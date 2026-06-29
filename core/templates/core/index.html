@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manufacturing System</title>
+    {% load static %}
+    <link rel="stylesheet" href="{% static 'core/styles.css' %}" media="all">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="{% url 'home.html' %}">Manufacturing System</a>
+            <div class="collapse navbar-collapse">
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'supplier_form' %}">Suppliers</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'customer_form' %}">Customers</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'raw_material_form' %}">Raw Materials</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'procurement_form' %}">Procurement</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'dispatch_form' %}">Dispatches</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'return_form' %}">Returns</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'loss_record_form' %}">Loss Records</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'financial_entry_form' %}">Financial Entries</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        {% block content %}
+        {% endblock %}
+    </div>
+    <footer class="footer mt-4 py-3 bg-light">
+        <div class="container">
+            <span class="text-muted">© 2026 John P Kamau</span>
+        </div>
+    </footer>
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.4/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+    <script src="{% static 'core/scripts.js' %}"></script>
+</body>
+</html>
