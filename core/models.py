@@ -1,100 +1,138 @@
+import secrets
+from sys import prefix
 from django.db import models, transaction
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from decimal import Decimal
+from django.utils.text import slugify
+from django.core.validators import MinValueValidator
 # models.
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
     name = models.CharField(max_length=255)
     contact_info = models.TextField()
-    payment_terms = models.CharField(max_length=255)
+    payment_terms = models.CharField(max_length=255, null=True, blank=True, default='Net 30')  # e.g., Net 30, Net 60, etc.
 
     def __str__(self):
         return self.name
 
-class RawMaterial(models.Model):
-    material_id = models.AutoField(primary_key=True)
-    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='materials')
+class Product(models.Model):
+    PRODUCT_TYPE_CHOICES = [
+        ('RAW', 'Raw Material'),
+        ('FINISHED', 'Finished Good'),
+        ('INTERMEDIATE', 'Intermediate Product'),
+    ]
+    product_id = models.AutoField(primary_key=True)
+    product_type = models.CharField(max_length=255, choices=PRODUCT_TYPE_CHOICES, default='RAW')
+    sku = models.CharField(max_length=100, unique=True, blank=True, help_text="Stock Keeping Unit, auto-generated if left blank.")
+    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='products')
     name = models.CharField(max_length=255)
     category = models.CharField(max_length=255)
     unit_of_measurement = models.CharField(max_length=255)
-    cost_per_unit = models.DecimalField(max_digits=10, decimal_places=2)
-    stock_level = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
-    
+    cost_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[models.MinValueValidator(Decimal('0.00'))], help_text="Cost per unit must be a positive amount greater than zero.")
+    stock_level = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[models.MinValueValidator(Decimal('0.00'))], help_text="Stock level cannot drop below zero.")
+
     # Added field-level validation rules
     def clean(self):
         if self.cost_per_unit and self.cost_per_unit <= 0:
             raise ValidationError("Cost per unit must be a positive amount greater than zero.")
         if self.stock_level < 0:
             raise ValidationError("Stock level cannot drop below zero.")
+
+        if self.product_type == 'Raw Material' and not self.supplier:
+            raise ValidationError({'supplier': 'Raw materials must have an associated supplier.'})
         
-   # Essential for making dropdown menus and lists readable in the dashboard
+        if self.product_type == 'Finished Good' and self.supplier:
+            raise ValidationError({'supplier': 'Finished goods cannot have an externally associated supplier.'})
+        
+    def save(self, *args, **kwargs):
+        # Auto-generate SKU if not provided
+        if not self.sku:
+            prefix_map = {
+                'RAW': 'RM',
+                'FINISHED': 'FG',
+                'INTERMEDIATE': 'INT'
+            }
+            prefix = prefix_map.get(self.product_type, 'UNK')
+            base_sku = slugify(self.name).replace('-', '').upper()[:10] 
+            while True: # Limit base SKU to 10 characters for brevity
+                unique_suffix = secrets.token_hex(3).upper()  # Generate a random 6-character hex string
+                potential_sku = f"{prefix}-{base_sku}-{unique_suffix}"
+                # only assign the SKU if it is unique in the database
+                if not Product.objects.filter(sku=potential_sku).exists():
+                    self.sku = potential_sku
+                    break
+
+        self.full_clean()  # Ensure validation is performed before saving
+        super().save(*args, **kwargs)    
+
+    # Essential for making dropdown menus and lists readable in the dashboard
     def __str__(self):
-        return f"{self.name} ({self.stock_level} {self.unit_of_measurement} available)"     
+        return f"{self.name} ({self.get_product_type_display()}) - SKU: {self.sku}"    
 
 class ProcurementOrder(models.Model):
     ENTRY_TYPE_CHOICES = [
-        ('Delivered', 'Delivered'),
-        ('Pending', 'Pending'),
+        ('DELIVERED', 'Delivered'),
+        ('PENDING', 'Pending'),
+        ('CANCELLED', 'Cancelled'),
     ]
     procurement_order_id = models.AutoField(primary_key=True)
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='procurement_order')
-    material = models.ForeignKey('RawMaterial', on_delete=models.PROTECT, related_name='procurement_order')
-    quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
-    price_per_unit = models.DecimalField(max_digits=10, decimal_places=2)
-    total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True)
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='procurement_order')
+    quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
+    price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Price per unit must be a positive amount greater than zero.")
+    total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True, default=Decimal('0.00'), help_text="Total cost is automatically calculated based on quantity ordered and price per unit.")
     order_date = models.DateField()
-    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Pending')   
+    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING')   
     delivery_location = models.CharField(max_length=255, default='Main Warehouse')
     
     # when status is updated to 'Delivered', the quantity should be added to inventory and total cost should be calculated based on quantity ordered and price per unit
+    def clean(self):
+        if self.product and self.product.product_type == 'INTERMEDIATE':
+            raise ValidationError({'product': 'procurement orders can only be created for finished products.'})
+
     def save(self, *args, **kwargs):
         self.total_cost = self.quantity_ordered * self.price_per_unit
+        self.full_clean()  # Ensure validation is performed before saving
 
         previously_delivered = False
         if self.pk:
-            previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='Delivered').exists()
+            previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='DELIVERED').exists()
         # Wrapped inventory modifications in an atomic transaction to avoid data corruption if a crash happens mid-save
         with transaction.atomic():
             super().save(*args, **kwargs)
 
-            if self.status == 'Delivered' and not previously_delivered:
+            if self.status == 'DELIVERED' and not previously_delivered:
                 inventory_item, created = Inventory.objects.get_or_create(
-                    material=self.material,
+                    product=self.product,
                     location=self.delivery_location,
                     defaults={'quantity_available': Decimal('0.00')}
                 )
 
                 inventory_item.quantity_available += self.quantity_ordered
                 inventory_item.save()
-               
-    def clean(self):
-        if self.quantity_ordered <= 0:
-            raise ValidationError("Quantity ordered must be greater than zero.")
-        if self.price_per_unit < 0:
-            raise ValidationError("Price per unit cannot be negative.")
 
     def __str__(self):
-        return f"PO {self.procurement_order_id} - {self.material.name} ({self.status})"           
+        return f"PO #{self.procurement_order_id} - {self.product.name} ({self.status})"           
                
 class Inventory(models.Model):
     Inventory_id = models.AutoField(primary_key=True) 
-    material = models.ForeignKey('RawMaterial', on_delete=models.PROTECT, related_name='inventory_record')   
-    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
+    Product = models.ForeignKey('RawMaterial', on_delete=models.PROTECT, related_name='inventory_record')   
+    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity available cannot drop below zero.")
     location = models.CharField(max_length=255) 
     valuation = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True)
 
     class Meta:
         # Prevents duplicate tracking entries for the exact same material in the exact same warehouse room
-        unique_together = ('material', 'location')
+        unique_together = ('Product', 'location')
         verbose_name_plural = "Inventory"
     # valuation is calculated based on quantity available and cost per unit of the raw material
     def save(self, *args, **kwargs):
-        self.valuation = self.quantity_available * self.material_id.cost_per_unit
+        self.valuation = self.quantity_available * self.Product.cost_per_unit
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.material.name}({self.location}) - {self.quantity_available} {self.material.unit_of_measurement}"    
+        return f"{self.Product.name}({self.location}) - {self.quantity_available} {self.Product.unit_of_measurement}"    
 
 class Employee(models.Model):
     employee_id = models.AutoField(primary_key=True)    
@@ -102,16 +140,16 @@ class Employee(models.Model):
     role = models.CharField(max_length=255)
     phone_number = models.CharField(max_length=15, default='0000000000')
     email = models.EmailField(default='unknown@example.com', blank=True)   
+    hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Hourly rate must be a positive amount greater than zero.")
 
-    # FIXED: Added string representation for clean dropdown selectors in forms
     def __str__(self):
         return f"{self.employee_name} ({self.role})"
 class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
-    material = models.ForeignKey('RawMaterial', on_delete=models.PROTECT, related_name='work_order')
+    Product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order')
     employee = models.ForeignKey('Employee', on_delete=models.PROTECT, related_name='assigned_work_order')
-    quantity_consumed = models.DecimalField(max_digits=10, decimal_places=2)
-    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2)
+    quantity_consumed = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity consumed must be a positive amount greater than zero.")
+    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
     production_start_date = models.DateField()
     production_end_date = models.DateField()    
 
@@ -120,28 +158,29 @@ class WorkOrder(models.Model):
         if self.production_end_date and self.production_start_date:
             if self.production_end_date < self.production_start_date:
              raise ValidationError('Production end date cannot be before production start date.')
-        if self.quantity_produced > self.quantity_consumed:
-            raise ValidationError('Quantity produced cannot exceed quantity consumed.')
+
+        if self.Product and self.Product.product_type not in ['FINISHED', 'INTERMEDIATE']:
+            raise ValidationError({'Product': 'Work orders can only be created for finished or intermediate products.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()  # Ensure validation is performed before saving
+        super().save(*args, **kwargs)        
+        
     def __str__(self):
-        return f"Work Order {self.work_order_id}"
+        return f"Work Order {self.work_order_id} — {self.Product.name}"
 
 class WorkOrderInstruction(models.Model):
     instruction_id = models.AutoField(primary_key=True)
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='instructions')
-    material = models.ForeignKey('RawMaterial', on_delete=models.SET_NULL, null=True, blank=True)
+    Product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
     step_number = models.IntegerField()
     machine=models.CharField(max_length=255, blank=True, null=True, default='No machine assigned')
     instruction_text = models.TextField()    
-    estimated_time_minutes = models.IntegerField(blank=True, null=True, default=0)
+    estimated_time_minutes = models.PositiveIntegerField(blank=True, null=True, default=0, validators=[MinValueValidator(0)])
 
     class Meta:
+        unique_together = ('work_order', 'step_number')
         ordering = ['step_number']
-
-    unique_together = ('work_order', 'step_number')
-# validation to ensure that step number is unique for each work order and estimated time is non-negative
-    def clean(self):
-        if self.estimated_time_minutes and self.estimated_time_minutes < 0:
-            raise ValidationError('Estimated time cannot be negative.')
 
 # string representation of the instruction showing work order id, step number and first 50 characters of instruction text
     def __str__(self):
@@ -157,11 +196,11 @@ class ProductionOrder(models.Model):
         ('CANCELLED', 'cancelled'),
     ]
     production_order_id = models.AutoField(primary_key=True)
-    material = models.ForeignKey('RawMaterial', on_delete=models.PROTECT, related_name='production_runs')
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs')
     employee = models.ForeignKey('Employee', on_delete=models.PROTECT, related_name='production_runs')
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
-    quantity_consumed = models.DecimalField(max_digits=10, decimal_places=2)
-    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2)
+    quantity_consumed = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity consumed must be a positive amount greater than zero.")
+    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
     # stays empty until a run physically transitions to IN_PROGRESS
     actual_start_date = models.DateField(blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
