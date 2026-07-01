@@ -325,10 +325,10 @@ class InvoiceLine(models.Model):
     Production_order = models.ForeignKey('ProductionOrder', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice_line')
     description = models.CharField(max_length=255, help_text="Description of the goods or manufacturing service rendered.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2)
-    unit_price = models.DecimalField(max_digits=10, decimal_places=2)
-    subtotal = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True)
+    unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Unit price must be a positive amount greater than zero.")
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], editable=False, blank=True)
     tax_amount = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0.00'), help_text="Tax percentage applied to this line (e.g., 16.00 for 16%).")   
-    line_total = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
+    line_total = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], editable=False)
 
     class Meta:
         ordering = ['invoice_line_id'] 
@@ -359,7 +359,7 @@ class Return(models.Model):
     return_id = models.AutoField(primary_key=True)
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.CASCADE)
     customer = models.ForeignKey('Customer', on_delete=models.CASCADE) 
-    quantity_returned = models.DecimalField(max_digits=10, decimal_places=2)
+    quantity_returned = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity returned must be a positive amount greater than zero.")
     reason_for_return = models.TextField(max_length=255, default='No reason provided')
     ENTRY_TYPE_CHOICES = [
         ('Approved', 'Approved'),
@@ -406,8 +406,8 @@ class Return(models.Model):
             
 class LossRecord(models.Model):
     loss_id = models.AutoField(primary_key=True)
-    material = models.ForeignKey('RawMaterial', on_delete=models.CASCADE)
-    quantity_lost = models.DecimalField(max_digits=10, decimal_places=2)
+    Product = models.ForeignKey('Product', on_delete=models.CASCADE)
+    quantity_lost = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity lost must be a positive amount greater than zero.")
     loss_date = models.DateField()
     reason = models.TextField()
     loss_location = models.CharField(max_length=255, default='Main Warehouse')
@@ -444,7 +444,7 @@ class FinanceEntry(models.Model):
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     Invoice = models.ForeignKey('Invoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
     entry_date = models.DateField()
     category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')  # e.g., 'Raw Material', 'Labor', 'Overhead'        
 
