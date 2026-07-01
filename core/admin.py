@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.utils.html import format_html
 from .models import (InvoiceLine, Supplier, RawMaterial, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
 )
 
@@ -19,6 +20,15 @@ admin.register(WorkOrder)
 admin.register(WorkOrderInstruction)
 
 # Register your models here.
+class InvoiceLineInline(admin.TabularInline):
+    model = InvoiceLine
+    extra = 1
+    fields = ('description', 'quantity', 'unit_price', 'line_total')
+    readonly_fields = ['line_total'] #computed field on save, should not be editable
+class WorkOrderInstructionInline(admin.TabularInline):
+    model = WorkOrderInstruction
+    extra = 1
+    fields = ('step_number', 'machine', 'instruction_text', 'estimated_time_minutes')    
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
     list_display = ('name', 'supplier_id', 'contact_info', 'payment_terms')
@@ -26,28 +36,29 @@ class SupplierAdmin(admin.ModelAdmin):
 
 @admin.register(Inventory)
 class InventoryAdmin(admin.ModelAdmin):
-    list_display = ('material_id', 'quantity_available', 'location', 'valuation')
-    search_fields = ('material_id', 'location')
+    list_display = ('material', 'quantity_available', 'location', 'valuation')
+    list_filter = ['location', 'material']
+    search_fields = ('material__name', 'location')
+    readonly_fields = ['valuation']  # Computed field, should not be editable
 
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
-    list_display = ('material_id', 'employee_id', 'work_order_id', 'quantity_consumed', 'quantity_produced', 'production_start_date', 'production_end_date')
-    search_fields = ('material_id', 'employee_id', 'work_order_id')   
+    list_display = ('material', 'employee', 'work_order', 'quantity_consumed', 'quantity_produced', 'actual_start_date', 'actual_end_date')
+    list_filter = ['status', 'actual_start_date']
+    search_fields = ('work_order__work_order_id', 'employee__employee_name')   
+
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_id', 'customer_id', 'total_amount', 'invoice_date', 'status')
-    search_fields = ('invoice_id', 'customer_id')
-
-@admin.register(InvoiceLine)
-class InvoiceLineAdmin(admin.ModelAdmin):
-    list_display = ('invoice_line_id', 'invoice_id', 'supplier_id', 'description', 'quantity', 'unit_price', 'line_total')
-    search_fields = ('invoice_line_id', 'invoice_id', 'description')
-
+    list_display = ('invoice_id', 'invoice_type', 'customer', 'total_amount', 'invoice_date', 'status')
+    list_filter = ['invoice_type', 'status', 'invoice_date']
+    inlines = [InvoiceLineInline]
+    readonly_fields = ['total_amount']  # Computed field, should not be editable
 @admin.register(Return)
 class ReturnAdmin(admin.ModelAdmin):
-    list_display = ('dispatch_id', 'customer_id', 'quantity_returned', 'reason_for_return', 'quality_control_status')
-    search_fields = ('dispatch_id__production_order__work_order_id', 'customer_id')
+    list_display = ('dispatch_id', 'customer', 'quantity_returned', 'reason_for_return', 'quality_control_status')
+    list_filter = ['quality_control_status']
+    search_fields = ('dispatch_id__dispatch_id', 'customer__customer_name')
 
 @admin.register(LossRecord)
 class LossRecordAdmin(admin.ModelAdmin):
@@ -56,8 +67,9 @@ class LossRecordAdmin(admin.ModelAdmin):
 
 @admin.register(FinanceEntry)
 class FinanceEntryAdmin(admin.ModelAdmin):
-    list_display = ('entry_type', 'amount', 'entry_date', 'category')
-    search_fields = ('entry_type', 'category')
+    list_display = ('finance_entry_id', 'entry_type', 'amount', 'entry_date', 'category')
+    list_filter = ['entry_type', 'category']
+    search_fields = ['category', 'invoice__invoice_id', 'procurement_order__procurement_order_id']
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
@@ -76,20 +88,23 @@ class RawMaterialAdmin(admin.ModelAdmin):
 
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
-    list_display = ('material_id', 'supplier_id', 'quantity_ordered', 'price_per_unit', 'total_cost', 'order_date', 'status')
-    search_fields = ('material_id', 'supplier_id')
+    list_display = ('procurement_order_id', 'material', 'supplier', 'quantity_ordered', 'price_per_unit', 'total_cost', 'order_date', 'status')
+    list_filter = ['status', 'order_date', 'supplier']
+    search_fields = ('material__name', 'supplier__name')
+    readonly_fields = ['total_cost']  # Computed field, should not be editable
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ('production_order_id', 'customer_id', 'quantity_dispatched', 'dispatch_date', 'delivery_date')
-    search_fields = ('production_order_id, work_order_id', 'customer_id')
+    list_display = ['dispatch_id', 'customer', 'quantity_dispatched', 'dispatch_date', 'delivery_date']
+    list_filter = ['dispatch_date', 'delivery_date']
+    search_fields = ['customer__customer_name', 'production_order__production_order_id']
+
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'material_id', 'employee_id', 'quantity_consumed', 'quantity_produced', 'production_start_date', 'production_end_date')
-    search_fields = ('work_order_id', 'material_id', 'employee_id')
+    list_display = ('work_order_id', 'material', 'employee', 'quantity_consumed', 'quantity_produced', 'production_start_date', 'production_end_date')
+    inlines = [WorkOrderInstructionInline]
+    search_fields = ('material__name', 'employee__employee_name')
 
-@admin.register(WorkOrderInstruction)
-class WorkOrderInstructionAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'step_number', 'machine', 'material_id', 'instruction_text', 'estimated_time_minutes')
-    search_fields = ('work_order_id','material_id', 'instruction_text')
+
+   

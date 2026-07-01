@@ -2,8 +2,7 @@ from django.db import models, transaction
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from decimal import Decimal
-from django.db.models import Sum                    
-# Create your models here.
+# models.
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
     name = models.CharField(max_length=255)
@@ -55,7 +54,7 @@ class ProcurementOrder(models.Model):
         previously_delivered = False
         if self.pk:
             previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='Delivered').exists()
-        # Wrap inventory modifications in an atomic transaction to avoid data corruption if a crash happens mid-save
+        # Wrapped inventory modifications in an atomic transaction to avoid data corruption if a crash happens mid-save
         with transaction.atomic():
             super().save(*args, **kwargs)
 
