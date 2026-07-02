@@ -25,25 +25,20 @@ class Product(models.Model):
     product_id = models.AutoField(primary_key=True)
     product_type = models.CharField(max_length=255, choices=PRODUCT_TYPE_CHOICES, default='RAW')
     sku = models.CharField(max_length=100, unique=True, blank=True, help_text="Stock Keeping Unit, auto-generated if left blank.")
-    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='products')
+    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, blank=True, null=True, related_name='products')
     name = models.CharField(max_length=255)
     category = models.CharField(max_length=255)
     unit_of_measurement = models.CharField(max_length=255)
-    cost_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[models.MinValueValidator(Decimal('0.00'))], help_text="Cost per unit must be a positive amount greater than zero.")
-    stock_level = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[models.MinValueValidator(Decimal('0.00'))], help_text="Stock level cannot drop below zero.")
+    cost_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Cost per unit must be a positive amount greater than zero.")
+    stock_level = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Stock level cannot drop below zero.")
 
     # Added field-level validation rules
-    def clean(self):
-        if self.cost_per_unit and self.cost_per_unit <= 0:
-            raise ValidationError("Cost per unit must be a positive amount greater than zero.")
-        if self.stock_level < 0:
-            raise ValidationError("Stock level cannot drop below zero.")
-
-        if self.product_type == 'Raw Material' and not self.supplier:
+    def clean(self):       
+        if self.product_type == 'RAW' and not self.supplier:
             raise ValidationError({'supplier': 'Raw materials must have an associated supplier.'})
         
-        if self.product_type == 'Finished Good' and self.supplier:
-            raise ValidationError({'supplier': 'Finished goods cannot have an externally associated supplier.'})
+        if self.product_type in ['FINISHED', 'INTERMEDIATE'] and self.supplier:
+            raise ValidationError({'supplier': 'Finished and intermediate goods cannot have an externally associated supplier.'})
         
     def save(self, *args, **kwargs):
         # Auto-generate SKU if not provided
@@ -117,22 +112,22 @@ class ProcurementOrder(models.Model):
                
 class Inventory(models.Model):
     Inventory_id = models.AutoField(primary_key=True) 
-    Product = models.ForeignKey('RawMaterial', on_delete=models.PROTECT, related_name='inventory_record')   
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='stock')   
     quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity available cannot drop below zero.")
     location = models.CharField(max_length=255) 
     valuation = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True)
 
     class Meta:
         # Prevents duplicate tracking entries for the exact same material in the exact same warehouse room
-        unique_together = ('Product', 'location')
+        unique_together = ('product', 'location')
         verbose_name_plural = "Inventory"
     # valuation is calculated based on quantity available and cost per unit of the raw material
     def save(self, *args, **kwargs):
-        self.valuation = self.quantity_available * self.Product.cost_per_unit
+        self.valuation = self.quantity_available * self.product.cost_per_unit
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.Product.name}({self.location}) - {self.quantity_available} {self.Product.unit_of_measurement}"    
+        return f"{self.product.name}({self.location}) - {self.quantity_available} {self.product.unit_of_measurement}"    
 
 class Employee(models.Model):
     employee_id = models.AutoField(primary_key=True)    
@@ -146,9 +141,8 @@ class Employee(models.Model):
         return f"{self.employee_name} ({self.role})"
 class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
-    Product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order')
-    employee = models.ForeignKey('Employee', on_delete=models.PROTECT, related_name='assigned_work_order')
-    quantity_consumed = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity consumed must be a positive amount greater than zero.")
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order')
+    employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
     production_start_date = models.DateField()
     production_end_date = models.DateField()    
@@ -159,20 +153,20 @@ class WorkOrder(models.Model):
             if self.production_end_date < self.production_start_date:
              raise ValidationError('Production end date cannot be before production start date.')
 
-        if self.Product and self.Product.product_type not in ['FINISHED', 'INTERMEDIATE']:
-            raise ValidationError({'Product': 'Work orders can only be created for finished or intermediate products.'})
+        if self.product and self.product.product_type not in ['FINISHED', 'INTERMEDIATE']:
+            raise ValidationError({'product': 'Work orders can only be created for finished or intermediate products.'})
 
     def save(self, *args, **kwargs):
         self.full_clean()  # Ensure validation is performed before saving
         super().save(*args, **kwargs)        
         
     def __str__(self):
-        return f"Work Order {self.work_order_id} — {self.Product.name}"
+        return f"Work Order {self.work_order_id} — {self.product.name}"
 
 class WorkOrderInstruction(models.Model):
     instruction_id = models.AutoField(primary_key=True)
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='instructions')
-    Product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
+    product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
     step_number = models.IntegerField()
     machine=models.CharField(max_length=255, blank=True, null=True, default='No machine assigned')
     instruction_text = models.TextField()    
@@ -197,9 +191,8 @@ class ProductionOrder(models.Model):
     ]
     production_order_id = models.AutoField(primary_key=True)
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs')
-    employee = models.ForeignKey('Employee', on_delete=models.PROTECT, related_name='production_runs')
+    employee = models.ManyToManyField('Employee', related_name='production_runs', help_text="Employees assigned to this production run.")
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
-    quantity_consumed = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity consumed must be a positive amount greater than zero.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
     # stays empty until a run physically transitions to IN_PROGRESS
     actual_start_date = models.DateField(blank=True, null=True)
@@ -279,7 +272,6 @@ class Invoice(models.Model):
     invoice_id = models.AutoField(primary_key=True)
     customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     expense_category = models.CharField(max_length=25, choices=EXPENSE_CATEGORY_CHOICES, blank=True, null=True)
     invoice_date = models.DateField()
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
@@ -314,9 +306,10 @@ class Invoice(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        # FIXED: Safe string representation that evaluates invoice type dynamically
+        # Safe string representation that evaluates invoice type dynamically
         party_name = self.customer.customer_name if self.invoice_type == 'CUSTOMER' else self.supplier.name
         return f"[{self.get_invoice_type_display()}] Inv #{self.invoice_id} — ${self.total_amount or 0.00} ({party_name})"
+
 class InvoiceLine(models.Model):
     invoice_line_id = models.AutoField(primary_key=True)
     invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE)
@@ -327,7 +320,7 @@ class InvoiceLine(models.Model):
     quantity = models.DecimalField(max_digits=10, decimal_places=2)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Unit price must be a positive amount greater than zero.")
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], editable=False, blank=True)
-    tax_amount = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0.00'), help_text="Tax percentage applied to this line (e.g., 16.00 for 16%).")   
+    tax_rate = models.DecimalField(max_digits=4, decimal_places=2, default=Decimal('0.00'), help_text="Tax percentage applied to this line (e.g., 16.00 for 16%).", validators=[MinValueValidator(Decimal('0.00'))])   
     line_total = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], editable=False)
 
     class Meta:
@@ -336,36 +329,28 @@ class InvoiceLine(models.Model):
     def save(self, *args, **kwargs):
         # Calculate the base costs
         self.subtotal = self.quantity * self.unit_price
-        self.tax_amount = self.subtotal * (self.tax_rate / Decimal('100.00'))
-        self.line_total = self.subtotal + self.tax_amount
+        self.line_total = self.subtotal + (self.subtotal * self.tax_rate / 100)
         # Force Django validation to run (checks for negative values, etc.)
         self.full_clean()
         
-        super().save(*args, **kwargs)
-    
-    def clean(self):
-        """Enforce that financial inputs make logical sense."""
-        if self.quantity <= 0:
-            raise ValidationError("Quantity billed must be greater than zero.")
-        if self.unit_price < 0:
-            raise ValidationError("Unit price cannot be a negative value.")
-        if self.tax_rate < 0:
-            raise ValidationError("Tax rate cannot be negative.")   
+        super().save(*args, **kwargs)  
     
     def __str__(self):
         return f"Invoice Line {self.invoice_line_id} - {self.description} ({self.quantity} @ {self.unit_price})"     
 
 class Return(models.Model):
+    STATUS_TYPE_CHOICES = [
+         ('PENDING', 'Pending Inspection'),
+         ('APPROVED', 'Approved'),
+         ('REJECTED', 'Rejected'),
+    ]
     return_id = models.AutoField(primary_key=True)
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.CASCADE)
     customer = models.ForeignKey('Customer', on_delete=models.CASCADE) 
     quantity_returned = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity returned must be a positive amount greater than zero.")
     reason_for_return = models.TextField(max_length=255, default='No reason provided')
-    ENTRY_TYPE_CHOICES = [
-        ('Approved', 'Approved'),
-        ('Rejected', 'Rejected'),
-    ]
-    quality_control_status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Rejected')
+    
+    quality_control_status = models.CharField(max_length=255, choices=STATUS_TYPE_CHOICES, default='PENDING')
     return_warehouse_location = models.CharField(max_length=255, default='Main Warehouse')
         # validation to ensure that quantity returned does not exceed quantity dispatched in the dispatch record
     def clean(self):
@@ -406,7 +391,7 @@ class Return(models.Model):
             
 class LossRecord(models.Model):
     loss_id = models.AutoField(primary_key=True)
-    Product = models.ForeignKey('Product', on_delete=models.CASCADE)
+    product = models.ForeignKey('Product', on_delete=models.CASCADE)
     quantity_lost = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity lost must be a positive amount greater than zero.")
     loss_date = models.DateField()
     reason = models.TextField()
@@ -429,30 +414,28 @@ class LossRecord(models.Model):
 class FinanceEntry(models.Model):
     finance_entry_id = models.AutoField(primary_key=True)
     ENTRY_TYPE_CHOICES = [
-        ('Revenue', 'Revenue'),
-        ('Expense', 'Expense'),
+        ('REVENUE', 'Revenue'),
+        ('EXPENSE', 'Expense'),
     ]
     ENTRY_CATEGORY_CHOICES = [
-        ('Sales', 'Sales'),
-        ('Labor', 'Labor'),
-        ('Overhead', 'Overhead'),
-        ('Procurement', 'Procurement'),
-        ('Customer refund', 'Customer refund'),
-        ('Loss', 'Loss'),
+        ('SALES', 'Sales'),
+        ('LABOR', 'Labor cost'),
+        ('OVERHEAD', 'Overhead'),
+        ('PROCUREMENT', 'material Procurement'),
+        ('CUSTOMER_REFUND', 'Customer refund'),
+        ('LOSS', 'Inventory Loss'),
     ]
     entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE')  # e.g., 'Revenue', 'Expense'
+    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')  # e.g., 'Raw Material', 'Labor', 'Overhead'        
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     Invoice = models.ForeignKey('Invoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
     entry_date = models.DateField()
-    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')  # e.g., 'Raw Material', 'Labor', 'Overhead'        
 
     # validation to ensure that if entry type is 'Revenue', category cannot be 'Procurement' or 'Loss', and if entry type is 'Expense', category cannot be 'Sales'
     def clean(self):
         # 1. Prevent negative entries from skewing totals
-        if self.amount and self.amount <= 0:
-            raise ValidationError({'amount': 'Financial transaction entries must be a positive amount greater than zero.'})
         if self.entry_type == 'REVENUE' and self.category in ['PROCUREMENT', 'LOSS', 'LABOR', 'OVERHEAD']:
             raise ValidationError(f"A Revenue entry cannot be categorized under {self.get_category_display()}.")
         if self.entry_type == 'EXPENSE' and self.category == 'SALES':

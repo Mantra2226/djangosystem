@@ -1,10 +1,10 @@
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import (InvoiceLine, Supplier, RawMaterial, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
+from .models import (InvoiceLine, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
 )
 
 admin.register(Supplier)
-admin.register(RawMaterial)
+admin.register(Product)
 admin.register(ProcurementOrder)
 admin.register(Inventory)   
 admin.register(Employee)
@@ -36,16 +36,21 @@ class SupplierAdmin(admin.ModelAdmin):
 
 @admin.register(Inventory)
 class InventoryAdmin(admin.ModelAdmin):
-    list_display = ('material', 'quantity_available', 'location', 'valuation')
-    list_filter = ['location', 'material']
-    search_fields = ('material__name', 'location')
+    list_display = ('product', 'quantity_available', 'location', 'valuation')
+    list_filter = ['location', 'product__product_type']
+    search_fields = ('product__name', 'product__sku', 'location')
     readonly_fields = ['valuation']  # Computed field, should not be editable
 
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
-    list_display = ('material', 'employee', 'work_order', 'quantity_consumed', 'quantity_produced', 'actual_start_date', 'actual_end_date')
+    list_display = ('product', 'display_employees', 'work_order', 'quantity_produced', 'actual_start_date', 'actual_end_date', 'status')
     list_filter = ['status', 'actual_start_date']
-    search_fields = ('work_order__work_order_id', 'employee__employee_name')   
+    search_fields = ('work_order__work_order_id', 'employee__employee_name')  
+    filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
+
+    def display_employees(self, obj):
+        return ", ".join([employee.employee_name for employee in obj.employee.all()])
+    display_employees.short_description = 'Assigned Employees'
 
 
 @admin.register(Invoice)
@@ -62,8 +67,8 @@ class ReturnAdmin(admin.ModelAdmin):
 
 @admin.register(LossRecord)
 class LossRecordAdmin(admin.ModelAdmin):
-    list_display = ('material_id', 'quantity_lost', 'reason', 'loss_date')
-    search_fields = ('material_id', 'reason')
+    list_display = ('product', 'quantity_lost', 'reason', 'loss_date')
+    search_fields = ('product__name', 'product__sku', 'reason')
 
 @admin.register(FinanceEntry)
 class FinanceEntryAdmin(admin.ModelAdmin):
@@ -81,16 +86,17 @@ class CustomerAdmin(admin.ModelAdmin):
     list_display = ('customer_name', 'contact_info')
     search_fields = ('customer_name', 'contact_info')
 
-@admin.register(RawMaterial)
-class RawMaterialAdmin(admin.ModelAdmin):
-    list_display = ('name', 'supplier_id', 'cost_per_unit')
-    search_fields = ('name', 'supplier_id')
+@admin.register(Product)
+class ProductAdmin(admin.ModelAdmin):
+    list_display = ('sku', 'name', 'product_type', 'supplier', 'cost_per_unit')
+    list_filter = ['product_type', 'supplier']
+    search_fields = ('sku', 'name', 'supplier__name')
 
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
-    list_display = ('procurement_order_id', 'material', 'supplier', 'quantity_ordered', 'price_per_unit', 'total_cost', 'order_date', 'status')
+    list_display = ('procurement_order_id', 'product', 'supplier', 'quantity_ordered', 'price_per_unit', 'total_cost', 'order_date', 'status')
     list_filter = ['status', 'order_date', 'supplier']
-    search_fields = ('material__name', 'supplier__name')
+    search_fields = ('product__name', 'product__sku', 'supplier__name')
     readonly_fields = ['total_cost']  # Computed field, should not be editable
 
 @admin.register(DispatchRecord)
@@ -102,9 +108,14 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'material', 'employee', 'quantity_consumed', 'quantity_produced', 'production_start_date', 'production_end_date')
+    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date')
     inlines = [WorkOrderInstructionInline]
-    search_fields = ('material__name', 'employee__employee_name')
+    search_fields = ('product__name', 'product__sku', 'employee__employee_name')
+    filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
+
+    def display_employees(self, obj):
+        return ", ".join([employee.employee_name for employee in obj.employee.all()])
+    display_employees.short_description = 'Assigned Crew Members'
 
 
    

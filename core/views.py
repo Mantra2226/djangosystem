@@ -1,6 +1,6 @@
 from django.shortcuts import render, redirect
 from django.contrib import messages
-from .models import DispatchRecord, ProcurementOrder, RawMaterial, Supplier, Inventory, ProductionOrder, Invoice, Return, LossRecord, FinanceEntry, Employee, Customer, WorkOrder, WorkOrderInstruction, InvoiceLine
+from .models import DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, ProductionOrder, Invoice, Return, LossRecord, FinanceEntry, Employee, Customer, WorkOrder, WorkOrderInstruction, InvoiceLine
 # Create your views here.
 
 def index(request):
@@ -85,25 +85,25 @@ def procurement_form(request):
     procurement_orders = ProcurementOrder.objects.all()
     return render(request, 'core/procurement_form.html', {'procurement_orders': procurement_orders})
 
-def raw_material_form(request):
+def product_form(request):
     if request.method == 'POST':
         name = request.POST.get('name')
         supplier_id = request.POST.get('supplier_id')
         cost_per_unit = request.POST.get('cost_per_unit')
-        RawMaterial.objects.create(name=name, supplier_id=supplier_id, cost_per_unit=cost_per_unit)
-    messages.success(request, 'Raw material added successfully!')
+        Product.objects.create(name=name, supplier_id=supplier_id, cost_per_unit=cost_per_unit)
+    messages.success(request, 'Product added successfully!')
     inventory_items = Inventory.objects.all()
-    return render(request, 'core/raw_material_form.html', {'inventory_items': inventory_items})
+    return render(request, 'core/product_form.html', {'inventory_items': inventory_items})
 
 def production(request):
     if request.method == 'POST':
-        material_id = request.POST.get('material_id')
+        product_id = request.POST.get('product_id')
         employee_id = request.POST.get('employee_id')
         work_order_id = request.POST.get('work_order_id')
         quantity_consumed = request.POST.get('quantity_consumed')
         quantity_produced = request.POST.get('quantity_produced')
         production_start_date = request.POST.get('production_start_date')
-        ProductionOrder.objects.create(material_id=material_id, employee_id=employee_id, work_order_id=work_order_id, quantity_consumed=quantity_consumed, quantity_produced=quantity_produced, production_start_date=production_start_date)
+        ProductionOrder.objects.create(product_id=product_id, employee_id=employee_id, work_order_id=work_order_id, quantity_consumed=quantity_consumed, quantity_produced=quantity_produced, production_start_date=production_start_date)
     messages.success(request, 'Production order added successfully!')
     production_orders = ProductionOrder.objects.all()
     return render(request, 'core/production_form.html', {'production_orders': production_orders})

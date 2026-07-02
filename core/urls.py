@@ -13,7 +13,7 @@ urlpatterns = [
     path('finance_entry_form/', views.finance_entry_form, name='finance_entry_form'),
     path('loss_record_form/', views.loss_record_form, name='loss_record_form'),
     path('procurement_form/', views.procurement_form, name='procurement_form'),
-    path('raw_material_form/', views.raw_material_form, name='raw_material_form'),
+    path('product_form/', views.product_form, name='product_form'),
     path('return_form/', views.return_form, name='return_form'),
 ]   
 
