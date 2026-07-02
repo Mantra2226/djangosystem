@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import (InvoiceLine, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
+from .models import (InvoiceLine, PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
 )
 
 admin.register(Supplier)
@@ -12,6 +12,7 @@ admin.register(ProductionOrder)
 admin.register(Customer)
 admin.register(DispatchRecord)
 admin.register(Invoice)
+admin.register(PurchaseInvoice) 
 admin.register(InvoiceLine)
 admin.register(Return)
 admin.register(LossRecord)
@@ -55,10 +56,18 @@ class ProductionOrderAdmin(admin.ModelAdmin):
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_id', 'invoice_type', 'customer', 'total_amount', 'invoice_date', 'status')
+    list_display = ('invoice_id', 'invoice_type', 'invoice_number', 'customer', 'total_amount', 'invoice_date', 'status')
     list_filter = ['invoice_type', 'status', 'invoice_date']
+    search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_id')
     inlines = [InvoiceLineInline]
     readonly_fields = ['total_amount']  # Computed field, should not be editable
+
+@admin.register(PurchaseInvoice)
+class PurchaseInvoiceAdmin(admin.ModelAdmin):
+    list_display = ('invoice_number', 'supplier', 'total_amount', 'invoice_date', 'status', 'paid_date')
+    list_filter = ['status', 'invoice_date']
+    search_fields = ('invoice_number', 'supplier__name')
+
 @admin.register(Return)
 class ReturnAdmin(admin.ModelAdmin):
     list_display = ('dispatch_id', 'customer', 'quantity_returned', 'reason_for_return', 'quality_control_status')

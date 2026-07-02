@@ -1,3 +1,4 @@
+from datetime import datetime
 import secrets
 from sys import prefix
 from django.db import models, transaction
@@ -270,6 +271,7 @@ class Invoice(models.Model):
         ('Unpaid', 'Unpaid'),
     ]
     invoice_id = models.AutoField(primary_key=True)
+    invoice_number = models.CharField(max_length=255, unique=True)
     customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     expense_category = models.CharField(max_length=25, choices=EXPENSE_CATEGORY_CHOICES, blank=True, null=True)
@@ -277,6 +279,7 @@ class Invoice(models.Model):
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
     invoice_type = models.CharField(max_length=255, choices=INVOICE_TYPE_CHOICES, default='CUSTOMER')
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
+    paid_date = models.DateField(null=True, blank=True)
 
     def clean(self):
         # 1. Enforce Customer Invoice Data Integrity
@@ -297,12 +300,25 @@ class Invoice(models.Model):
             if not self.expense_category:
                 raise ValidationError({'expense_category': 'Please choose an expense category for this supplier layout.'})
 
+        if self.status == 'Paid' and not self.paid_date:
+            raise ValidationError({'paid_date': 'A paid invoice must have an associated payment settlement date.'})
     # validation to ensure that invoice date is not before dispatch date and total amount is calculated based on quantity dispatched and cost per unit of the material in the production order
     def save(self, *args, **kwargs):
         self.full_clean()
         # auto calculate total amount for the invoice based on quantity dispatched and cost per unit
         if self.invoice_type == 'CUSTOMER' and self.dispatch:
             self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.material.cost_per_unit
+
+        if not self.invoice_number:
+            # Generate a clean corporate format: INV-YEAR-MONTH-ID (e.g., INV-2026-07-0001)
+            year_month = datetime.date.today().strftime("%Y-%m")
+            
+            # Find the last invoice ID to make it sequential
+            last_invoice = Invoice.objects.all().order_by('invoice_id').last()
+            next_id = (last_invoice.invoice_id + 1) if last_invoice else 1
+            
+            # Format with leading zeros so it stays neat (zfill padding)
+            self.invoice_number = f"INV-{year_month}-{str(next_id).zfill(4)}"    
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -310,6 +326,44 @@ class Invoice(models.Model):
         party_name = self.customer.customer_name if self.invoice_type == 'CUSTOMER' else self.supplier.name
         return f"[{self.get_invoice_type_display()}] Inv #{self.invoice_id} — ${self.total_amount or 0.00} ({party_name})"
 
+class PurchaseInvoice(models.Model):
+    STATUS_CHOICES = [
+        ('PAID', 'Paid'),
+        ('UNPAID', 'Unpaid'),
+        ('PARTIALLY_PAID', 'Partially Paid'),
+    ]   
+    invoice_id = models.AutoField(primary_key=True)
+    invoice_number = models.CharField(max_length=50, unique=True, help_text="Unique identifier for the purchase invoice from the supplier.")
+    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
+    procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
+    invoice_date = models.DateField()
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
+    paid_date = models.DateField(blank=True, null=True, help_text="Date when the invoice was fully paid. Leave blank if unpaid or partially paid.")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        # Ensure that the invoice date is not before the procurement order date
+        if self.procurement_order and self.invoice_date < self.procurement_order.order_date:
+            raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the procurement order date.'})
+        # Ensure that the supplier on the invoice matches the supplier on the procurement order
+        if self.procurement_order and self.procurement_order.supplier != self.supplier:
+            raise ValidationError({'supplier': 'The supplier on the invoice must match the supplier on the procurement order.'})
+    
+        if self.status == 'PAID' and not self.paid_date:
+            raise ValidationError({'paid_date': 'An invoice marked as PAID must have an associated payment settlement date.'})
+        if self.status != 'PAID' and self.paid_date:
+            raise ValidationError({'paid_date': 'Paid date should only be set when the invoice status is PAID.'})
+        
+    def save(self, *args, **kwargs):
+        self.full_clean()  # Ensure validation is performed before saving
+        # auto calculate total amount for the purchase invoice based on quantity ordered and price per unit
+        if self.procurement_order:
+            self.total_amount = self.procurement_order.quantity_ordered * self.procurement_order.price_per_unit
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Purchase Invoice #{self.invoice_number} — ${self.total_amount or 0.00} ({self.supplier.name})"        
 class InvoiceLine(models.Model):
     invoice_line_id = models.AutoField(primary_key=True)
     invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE)
