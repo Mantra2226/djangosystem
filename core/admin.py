@@ -56,10 +56,10 @@ class ProductionOrderAdmin(admin.ModelAdmin):
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_id', 'invoice_type', 'invoice_number', 'customer', 'total_amount', 'invoice_date', 'status')
-    list_filter = ['invoice_type', 'status', 'invoice_date']
+    list_display = ('invoice_id', 'invoice_number', 'customer', 'total_amount', 'invoice_date', 'status')
+    list_filter = ['status', 'invoice_date', 'customer']
     search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_id')
-    inlines = [InvoiceLineInline]
+    inlines = []
     readonly_fields = ['total_amount']  # Computed field, should not be editable
 
 @admin.register(PurchaseInvoice)

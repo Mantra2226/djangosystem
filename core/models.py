@@ -234,7 +234,7 @@ class DispatchRecord(models.Model):
     customer = models.ForeignKey('Customer', on_delete=models.PROTECT, related_name='dispatches') 
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
     dispatch_date = models.DateField()
-    delivery_date = models.DateField()
+    delivery_date = models.DateField(blank=True, null=True)
 
     # validation to ensure that delivery date is not before dispatch date and quantity dispatched does not exceed quantity produced in the production order
     def clean(self):
@@ -256,28 +256,16 @@ class DispatchRecord(models.Model):
         return f"Dispatch {self.dispatch_id} - {self.quantity_dispatched} units to {self.customer.customer_name}"    
 
 class Invoice(models.Model):
-    INVOICE_TYPE_CHOICES = [
-        ('CUSTOMER', 'Customer invoice(Receivable)'),
-        ('SUPPLIER', 'Supplier invoice(Payable)'),
-    ]
-    EXPENSE_CATEGORY_CHOICES = [
-        ('Raw Material', 'Raw Material Purchase'),
-        ('Salaries', 'Employee Salaries'),
-        ('Services', 'External services'),
-        ('Overhead', 'Overhead costs'),
-    ]
     ENTRY_TYPE_CHOICES = [
         ('Paid', 'Paid'),
         ('Unpaid', 'Unpaid'),
     ]
     invoice_id = models.AutoField(primary_key=True)
-    invoice_number = models.CharField(max_length=255, unique=True)
+    invoice_number = models.CharField(max_length=255, unique=True, blank=True, help_text="Unique identifier for the invoice. Auto-generated if left blank.")
     customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    expense_category = models.CharField(max_length=25, choices=EXPENSE_CATEGORY_CHOICES, blank=True, null=True)
     invoice_date = models.DateField()
-    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
-    invoice_type = models.CharField(max_length=255, choices=INVOICE_TYPE_CHOICES, default='CUSTOMER')
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
     paid_date = models.DateField(null=True, blank=True)
 
@@ -305,13 +293,19 @@ class Invoice(models.Model):
     # validation to ensure that invoice date is not before dispatch date and total amount is calculated based on quantity dispatched and cost per unit of the material in the production order
     def save(self, *args, **kwargs):
         self.full_clean()
+        if self.dispatch:
+            self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.product.cost_per_unit
+        else:
+            if not self.total_amount:
+                self.total_amount = Decimal('0.00')  # Default to zero if no dispatch is linked
         # auto calculate total amount for the invoice based on quantity dispatched and cost per unit
-        if self.invoice_type == 'CUSTOMER' and self.dispatch:
-            self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.material.cost_per_unit
+        if self.total_amount and self.dispatch:
+            self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.product.cost_per_unit
 
         if not self.invoice_number:
             # Generate a clean corporate format: INV-YEAR-MONTH-ID (e.g., INV-2026-07-0001)
-            year_month = datetime.date.today().strftime("%Y-%m")
+            from datetime import datetime
+            year_month = datetime.today().strftime("%Y-%m")
             
             # Find the last invoice ID to make it sequential
             last_invoice = Invoice.objects.all().order_by('invoice_id').last()
@@ -322,9 +316,7 @@ class Invoice(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        # Safe string representation that evaluates invoice type dynamically
-        party_name = self.customer.customer_name if self.invoice_type == 'CUSTOMER' else self.supplier.name
-        return f"[{self.get_invoice_type_display()}] Inv #{self.invoice_id} — ${self.total_amount or 0.00} ({party_name})"
+        return f"[Customer Invoice] #{self.invoice_number} — ${self.total_amount} ({self.customer.customer_name})"
 
 class PurchaseInvoice(models.Model):
     STATUS_CHOICES = [
