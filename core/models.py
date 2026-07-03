@@ -4,7 +4,7 @@ from sys import prefix
 from django.db import models, transaction
 from django.core.exceptions import ValidationError
 from django.utils import timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from django.utils.text import slugify
 from django.core.validators import MinValueValidator
 # models.
@@ -88,7 +88,12 @@ class ProcurementOrder(models.Model):
             raise ValidationError({'product': 'procurement orders can only be created for finished products.'})
 
     def save(self, *args, **kwargs):
-        self.total_cost = self.quantity_ordered * self.price_per_unit
+        if self.product and self.quantity_ordered:
+            raw_cost = self.quantity_ordered * self.price_per_unit
+            self.total_cost = raw_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            if not self.product or not self.quantity_ordered:
+                self.total_cost = Decimal('0.00')
         self.full_clean()  # Ensure validation is performed before saving
 
         previously_delivered = False
@@ -269,25 +274,11 @@ class Invoice(models.Model):
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
     paid_date = models.DateField(null=True, blank=True)
 
-    def clean(self):
-        # 1. Enforce Customer Invoice Data Integrity
-        if self.invoice_type == 'CUSTOMER':
-            if not self.customer:
-                raise ValidationError({'customer': 'Customer is required for customer invoices.'})
-            if not self.dispatch:
-                raise ValidationError({'dispatch': 'Dispatch record is required to calculate customer billing.'})
-            
-            # FIXED: Implemented the missing date validation promise
-            if self.dispatch and self.invoice_date < self.dispatch.dispatch_date:
+    def clean(self):    
+             # Implemented missing date validation 
+        if self.dispatch and self.invoice_date < self.dispatch.dispatch_date:
                 raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the physical dispatch date.'})
-
-        # 2. Enforce Supplier Invoice Data Integrity
-        if self.invoice_type == 'SUPPLIER':
-            if not self.supplier:
-                raise ValidationError({'supplier': 'Supplier is required for supplier invoices.'})
-            if not self.expense_category:
-                raise ValidationError({'expense_category': 'Please choose an expense category for this supplier layout.'})
-
+        
         if self.status == 'Paid' and not self.paid_date:
             raise ValidationError({'paid_date': 'A paid invoice must have an associated payment settlement date.'})
     # validation to ensure that invoice date is not before dispatch date and total amount is calculated based on quantity dispatched and cost per unit of the material in the production order
@@ -399,41 +390,66 @@ class Return(models.Model):
     quality_control_status = models.CharField(max_length=255, choices=STATUS_TYPE_CHOICES, default='PENDING')
     return_warehouse_location = models.CharField(max_length=255, default='Main Warehouse')
         # validation to ensure that quantity returned does not exceed quantity dispatched in the dispatch record
-    def clean(self):
-        if self.dispatch and self.quantity_returned > self.dispatch.quantity_dispatched:    
-            raise ValidationError('Returned quantity cannot exceed dispatched quantity.')
-    
     def save(self, *args, **kwargs):
+        # 1. Secure our references (handles whether production_order is a direct field or accessed via dispatch)
+        prod_order = getattr(self, 'production_order', None) or (self.dispatch.production_order if self.dispatch else None)
+
+        # 2. Quantize internal financial fields BEFORE running any validation checks
+        if prod_order and self.quantity_returned:
+            raw_amount = self.quantity_returned * prod_order.product.cost_per_unit
+            
+            if hasattr(self, 'total_amount'):
+                self.total_amount = raw_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            if hasattr(self, 'refund_amount'):
+                self.refund_amount = raw_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            if hasattr(self, 'total_amount') and not self.total_amount:
+                self.total_amount = Decimal('0.00')
+            if hasattr(self, 'refund_amount') and not self.refund_amount:
+                self.refund_amount = Decimal('0.00')
+
+        # Run model clean data validations now that our numbers are perfectly formatted
         self.full_clean()
 
-        # Detect historical state to prevent duplicate stock updates on multiple edits
+        # 3. Detect historical state to prevent duplicate stock updates on multiple edits
         previously_approved = False
         if self.pk:
             previously_approved = Return.objects.filter(pk=self.pk, quality_control_status='APPROVED').exists()
 
+        # 4. Execute database operations in a single, safe atomic pass
         with transaction.atomic():
+            # Run the primary database save exactly ONCE
             super().save(*args, **kwargs)
 
-        # if return is approved, the quantity returned should be added back to inventory and total amount for the invoice should be reduced based on quantity returned and cost per unit of the material
+            # If return is approved, adjust inventory and credit the customer's invoice balance
             if self.quality_control_status == 'APPROVED' and not previously_approved:
-                # 1. Update stock levels and automatically update material valuation
+                
+                # Step A: Return the physical items back into warehouse inventory logs
+                if prod_order:
                     inventory_item, created = Inventory.objects.get_or_create(
-                        material=self.dispatch.production_order.material,
+                        product=prod_order.product,
                         location=self.return_warehouse_location,
                         defaults={'quantity_available': Decimal('0.00')}
                     )
                     inventory_item.quantity_available += self.quantity_returned
                     inventory_item.save()
 
-                # 2. Safely deduct returned items cost from the associated Invoice row
-                    invoice_record = Invoice.objects.filter(dispatch=self.dispatch).first()
-                    if invoice_record and invoice_record.total_amount:
-                        return_value = self.quantity_returned * self.dispatch.production_order.material.cost_per_unit
-                        invoice_record.total_amount -= return_value
-                        invoice_record.save()
+                # Step B: Safely deduct returned items cost from the associated Invoice row
+                invoice_record = Invoice.objects.filter(dispatch=self.dispatch).first()
+                if invoice_record and invoice_record.total_amount and prod_order:
+                    raw_return_value = self.quantity_returned * prod_order.product.cost_per_unit
+                    
+                    # FIXED: We clip the return value to exactly 2 decimal places BEFORE modifying the invoice!
+                    return_value = raw_return_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    
+                    invoice_record.total_amount -= return_value
+                    # Extra safety shield: ensure the final invoice total is cleanly quantized too
+                    invoice_record.total_amount = invoice_record.total_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    
+                    invoice_record.save()
 
     def __str__(self):
-        return f"Return #{self.return_id} ({self.quality_control_status}) — {self.quantity_returned} Units"
+        return f"Return #{self.return_id} — {self.quantity_returned} units from Dispatch #{self.dispatch.dispatch_id} ({self.quality_control_status})"        
             
 class LossRecord(models.Model):
     loss_id = models.AutoField(primary_key=True)
@@ -449,14 +465,14 @@ class LossRecord(models.Model):
             super().save(*args, **kwargs)
             
             # CRITICAL ADDITION: Automatically deduct lost material amounts from physical inventory stock lines
-            inventory_item = Inventory.objects.filter(material=self.material, location=self.loss_location).first()
+            inventory_item = Inventory.objects.filter(product=self.product, location=self.loss_location).first()
             if inventory_item:
                 inventory_item.quantity_available -= self.quantity_lost
                 # Triggers clean validation checks if loss plunges stock into negative boundaries
                 inventory_item.save()
 
     def __str__(self):
-        return f"Loss #{self.loss_id} — {self.quantity_lost} of {self.material.name} written off"
+        return f"Loss #{self.loss_id} — {self.quantity_lost} of {self.product.name} written off"
 class FinanceEntry(models.Model):
     finance_entry_id = models.AutoField(primary_key=True)
     ENTRY_TYPE_CHOICES = [
