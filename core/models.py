@@ -151,7 +151,7 @@ class WorkOrder(models.Model):
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
     production_start_date = models.DateField()
-    production_end_date = models.DateField()    
+    production_end_date = models.DateField() 
 
 # validation to ensure that production end date is not before production start date and quantity produced does not exceed quantity consumed
     def clean(self):
@@ -250,6 +250,7 @@ class DispatchRecord(models.Model):
            if self.quantity_dispatched > self.production_order.quantity_produced: 
                 raise ValidationError(f"Dispatched quantity ({self.quantity_dispatched}) cannot exceed "
                     f"produced quantity ({self.production_order.quantity_produced})."
+                    
                 )
 
     def save(self, *args, **kwargs):
