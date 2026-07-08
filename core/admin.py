@@ -29,7 +29,8 @@ class InvoiceLineInline(admin.TabularInline):
 class WorkOrderInstructionInline(admin.TabularInline):
     model = WorkOrderInstruction
     extra = 1
-    fields = ('step_number', 'machine', 'instruction_text', 'estimated_time_minutes')    
+    fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
+    readonly_fields = ['step_number']  # Auto-incremented field, should not be editable    
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
     list_display = ('name', 'supplier_id', 'contact_info', 'payment_terms')
@@ -103,7 +104,7 @@ class ProductAdmin(admin.ModelAdmin):
 
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
-    list_display = ('procurement_order_id', 'product', 'supplier', 'quantity_ordered', 'price_per_unit', 'total_cost', 'order_date', 'status')
+    list_display = ('procurement_order_id', 'product', 'supplier', 'quantity', 'price_per_unit', 'total_cost', 'order_date', 'status')
     list_filter = ['status', 'order_date', 'supplier']
     search_fields = ('product__name', 'product__sku', 'supplier__name')
     readonly_fields = ['total_cost']  # Computed field, should not be editable

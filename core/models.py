@@ -31,7 +31,7 @@ class Product(models.Model):
     category = models.CharField(max_length=255)
     unit_of_measurement = models.CharField(max_length=255)
     cost_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Cost per unit must be a positive amount greater than zero.")
-    stock_level = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Stock level cannot drop below zero.")
+    ordered_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Ordered quantity cannot be negative.")
 
     # Added field-level validation rules
     def clean(self):       
@@ -42,6 +42,21 @@ class Product(models.Model):
             raise ValidationError({'supplier': 'Finished and intermediate goods cannot have an externally associated supplier.'})
         
     def save(self, *args, **kwargs):
+        previously_completed = False
+        if self.pk:
+            previously_completed = Product.objects.filter(pk=self.pk, product_type='FINISHED').exists()
+
+            super().save(*args, **kwargs)
+
+           # If the product is a finished good and it was not previously completed, create an inventory record for it 
+            if self.product_type == 'FINISHED' and not previously_completed:
+                inventory_item, created = Inventory.objects.get_or_create(
+                    product=self,
+                    location='Main Warehouse',
+                    defaults={'quantity_available': Decimal('0.00')}
+                )
+                inventory_item.quantity_available = self.ordered_quantity
+                inventory_item.save()
         # Auto-generate SKU if not provided
         if not self.sku:
             prefix_map = {
@@ -75,7 +90,7 @@ class ProcurementOrder(models.Model):
     procurement_order_id = models.AutoField(primary_key=True)
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='procurement_order')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='procurement_order')
-    quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Price per unit must be a positive amount greater than zero.")
     total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True, default=Decimal('0.00'), help_text="Total cost is automatically calculated based on quantity ordered and price per unit.")
     order_date = models.DateField()
@@ -84,15 +99,15 @@ class ProcurementOrder(models.Model):
     
     # when status is updated to 'Delivered', the quantity should be added to inventory and total cost should be calculated based on quantity ordered and price per unit
     def clean(self):
-        if self.product and self.product.product_type == 'INTERMEDIATE':
-            raise ValidationError({'product': 'procurement orders can only be created for finished products.'})
+        if self.product and self.product.product_type == 'FINISHED':
+            raise ValidationError({'product': 'finished products are manufactured internally. Use a production order instead of a procurement order for finished products.'})
 
     def save(self, *args, **kwargs):
-        if self.product and self.quantity_ordered:
-            raw_cost = self.quantity_ordered * self.price_per_unit
+        if self.product and self.quantity:
+            raw_cost = self.quantity * self.price_per_unit
             self.total_cost = raw_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         else:
-            if not self.product or not self.quantity_ordered:
+            if not self.product or not self.quantity:
                 self.total_cost = Decimal('0.00')
         self.full_clean()  # Ensure validation is performed before saving
 
@@ -110,7 +125,7 @@ class ProcurementOrder(models.Model):
                     defaults={'quantity_available': Decimal('0.00')}
                 )
 
-                inventory_item.quantity_available += self.quantity_ordered
+                inventory_item.quantity_available += self.quantity
                 inventory_item.save()
 
     def __str__(self):
@@ -149,9 +164,9 @@ class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order')
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
-    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
+    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     production_start_date = models.DateField()
-    production_end_date = models.DateField() 
+    production_end_date = models.DateField(null=True, blank=True)  # Can be null until production is completed
 
 # validation to ensure that production end date is not before production start date and quantity produced does not exceed quantity consumed
     def clean(self):
@@ -170,23 +185,38 @@ class WorkOrder(models.Model):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
 class WorkOrderInstruction(models.Model):
+    STATUS_CHOICES = [
+        ('CANCELLED', 'Cancelled'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('COMPLETED', 'Completed'),
+    ]
     instruction_id = models.AutoField(primary_key=True)
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='instructions')
     product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
-    step_number = models.IntegerField()
+    step_number = models.PositiveIntegerField(null=True, blank=True)
+    step_name = models.CharField(max_length=255, null=True, blank=True)
     machine=models.CharField(max_length=255, blank=True, null=True, default='No machine assigned')
     instruction_text = models.TextField()    
     estimated_time_minutes = models.PositiveIntegerField(blank=True, null=True, default=0, validators=[MinValueValidator(0)])
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
 
     class Meta:
         unique_together = ('work_order', 'step_number')
         ordering = ['step_number']
 
+    def save(self, *args, **kwargs):
+        if not self.step_number:
+            highest_step = WorkOrderInstruction.objects.filter(work_order=self.work_order).aggregate(models.Max('step_number'))['step_number__max']
+            self.step_number = (highest_step or 0) + 1
+
+        self.full_clean()  # Ensure validation is performed before saving
+        super().save(*args, **kwargs)    
+
 # string representation of the instruction showing work order id, step number and first 50 characters of instruction text
     def __str__(self):
         text_preview = self.instruction_text[:50]
         snippet = f"{text_preview}..." if len(self.instruction_text) > 50 else text_preview
-        return f"WO-{self.work_order.work_order_id} - Step {self.step_number}:{snippet}"      
+        return f"step {self.step_number}: {self.step_name} ({self.status})"    
   
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
@@ -197,8 +227,8 @@ class ProductionOrder(models.Model):
     ]
     production_order_id = models.AutoField(primary_key=True)
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs')
-    employee = models.ManyToManyField('Employee', related_name='production_runs', help_text="Employees assigned to this production run.")
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
+    employee = models.ManyToManyField('Employee', related_name='production_runs', help_text="Employees assigned to this production run.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
     # stays empty until a run physically transitions to IN_PROGRESS
     actual_start_date = models.DateField(blank=True, null=True)
@@ -223,6 +253,29 @@ class ProductionOrder(models.Model):
         if self.status == 'COMPLETED' and not self.actual_end_date:
             raise ValidationError('A completed production order must have an actual end date.')
 
+        if self.work_order:
+            if not self.product:
+                self.product = self.work_order.product
+
+            if not self.quantity_produced and hasattr(self.work_order, 'quantity_produced'):
+                self.quantity_produced = self.work_order.quantity_produced
+
+            if not self.actual_start_date and hasattr(self.work_order, 'start_date'):
+                self.actual_start_date = self.work_order.start_date
+
+            if not self.actual_end_date and hasattr(self.work_order, 'end_date'):
+                self.actual_end_date = self.work_order.end_date
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        self.full_clean()  # Ensure validation is performed before saving
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+
+        if is_new and self.work_order:
+            if hasattr(self.work_order, 'employee'):
+                self.employee.set(self.work_order.employee.all())                       
+                    
     def __str__(self):
         return f"Prod Order {self.production_order_id} ({self.get_status_display()}) - Blueprint: WO-{self.work_order.work_order_id}"            
 class Customer(models.Model):
