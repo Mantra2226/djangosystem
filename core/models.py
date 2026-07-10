@@ -162,9 +162,10 @@ class Employee(models.Model):
         return f"{self.employee_name} ({self.role})"
 class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
+    bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order')
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
-    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     production_start_date = models.DateField()
     production_end_date = models.DateField(null=True, blank=True)  # Can be null until production is completed
 
@@ -178,6 +179,11 @@ class WorkOrder(models.Model):
             raise ValidationError({'product': 'Work orders can only be created for finished or intermediate products.'})
 
     def save(self, *args, **kwargs):
+        # AUTOMATION: Default to the active recipe for this product if left blank
+        if not self.bill_of_material and self.product:
+            active_bom = self.product.boms.filter(is_active=True).first()
+            if active_bom:
+                self.bill_of_material = active_bom
         self.full_clean()  # Ensure validation is performed before saving
         super().save(*args, **kwargs)        
         
@@ -217,7 +223,76 @@ class WorkOrderInstruction(models.Model):
         text_preview = self.instruction_text[:50]
         snippet = f"{text_preview}..." if len(self.instruction_text) > 50 else text_preview
         return f"step {self.step_number}: {self.step_name} ({self.status})"    
-  
+
+class BillOfMaterial(models.Model):
+    bom_id = models.AutoField(primary_key=True)
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']},
+        help_text="The finished or intermediate good this recipe creates.")
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(
+        default=True, 
+        help_text="Designates whether this is the active recipe used for live manufacturing runs."
+    )
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Bill of Material"
+        verbose_name_plural = "Bills of Materials"
+
+    def clean(self):
+        # Enforce that raw materials cannot have a BOM blueprint
+        if self.product and self.product.product_type == 'RAW':
+            raise ValidationError({
+                'product': 'You cannot create a Bill of Materials for a raw material.'
+            })
+
+        # Safeguard: Ensure only ONE active BOM exists per product at any given time
+        if self.is_active:
+            qs = BillOfMaterial.objects.filter(product=self.product, is_active=True)
+            if self.pk:
+                qs = qs.exclude(pk=self.pk)
+            if qs.exists():
+                raise ValidationError({
+                    'is_active': f"An active BOM already exists for '{self.product.name}'. Please deactivate the old BOM first."
+                })
+
+    def __str__(self):
+        return f"BOM: {self.product.name} ({self.name}) - Active: {self.is_active}"
+
+
+class BOMItem(models.Model):
+    bom_item_id = models.AutoField(primary_key=True)
+    bom = models.ForeignKey('BillOfMaterial', on_delete=models.CASCADE, related_name='components')
+    
+    # The ingredient going into the recipe
+    component = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='used_in_boms', limit_choices_to={'product_type__in': ['RAW', 'INTERMEDIATE']}, help_text="A raw material, retail item or intermediate sub-assembly required for production.")
+    # Quantity required to manufacture exactly ONE unit of the parent product
+    quantity_required = models.DecimalField(
+        max_digits=10, 
+        decimal_places=4,  # Expanded to 4 decimal places for precision blending/measurements
+        validators=[MinValueValidator(Decimal('0.0001'))],
+        help_text="The precise amount needed to create 1 unit of the parent product."
+    )
+
+    def clean(self):
+        # Infinite Loop Prevention: A product cannot be an ingredient in its own recipe card!
+        if self.bom and self.component == self.bom.product:
+            raise ValidationError({
+                'component': f"Circular Dependency Error: '{self.component.name}' cannot be an ingredient in its own build recipe."
+            })
+        # DEEP NESTED LOOP CHECK 
+        # Checks if the component you are adding already relies on the parent product in its own BOM
+        if self.component.boms.filter(components__component=self.bom.product).exists():
+            raise ValidationError({
+                'component': f"Circular Dependency Detected: You are trying to add '{self.component.name}' here, "
+                             f"but '{self.component.name}' already requires '{self.bom.product.name}' in its own active BOM!"
+            })
+
+    def __str__(self):
+        return f"{self.quantity_required}x {self.component.name} inside {self.bom}"
+
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
         ('IN_PROGRESS', 'in_progress'),
@@ -243,8 +318,8 @@ class ProductionOrder(models.Model):
             if not self.product:
                 self.product = self.work_order.product
 
-            if not self.quantity_produced and hasattr(self.work_order, 'quantity_produced'):
-                self.quantity_produced = self.work_order.quantity_produced
+            if not self.quantity and hasattr(self.work_order, 'quantity'):
+                self.quantity = self.work_order.quantity
 
 
     def save(self, *args, **kwargs):
@@ -255,8 +330,49 @@ class ProductionOrder(models.Model):
 
         if is_new and self.work_order:
             if hasattr(self.work_order, 'employee'):
-                self.employee.set(self.work_order.employee.all())                       
+                self.employee.set(self.work_order.employee.all())
+        
+        is_transitioning_to_progress = False
+        if self.pk:
+            old_instance = ProductionOrder.objects.get(pk=self.pk)
+            if old_instance.status != 'IN_PROGRESS' and self.status == 'IN_PROGRESS':
+                is_transitioning_to_progress = True
+        elif self.status == 'IN_PROGRESS':
+            is_transitioning_to_progress = True   
+
+
+        # 2. Execute within an atomic transaction block
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+
+            # AUTOMATED CONSUMPTION: Deduct ingredients if the build starts
+            if is_transitioning_to_progress and self.work_order.bill_of_material:
+                bom = self.work_order.bill_of_material
+                target_quantity = self.work_order.quantity # Total amount being manufactured
+                
+                # Loop through every ingredient requirement row
+                for item in bom.components.all():
+                    # Total needed = multiplier quantity * batch run volume
+                    total_needed = item.quantity_required * target_quantity
                     
+                    # Target the physical ledger row for this component
+                    inventory_item = Inventory.objects.filter(
+                        product=item.component, 
+                        location='Main Warehouse'
+                    ).first()
+                    
+                    if not inventory_item or inventory_item.quantity_available < total_needed:
+                        # Throw an error to halt the save if components are missing
+                        raise ValidationError(
+                            f"Insolvent Stock Error: Insufficient inventory for ingredient '{item.component.name}'. "
+                            f"Required: {total_needed}, Available: {inventory_item.quantity_available if inventory_item else 0.00}"
+                        )
+                    
+                    # Deduct stock and commit changes to the ledger
+                    inventory_item.quantity_available -= total_needed
+                    inventory_item.save()                                
+            self.full_clean()
+                
     def __str__(self):
         return f"Prod Order {self.production_order_id} ({self.get_status_display()}) - Blueprint: WO-{self.work_order.work_order_id}"            
 class Customer(models.Model):
@@ -281,9 +397,9 @@ class DispatchRecord(models.Model):
             if self.delivery_date < self.dispatch_date:
                 raise ValidationError('Delivery date cannot be before dispatch date.')
         if self.quantity_dispatched and self.production_order:
-           if self.quantity_dispatched > self.production_order.quantity_produced: 
+           if self.quantity_dispatched > self.production_order.quantity: 
                 raise ValidationError(f"Dispatched quantity ({self.quantity_dispatched}) cannot exceed "
-                    f"produced quantity ({self.production_order.quantity_produced})."
+                    f"produced quantity ({self.production_order.quantity})."
                     
                 )
 
@@ -356,7 +472,7 @@ class PurchaseInvoice(models.Model):
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
     invoice_date = models.DateField()
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
-    
+
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
     paid_date = models.DateField(blank=True, null=True, help_text="Date when the invoice was fully paid. Leave blank if unpaid or partially paid.")
     created_at = models.DateTimeField(auto_now_add=True)

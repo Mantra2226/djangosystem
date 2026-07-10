@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
-from .models import (InvoiceLine, PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
+from .models import (InvoiceLine, PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem
 )
 
 admin.register(Supplier)
@@ -21,6 +21,8 @@ admin.register(LossRecord)
 admin.register(FinanceEntry)
 admin.register(WorkOrder)
 admin.register(WorkOrderInstruction)
+admin.register(BillOfMaterial)
+admin.register(BOMItem)
 
 # Register your models here.
 class InvoiceLineInline(admin.TabularInline):
@@ -33,6 +35,13 @@ class WorkOrderInstructionInline(admin.TabularInline):
     extra = 1
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
     readonly_fields = ['step_number']  # Auto-incremented field, should not be editable    
+
+class BOMItemInline(admin.TabularInline):
+    model = BOMItem
+    extra = 1  # Provides one empty row by default for quick typing
+    fk_name = 'bom'
+    # Use autocomplete if your product catalog contains hundreds of items
+    autocomplete_fields = ['component']    
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
     list_display = ('name', 'supplier_id', 'contact_info', 'payment_terms')
@@ -178,6 +187,17 @@ class CustomerAdmin(admin.ModelAdmin):
     list_display = ('customer_name', 'contact_info')
     search_fields = ('customer_name', 'contact_info')
 
+@admin.register(BillOfMaterial)
+class BillOfMaterialAdmin(admin.ModelAdmin):
+    list_display = ('product', 'name', 'is_active', 'get_component_count', 'updated_at')
+    list_filter = ['is_active']
+    search_fields = ('product__name', 'name', 'product__sku')
+    inlines = [BOMItemInline]
+
+    @admin.display(description='Total Ingredients')
+    def get_component_count(self, obj):
+        return obj.components.count()    
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = ('sku', 'name', 'product_type', 'supplier', 'cost_per_unit')
@@ -200,7 +220,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date')
+    list_display = ('work_order_id', 'product', 'display_employees', 'quantity', 'production_start_date', 'production_end_date')
     inlines = [WorkOrderInstructionInline]
     search_fields = ('product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
