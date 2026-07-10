@@ -220,7 +220,6 @@ class WorkOrderInstruction(models.Model):
   
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
-        ('PENDING', 'pending'),
         ('IN_PROGRESS', 'in_progress'),
         ('COMPLETED', 'completed'),
         ('CANCELLED', 'cancelled'),
@@ -228,30 +227,17 @@ class ProductionOrder(models.Model):
     production_order_id = models.AutoField(primary_key=True)
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs')
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
-    employee = models.ManyToManyField('Employee', related_name='production_runs', help_text="Employees assigned to this production run.")
-    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity produced must be a positive amount greater than zero.")
+    employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
     # stays empty until a run physically transitions to IN_PROGRESS
-    actual_start_date = models.DateField(blank=True, null=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
-    actual_end_date = models.DateField(blank=True, null=True)  
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
     notes = models.TextField(blank=True, null=True, help_text="Any issues or notes during this production run.")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        ordering = ['-actual_start_date']    
+ 
 
     def clean(self):
-        if self.actual_end_date and self.actual_start_date:
-            if self.actual_end_date < self.actual_start_date:
-                raise ValidationError('Actual end date cannot be before actual start date.')
 # Require an actual start date if status is IN_PROGRESS
-        if self.status == 'IN_PROGRESS' and not self.actual_start_date:
-            self.actual_start_date = timezone.now().date()
-# Require an actual end date if status is COMPLETED
-        if self.status == 'COMPLETED' and not self.actual_end_date:
-            raise ValidationError('A completed production order must have an actual end date.')
 
         if self.work_order:
             if not self.product:
@@ -260,11 +246,6 @@ class ProductionOrder(models.Model):
             if not self.quantity_produced and hasattr(self.work_order, 'quantity_produced'):
                 self.quantity_produced = self.work_order.quantity_produced
 
-            if not self.actual_start_date and hasattr(self.work_order, 'start_date'):
-                self.actual_start_date = self.work_order.start_date
-
-            if not self.actual_end_date and hasattr(self.work_order, 'end_date'):
-                self.actual_end_date = self.work_order.end_date
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -375,6 +356,7 @@ class PurchaseInvoice(models.Model):
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
     invoice_date = models.DateField()
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
+    
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
     paid_date = models.DateField(blank=True, null=True, help_text="Date when the invoice was fully paid. Leave blank if unpaid or partially paid.")
     created_at = models.DateTimeField(auto_now_add=True)

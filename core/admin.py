@@ -1,5 +1,7 @@
 from django.contrib import admin
 from django.utils.html import format_html
+import json
+from django.core.serializers.json import DjangoJSONEncoder
 from .models import (InvoiceLine, PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction
 )
 
@@ -45,14 +47,94 @@ class InventoryAdmin(admin.ModelAdmin):
 
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
-    list_display = ('product', 'display_employees', 'work_order', 'quantity_produced', 'actual_start_date', 'actual_end_date', 'status')
-    list_filter = ['status', 'actual_start_date']
+    # display
+    list_display = ('product', 'work_order', 'get_product', 'get_quantity', 'status')
+    list_filter = ['status']
     search_fields = ('work_order__work_order_id', 'employee__employee_name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
+    readonly_fields = ['work_order_details_viewer']
+    
+    fieldsets = (
+        ('1 Blueprint selection', {
 
-    def display_employees(self, obj):
-        return ", ".join([employee.employee_name for employee in obj.employee.all()])
-    display_employees.short_description = 'Assigned Employees'
+          'fields': ('work_order', 'status', 'work_order_details_viewer'),
+           'description': 'autofilled from the selected Work Order.'
+        }),
+    )
+
+    @admin.display(description='Product')
+    def get_product(self, obj):
+        return obj.product.name if obj.product else 'N/A'
+    
+    @admin.display(description='Quantity')
+    def get_quantity(self,obj):
+        if obj.work_order:
+            return getattr( obj.work_order, 'quantity_produced', getattr(obj.work_order, 'quantity', '0.00')) 
+        return "0.00"
+
+    def work_order_details_viewer(self, obj):
+        work_orders = WorkOrder.objects.all()
+        blueprint_data = {}
+        for wo in work_orders:
+            if hasattr(wo, 'product') and wo.product:
+
+                emp_list = []
+                if hasattr(wo, 'employee') and wo.employee:
+                    emp_list = [getattr(emp, 'employee_name', str(emp)) for emp in wo.employee.all()]
+                
+                blueprint_data[wo.work_order_id] = {
+                    'product_name': wo.product.name,
+                    'product_sku': getattr(wo.product, 'sku', ''),
+                    'assigned_employees': emp_list,
+                    'quantity_produced': getattr(wo, 'quantity_produced', getattr(wo, 'quantity', '0.00')),
+                    'production_start_date': getattr(wo, 'production_start_date', ''),
+                    'production_end_date': getattr(wo, 'production_end_date', ''),
+                    'status': getattr(wo, 'status', 'N/A'),
+                }
+
+        json_data = json.dumps(blueprint_data, cls=DjangoJSONEncoder)   
+
+        html_string = f"""
+        <div id="wo-preview-panel" style="margin-top: 10px; padding: 12px; background: #f8f9fa; border-left: 4px solid #79aec8; border-radius: 4px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.05); color: #333; max-width: 600px;">
+            <strong style="color: #555; display: block; margin-bottom: 5px;">Blueprint Live Specifications:</strong>
+            <div id="wo-preview-content" style="font-size: 13px; line-height: 1.6;">
+                <span style="color: #666; font-style: italic;">Select a Work Order from the dropdown above to look into its structural details...</span>
+            </div>
+        </div>
+        
+        <script type="text/javascript">
+            document.addEventListener('DOMContentLoaded', function() {{
+                var blueprintLookup = {json_data};
+                var selectField = document.getElementById('id_work_order');
+                var displayBox = document.getElementById('wo-preview-content');
+                
+                if (!selectField) return;
+                
+                function updateLiveUI() {{
+                    var selectedId = selectField.value;
+                    if (selectedId && blueprintLookup[selectedId]) {{
+                        var info = blueprintLookup[selectedId];
+                        displayBox.innerHTML = 
+                            "<strong>Target Product:</strong> " + info.product_name + "(" + info.product_sku + ") <br>" +
+                            "<strong>Expected Yield:</strong> " + info.quantity_produced + "<br>" +
+                            "<strong>Assigned Team/Crew:</strong> " + info.assigned_employees + "<br>" +
+                            "<strong>Current Step Status:</strong> <span style='text-transform: uppercase; font-weight: bold; color: #264b5d;'>" + info.status + "</span>";
+                    }} else {{
+                        displayBox.innerHTML = "<span style='color: #666; font-style: italic;'>Select a Work Order from the dropdown above to look into its structural details...</span>";
+                    }}
+                }}
+                
+                // Fire update every time the user clicks a different option
+                selectField.addEventListener('change', updateLiveUI);
+                
+                // Fire instantly on page load if editing an existing run
+                updateLiveUI(); 
+            }});
+        </script>
+        """ 
+        return format_html(html_string)
+    
+    work_order_details_viewer.short_description = "Blueprint Live Specifications"
 
 
 @admin.register(Invoice)
