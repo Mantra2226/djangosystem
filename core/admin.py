@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
-from .models import (InvoiceLine, PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem
+from .models import (PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment
 )
 
 admin.register(Supplier)
@@ -14,8 +14,9 @@ admin.register(ProductionOrder)
 admin.register(Customer)
 admin.register(DispatchRecord)
 admin.register(Invoice)
+admin.register(SalesInvoicePayments)
 admin.register(PurchaseInvoice) 
-admin.register(InvoiceLine)
+admin.register(PurchasePayment)
 admin.register(Return)
 admin.register(LossRecord)
 admin.register(FinanceEntry)
@@ -25,11 +26,6 @@ admin.register(BillOfMaterial)
 admin.register(BOMItem)
 
 # Register your models here.
-class InvoiceLineInline(admin.TabularInline):
-    model = InvoiceLine
-    extra = 1
-    fields = ('description', 'quantity', 'unit_price', 'line_total')
-    readonly_fields = ['line_total'] #computed field on save, should not be editable
 class WorkOrderInstructionInline(admin.TabularInline):
     model = WorkOrderInstruction
     extra = 1
@@ -42,6 +38,19 @@ class BOMItemInline(admin.TabularInline):
     fk_name = 'bom'
     # Use autocomplete if your product catalog contains hundreds of items
     autocomplete_fields = ['component']    
+
+class SalesInvoicePaymentsInline(admin.TabularInline):
+    model = SalesInvoicePayments
+    extra = 1  
+    fields = ('amount', 'payment_method', 'paid_at')   
+    readonly_fields = ['paid_at']
+
+class PurchasePaymentInline(admin.TabularInline):
+    model = PurchasePayment
+    extra = 1
+    fields =  ('amount', 'payment_method', 'paid_at') 
+    readonly_fields = ['paid_at']
+  
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
     list_display = ('name', 'supplier_id', 'contact_info', 'payment_terms')
@@ -56,7 +65,6 @@ class InventoryAdmin(admin.ModelAdmin):
 
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
-    # display
     list_display = ('product', 'work_order', 'get_product', 'get_quantity', 'status')
     list_filter = ['status']
     search_fields = ('work_order__work_order_id', 'employee__employee_name')  
@@ -148,18 +156,37 @@ class ProductionOrderAdmin(admin.ModelAdmin):
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_id', 'invoice_number', 'customer', 'total_amount', 'invoice_date', 'status')
+    list_display = ('invoice_id', 'invoice_number', 'customer', 'total_amount', 'remaining_balance', 'invoice_date', 'status')
     list_filter = ['status', 'invoice_date', 'customer']
     search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_id')
-    inlines = []
-    readonly_fields = ['total_amount']  # Computed field, should not be editable
+    inlines = [SalesInvoicePaymentsInline]
+    readonly_fields = ['status', 'remaining_balance']  # Computed field, should not be editable
+
+    def get_balance_status(self, obj):
+        balance = obj.remaining_balance
+        if balance < 0:
+            return f"Overpaid (Credit Due): ${abs(balance)}"
+        return f"${balance}"
+    
+    # Renames the column header in the admin table list view
+    get_balance_status.short_description = 'Remaining Balance'
 
 @admin.register(PurchaseInvoice)
 class PurchaseInvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'supplier', 'total_amount', 'invoice_date', 'status', 'paid_date')
+    list_display = ('invoice_number', 'supplier', 'total_amount', 'invoice_date', 'status', 'remaining_balance')
     list_filter = ['status', 'invoice_date']
     search_fields = ('invoice_number', 'supplier__name')
+    inlines = [PurchasePaymentInline]
+    readonly_fields = ['status', 'remaining_balance']
 
+    def get_balance_status(self, obj):
+        balance = obj.remaining_balance
+        if balance < 0:
+            return f"Overpaid (Credit Due): ${abs(balance)}"
+        return f"${balance}"
+    
+    # Renames the column header in the admin table list view
+    get_balance_status.short_description = 'Remaining Balance'
 @admin.register(Return)
 class ReturnAdmin(admin.ModelAdmin):
     list_display = ('dispatch_id', 'customer', 'quantity_returned', 'reason_for_return', 'quality_control_status')

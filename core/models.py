@@ -7,6 +7,8 @@ from django.utils import timezone
 from decimal import ROUND_HALF_UP, Decimal
 from django.utils.text import slugify
 from django.core.validators import MinValueValidator
+from django.db.models import Sum
+from django.utils import timezone
 # models.
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
@@ -454,17 +456,81 @@ class Invoice(models.Model):
             next_id = (last_invoice.invoice_id + 1) if last_invoice else 1
             
             # Format with leading zeros so it stays neat (zfill padding)
-            self.invoice_number = f"INV-{year_month}-{str(next_id).zfill(4)}"    
+            self.invoice_number = f"INV-{year_month}-{str(next_id).zfill(4)}"
         super().save(*args, **kwargs)
+
+    @property
+    def remaining_balance(self):
+        """Calculates the live remaining balance on the invoice."""
+        total_paid = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        return self.total_amount - total_paid
+
+    def update_payment_status(self):
+        """Auto-updates customer bill status based on incoming payments."""
+        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        
+        if total_paid >= self.total_amount:
+            self.status = 'PAID'
+        elif total_paid > 0:
+            self.status = 'PARTIAL'
+        else:
+            self.status = 'UNPAID'
+        self.save(update_fields=['status']) 
+
 
     def __str__(self):
         return f"[Customer Invoice] #{self.invoice_number} — ${self.total_amount} ({self.customer.customer_name})"
 
+class SalesInvoicePayments(models.Model):
+    invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE, related_name='payments')
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card'), ('TRANSFER', 'Bank Transfer')])
+    reference_number = models.CharField(max_length=100, blank=True)
+    paid_at = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        super().clean()
+        
+        # Skip validation if invoice or amount missing during form typing
+        if not hasattr(self, 'invoice') or self.amount is None:
+            return
+
+        # Gather all OTHER historical payments for this specific invoice
+        other_payments = self.invoice.payments.all()
+        
+        # Edge Case Safeguard: If EDITING an existing payment row, 
+        # exclude its own old value from the history so we don't double-count it.
+        if self.pk:
+            other_payments = other_payments.exclude(pk=self.pk)
+
+        # Summing up what has already been collected
+        total_already_paid = other_payments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        
+        # Calculating remaining threshold limit
+        remaining_balance = self.invoice.total_amount - total_already_paid
+
+    @property
+    def remaining_balance(self):
+        """
+        Calculates live outstanding balance. 
+        """
+        total_paid = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        return self.total_amount - total_paid    
+        
+        
+
+    def save(self, *args, **kwargs):
+        # Force the full validation routine to run before saving
+        self.full_clean()
+        
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            self.invoice.update_payment_status()
 class PurchaseInvoice(models.Model):
     STATUS_CHOICES = [
         ('PAID', 'Paid'),
         ('UNPAID', 'Unpaid'),
-        ('PARTIALLY_PAID', 'Partially Paid'),
+        ('PARTIAL', 'Partially Paid'),
     ]   
     invoice_id = models.AutoField(primary_key=True)
     invoice_number = models.CharField(max_length=50, unique=True, help_text="Unique identifier for the purchase invoice from the supplier.")
@@ -474,7 +540,6 @@ class PurchaseInvoice(models.Model):
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
-    paid_date = models.DateField(blank=True, null=True, help_text="Date when the invoice was fully paid. Leave blank if unpaid or partially paid.")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def clean(self):
@@ -484,49 +549,84 @@ class PurchaseInvoice(models.Model):
         # Ensure that the supplier on the invoice matches the supplier on the procurement order
         if self.procurement_order and self.procurement_order.supplier != self.supplier:
             raise ValidationError({'supplier': 'The supplier on the invoice must match the supplier on the procurement order.'})
-    
-        if self.status == 'PAID' and not self.paid_date:
-            raise ValidationError({'paid_date': 'An invoice marked as PAID must have an associated payment settlement date.'})
-        if self.status != 'PAID' and self.paid_date:
-            raise ValidationError({'paid_date': 'Paid date should only be set when the invoice status is PAID.'})
         
     def save(self, *args, **kwargs):
         self.full_clean()  # Ensure validation is performed before saving
         # auto calculate total amount for the purchase invoice based on quantity ordered and price per unit
         if self.procurement_order:
-            self.total_amount = self.procurement_order.quantity_ordered * self.procurement_order.price_per_unit
+            self.total_amount = self.procurement_order.quantity * self.procurement_order.price_per_unit
+        if self.total_amount is not None:
+            self.total_amount = Decimal(str(self.total_amount)).quantize(Decimal('0.01'))
+
+        self.full_clean()    
         super().save(*args, **kwargs)
+    
+    @property
+    def remaining_balance(self):
+        """Calculates live outstanding balance owed to the supplier."""
+        total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        return self.total_amount - total_paid
+
+    def update_payment_status(self):
+        """Auto-updates supplier bill status based on outgoing payments."""
+        total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        
+        if total_paid >= self.total_amount:
+            self.status = 'PAID'
+        elif total_paid > 0:
+            self.status = 'PARTIAL'
+        else:
+            self.status = 'UNPAID'
+        self.save(update_fields=['status'])  
+
+    # Inside your PurchaseInvoice model in core/models.py
+
+def update_payment_status(self):
+    """Auto-updates supplier bill status and date stamps based on outgoing payments."""
+    total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+    
+    if total_paid >= self.total_amount:
+        self.status = 'PAID'
+        # If it's newly paid and has no date, stamp it with the current time automatically
+        if not self.paid_date:
+            self.paid_date = timezone.now()
+            
+    elif total_paid > 0:
+        self.status = 'PARTIAL'
+        # Clear the date stamp if a payment is deleted and it drops back to partial
+        self.paid_date = None
+        
+    else:
+        self.status = 'UNPAID'
+        # Clear the date stamp if all payments are deleted
+        self.paid_date = None
+        
+    # Add 'paid_date' to the update_fields list so Django saves it
+    self.save(update_fields=['status', 'paid_date'])      
 
     def __str__(self):
-        return f"Purchase Invoice #{self.invoice_number} — ${self.total_amount or 0.00} ({self.supplier.name})"        
-class InvoiceLine(models.Model):
-    invoice_line_id = models.AutoField(primary_key=True)
-    invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE)
-    supplier = models.ForeignKey('Supplier', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice_line')
-    Employee = models.ForeignKey('Employee', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice_line')
-    Production_order = models.ForeignKey('ProductionOrder', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice_line')
-    description = models.CharField(max_length=255, help_text="Description of the goods or manufacturing service rendered.")
-    quantity = models.DecimalField(max_digits=10, decimal_places=2)
-    unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Unit price must be a positive amount greater than zero.")
-    subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], editable=False, blank=True)
-    tax_rate = models.DecimalField(max_digits=4, decimal_places=2, default=Decimal('0.00'), help_text="Tax percentage applied to this line (e.g., 16.00 for 16%).", validators=[MinValueValidator(Decimal('0.00'))])   
-    line_total = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], editable=False)
+        return f"Purchase Invoice #{self.invoice_number} — ${self.total_amount or 0.00} ({self.supplier.name})"
 
-    class Meta:
-        ordering = ['invoice_line_id'] 
+class PurchasePayment(models.Model):
+    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='purchase_payments')
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('TRANSFER', 'Bank Transfer')])
+    reference_number = models.CharField(max_length=100, blank=True, help_text="Transaction reference/receipt ID")
+    paid_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
-        # Calculate the base costs
-        self.subtotal = self.quantity * self.unit_price
-        self.line_total = self.subtotal + (self.subtotal * self.tax_rate / 100)
-        # Force Django validation to run (checks for negative values, etc.)
+        # Keeps native Django field validations active
         self.full_clean()
-        
-        super().save(*args, **kwargs)  
-    
-    def __str__(self):
-        return f"Invoice Line {self.invoice_line_id} - {self.description} ({self.quantity} @ {self.unit_price})"     
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            self.purchase_invoice.update_payment_status()
 
+    def delete(self, *args, **kwargs):
+        with transaction.atomic():
+            invoice = self.purchase_invoice
+            super().delete(*args, **kwargs)
+            invoice.update_payment_status()    
+     
 class Return(models.Model):
     STATUS_TYPE_CHOICES = [
          ('PENDING', 'Pending Inspection'),
