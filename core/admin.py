@@ -2,6 +2,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
+from django import forms
 from .models import (PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment
 )
 
@@ -42,13 +43,13 @@ class BOMItemInline(admin.TabularInline):
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
     extra = 1  
-    fields = ('amount', 'payment_method', 'paid_at')   
+    fields = ('amount', 'payment_method', 'paid_at', 'reference_number')   
     readonly_fields = ['paid_at']
 
 class PurchasePaymentInline(admin.TabularInline):
     model = PurchasePayment
     extra = 1
-    fields =  ('amount', 'payment_method', 'paid_at') 
+    fields =  ('amount', 'payment_method', 'paid_at', 'reference_number') 
     readonly_fields = ['paid_at']
   
 @admin.register(Supplier)
@@ -63,19 +64,38 @@ class InventoryAdmin(admin.ModelAdmin):
     search_fields = ('product__name', 'product__sku', 'location')
     readonly_fields = ['valuation']  # Computed field, should not be editable
 
+class ProductionOrderAdminForm(forms.ModelForm):
+    class Meta:
+        model = ProductionOrder
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # THE UX FILTER:
+        # If editing an existing Production Order, 
+        # filter the Work Order choices to only show those for this specific product.
+        if self.instance and self.instance.product_id:
+            self.fields['work_order'].queryset = WorkOrder.objects.filter(
+                product=self.instance.product
+            )    
+
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
-    list_display = ('product', 'work_order', 'get_product', 'get_quantity', 'status')
-    list_filter = ['status']
-    search_fields = ('work_order__work_order_id', 'employee__employee_name')  
+    form = ProductionOrderAdminForm
+    list_display = ('product', 'work_order', 'quantity', 'status', 'created_at')
+    list_filter = ['status', 'created_at']
+    search_fields = ('work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
-    readonly_fields = ['work_order_details_viewer']
+    readonly_fields = ['work_order_details_viewer', 'created_at', 'completed_at']
     
     fieldsets = (
-        ('1 Blueprint selection', {
-
-          'fields': ('work_order', 'status', 'work_order_details_viewer'),
-           'description': 'autofilled from the selected Work Order.'
+       ('Order Information', {
+            'fields': ('product', 'work_order', 'quantity', 'status')
+        }),
+        ('System Details (Read Only)', {
+            'fields': ('work_order_details_viewer', 'created_at', 'completed_at'),
+            'classes': ('collapse',), # Collapses this section by default to keep screen clean
         }),
     )
 
@@ -103,7 +123,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
                     'product_name': wo.product.name,
                     'product_sku': getattr(wo.product, 'sku', ''),
                     'assigned_employees': emp_list,
-                    'quantity_produced': getattr(wo, 'quantity_produced', getattr(wo, 'quantity', '0.00')),
+                    'quantity': getattr(wo, 'quantity', getattr(wo, 'quantity', '0.00')),
                     'production_start_date': getattr(wo, 'production_start_date', ''),
                     'production_end_date': getattr(wo, 'production_end_date', ''),
                     'status': getattr(wo, 'status', 'N/A'),
@@ -156,7 +176,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_id', 'invoice_number', 'customer', 'total_amount', 'remaining_balance', 'invoice_date', 'status')
+    list_display = ('invoice_number', 'customer', 'total_amount', 'remaining_balance', 'invoice_date', 'status')
     list_filter = ['status', 'invoice_date', 'customer']
     search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_id')
     inlines = [SalesInvoicePaymentsInline]

@@ -4,7 +4,7 @@ from sys import prefix
 from django.db import models, transaction
 from django.core.exceptions import ValidationError
 from django.utils import timezone
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.utils.text import slugify
 from django.core.validators import MinValueValidator
 from django.db.models import Sum
@@ -23,10 +23,10 @@ class Product(models.Model):
     PRODUCT_TYPE_CHOICES = [
         ('RAW', 'Raw Material'),
         ('FINISHED', 'Finished Good'),
-        ('INTERMEDIATE', 'Intermediate Product'),
+        ('INTERMEDIATE', 'component / sub-assembly'),
     ]
     product_id = models.AutoField(primary_key=True)
-    product_type = models.CharField(max_length=255, choices=PRODUCT_TYPE_CHOICES, default='RAW')
+    product_type = models.CharField(max_length=20, choices=PRODUCT_TYPE_CHOICES, default='FINISHED')
     sku = models.CharField(max_length=100, unique=True, blank=True, help_text="Stock Keeping Unit, auto-generated if left blank.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, blank=True, null=True, related_name='products')
     name = models.CharField(max_length=255)
@@ -228,14 +228,9 @@ class WorkOrderInstruction(models.Model):
 
 class BillOfMaterial(models.Model):
     bom_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']},
-        help_text="The finished or intermediate good this recipe creates.")
-    name = models.CharField(max_length=255)
-    is_active = models.BooleanField(
-        default=True, 
-        help_text="Designates whether this is the active recipe used for live manufacturing runs."
-    )
-    
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']}, help_text="The finished or intermediate good this recipe creates.")
+    name = models.CharField(max_length=255, blank=True, help_text="name is auto-generated after the selected product if left blank.")
+    is_active = models.BooleanField(default=True, help_text="Designates whether this is the active recipe used for live manufacturing runs.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -244,6 +239,10 @@ class BillOfMaterial(models.Model):
         verbose_name_plural = "Bills of Materials"
 
     def clean(self):
+        super().clean()
+        # auto-generates a descriptive name if left blank!
+        if not self.name and self.product_id:
+            self.name = f"BOM - {self.product.name}"
         # Enforce that raw materials cannot have a BOM blueprint
         if self.product and self.product.product_type == 'RAW':
             raise ValidationError({
@@ -259,6 +258,10 @@ class BillOfMaterial(models.Model):
                 raise ValidationError({
                     'is_active': f"An active BOM already exists for '{self.product.name}'. Please deactivate the old BOM first."
                 })
+            
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)        
 
     def __str__(self):
         return f"BOM: {self.product.name} ({self.name}) - Active: {self.is_active}"
@@ -302,29 +305,57 @@ class ProductionOrder(models.Model):
         ('CANCELLED', 'cancelled'),
     ]
     production_order_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs')
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type': 'FINISHED'})
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
-    # stays empty until a run physically transitions to IN_PROGRESS
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.01'))], help_text="Quantity to be produced in this specific run.")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
     notes = models.TextField(blank=True, null=True, help_text="Any issues or notes during this production run.")
 
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(auto_now=True)
  
 
     def clean(self):
-# Require an actual start date if status is IN_PROGRESS
+        super().clean()   
+        # Fallback quantity calculation
+        if (not self.quantity or self.quantity == Decimal('0.00')) and self.work_order_id:
+            self.quantity = self.work_order.quantity
 
-        if self.work_order:
-            if not self.product:
+        # Enforce finished goods only
+        if self.product_id and not self.product.product_type != 'Finished Goods': # Or self.product.product_type != 'FINISHED_GOOD'
+            raise ValidationError({
+                'product': "Only products designated as 'Finished Goods' can be selected for a production run."
+            })       
+        if self.work_order_id:
+            if not self.product_id:
                 self.product = self.work_order.product
 
-            if not self.quantity and hasattr(self.work_order, 'quantity'):
-                self.quantity = self.work_order.quantity
-
+        if (not self.quantity or self.quantity == Decimal('0.00')) and self.work_order_id:
+            self.quantity = self.work_order.quantity    
+       # Checks if product and work_order match
+        if self.product and self.work_order:
+        # Assuming your WorkOrder model has a 'product' field (e.g. self.work_order.product)
+            if self.work_order.product != self.product:
+                raise ValidationError({
+                 'work_order': (
+                    f"Conflict: The selected Work Order ({self.work_order}) is for '{self.work_order.product}', "
+                    f"but this Production Order is set to produce '{self.product}'."
+                )
+            })     
 
     def save(self, *args, **kwargs):
+         # 1. If it transitioned to IN_PROGRESS and doesn't have a start date yet, stamp it
+        if self.status == 'IN_PROGRESS' and not self.created_at:
+            self.created_at = timezone.now()
+        
+        # 2. If it transitioned to COMPLETED and doesn't have a completion date yet, stamp it
+        elif self.status == 'COMPLETED' and not self.completed_at:
+             self.completed_at = timezone.now()
+        
+    # 3. If it gets cancelled or rolled back, clear the completion stamp
+        elif self.status == 'CANCELLED':
+            self.completed_at = None 
         is_new = self.pk is None
         self.full_clean()  # Ensure validation is performed before saving
         with transaction.atomic():
@@ -395,7 +426,7 @@ class DispatchRecord(models.Model):
 
     # validation to ensure that delivery date is not before dispatch date and quantity dispatched does not exceed quantity produced in the production order
     def clean(self):
-        if self.delivery_date < self.dispatch_date:
+        if self.dispatch_date and self.delivery_date:
             if self.delivery_date < self.dispatch_date:
                 raise ValidationError('Delivery date cannot be before dispatch date.')
         if self.quantity_dispatched and self.production_order:
@@ -416,6 +447,7 @@ class DispatchRecord(models.Model):
 class Invoice(models.Model):
     ENTRY_TYPE_CHOICES = [
         ('Paid', 'Paid'),
+        ('Partial', 'Partial Payment'),
         ('Unpaid', 'Unpaid'),
     ]
     invoice_id = models.AutoField(primary_key=True)
@@ -425,23 +457,35 @@ class Invoice(models.Model):
     invoice_date = models.DateField()
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
-    paid_date = models.DateField(null=True, blank=True)
 
-    def clean(self):    
-             # Implemented missing date validation 
+    def clean_fields(self, exclude=None):
+        # Round right as Django starts validating individual fields
+        if self.total_amount is not None:
+            self.total_amount = Decimal(str(self.total_amount)).quantize(
+                Decimal('0.01'), 
+                rounding=ROUND_HALF_UP
+            )
+        super().clean_fields(exclude=exclude)
+
+    def clean(self):  
+        super().clean()     
+        if self.total_amount is not None:
+                self.total_amount = Decimal(str(self.total_amount)).quantize(
+                    Decimal('0.01'), 
+                    rounding=ROUND_HALF_UP
+                )
         if self.dispatch and self.invoice_date < self.dispatch.dispatch_date:
-                raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the physical dispatch date.'})
-        
-        if self.status == 'Paid' and not self.paid_date:
-            raise ValidationError({'paid_date': 'A paid invoice must have an associated payment settlement date.'})
+            raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the physical dispatch date.'}) 
+                   
     # validation to ensure that invoice date is not before dispatch date and total amount is calculated based on quantity dispatched and cost per unit of the material in the production order
+            
+        
     def save(self, *args, **kwargs):
-        self.full_clean()
-        if self.dispatch:
-            self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.product.cost_per_unit
-        else:
-            if not self.total_amount:
-                self.total_amount = Decimal('0.00')  # Default to zero if no dispatch is linked
+        if self.total_amount is not None:
+            self.total_amount = Decimal(str(self.total_amount)).quantize(
+                Decimal('0.01'), 
+                rounding=ROUND_HALF_UP
+            )
         # auto calculate total amount for the invoice based on quantity dispatched and cost per unit
         if self.total_amount and self.dispatch:
             self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.product.cost_per_unit
@@ -457,24 +501,25 @@ class Invoice(models.Model):
             
             # Format with leading zeros so it stays neat (zfill padding)
             self.invoice_number = f"INV-{year_month}-{str(next_id).zfill(4)}"
+        self.full_clean()    
         super().save(*args, **kwargs)
 
     @property
     def remaining_balance(self):
         """Calculates the live remaining balance on the invoice."""
-        total_paid = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.01')
         return self.total_amount - total_paid
 
     def update_payment_status(self):
         """Auto-updates customer bill status based on incoming payments."""
-        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.01')
         
         if total_paid >= self.total_amount:
-            self.status = 'PAID'
+            self.status = 'Paid'
         elif total_paid > 0:
-            self.status = 'PARTIAL'
+            self.status = 'Partial'
         else:
-            self.status = 'UNPAID'
+            self.status = 'Unpaid'
         self.save(update_fields=['status']) 
 
 
@@ -482,21 +527,37 @@ class Invoice(models.Model):
         return f"[Customer Invoice] #{self.invoice_number} — ${self.total_amount} ({self.customer.customer_name})"
 
 class SalesInvoicePayments(models.Model):
-    invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE, related_name='payments')
+    invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE, related_name='sales_payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
-    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card'), ('TRANSFER', 'Bank Transfer')])
+    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card Transfer'), ('TRANSFER', 'Bank Transfer')])
     reference_number = models.CharField(max_length=100, blank=True)
     paid_at = models.DateTimeField(auto_now_add=True)
 
     def clean(self):
         super().clean()
         
+        # Normalizing the payment method to uppercase to handle any casing variations
+        method = (self.payment_method or '').upper()
+        
+        # Clean up the reference number by stripping empty spaces
+        ref_num = (self.reference_number or '').strip()
+        method = (self.payment_method or '').upper()
+        
+        # Clean up the reference number by stripping empty spaces
+        ref_num = (self.reference_number or '').strip()
+
+        requires_reference = ['CARD', 'BANK']
+
+        if method in requires_reference and not ref_num:
+            raise ValidationError({
+                'reference_number': "A reference number (transaction ID or deposit confirmation) is required for payments made by card or bank transfer."
+            })
         # Skip validation if invoice or amount missing during form typing
         if not hasattr(self, 'invoice') or self.amount is None:
             return
 
         # Gather all OTHER historical payments for this specific invoice
-        other_payments = self.invoice.payments.all()
+        other_payments = self.invoice.sales_payments.all()
         
         # Edge Case Safeguard: If EDITING an existing payment row, 
         # exclude its own old value from the history so we don't double-count it.
@@ -610,10 +671,28 @@ def update_payment_status(self):
 class PurchasePayment(models.Model):
     purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='purchase_payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2)
-    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('TRANSFER', 'Bank Transfer')])
-    reference_number = models.CharField(max_length=100, blank=True, help_text="Transaction reference/receipt ID")
+    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card Transfer'), ('TRANSFER', 'Bank Transfer')])
+    reference_number = models.CharField(max_length=100, blank=True, null=True, help_text="Transaction reference/receipt ID for Bank and Mobile money transfers")
     paid_at = models.DateTimeField(auto_now_add=True)
 
+    def clean(self):
+        super().clean()        
+        # Normalizing the payment method to uppercase to handle any casing variations
+        method = (self.payment_method or '').upper()
+        
+        # Clean up the reference number by stripping empty spaces
+        ref_num = (self.reference_number or '').strip()
+        method = (self.payment_method or '').upper()
+        
+        # Clean up the reference number by stripping empty spaces
+        ref_num = (self.reference_number or '').strip()
+
+        requires_reference = ['CARD', 'BANK']
+
+        if method in requires_reference and not ref_num:
+            raise ValidationError({
+                'reference_number': "A reference number (transaction ID or deposit confirmation) is required for payments made by card or bank transfer."
+            })
     def save(self, *args, **kwargs):
         # Keeps native Django field validations active
         self.full_clean()
