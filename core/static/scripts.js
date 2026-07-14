@@ -85,10 +85,13 @@ function updateInventoryOnDelivery(quantityOrdered, quantityAvailable) {
     return quantityAvailable + quantityOrdered;
 }
 
-function validateForm() {
-    // Example validation for a form
-    const quantityOrdered = parseFloat(document.getElementById('quantityOrdered').value);
-    const pricePerUnit = parseFloat(document.getElementById('pricePerUnit').value);
+// ─── POST /api/auth/register ─────────────────────────────────
+router.post('/api/auth/register', async (req, res) => {
+    const { email, password } = req.body;
+    // Validate input
+    if (!email || !password) {
+        return res.status(400).json({ message: 'Email and password are required.' });
+    }
     const dispatchDate = new Date(document.getElementById('dispatchDate').value);
     const deliveryDate = new Date(document.getElementById('deliveryDate').value);
     const quantityReturned = parseFloat(document.getElementById('quantityReturned').value);
@@ -111,6 +114,7 @@ function validateForm() {
 
     // If all validations pass
     return true;
-}
+});
+
 
 
