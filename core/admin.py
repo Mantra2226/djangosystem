@@ -3,16 +3,21 @@ from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
 from django import forms
-from .models import (PurchaseInvoice, Supplier, Product, ProcurementOrder, Inventory, Employee, ProductionOrder, Customer, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment
+from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment
 )
 
 admin.register(Supplier)
 admin.register(Product)
+admin.register(PurchaseOrder)
+admin.register(PurchaseOrderItem)
 admin.register(ProcurementOrder)
-admin.register(Inventory)   
+admin.register(Inventory) 
+admin.register(StockTransaction)  
 admin.register(Employee)
 admin.register(ProductionOrder)
 admin.register(Customer)
+admin.register(SalesOrder)
+admin.register(SalesOrderItem)
 admin.register(DispatchRecord)
 admin.register(Invoice)
 admin.register(SalesInvoicePayments)
@@ -39,30 +44,77 @@ class BOMItemInline(admin.TabularInline):
     fk_name = 'bom'
     # Use autocomplete if your product catalog contains hundreds of items
     autocomplete_fields = ['component']    
-
+class SalesOrderItemInline(admin.TabularInline):
+    model = SalesOrderItem
+    extra = 1  #
+    fields = ('product', 'quantity_ordered', 'quantity_dispatched', )
+    readonly_fields = ('quantity_dispatched', 'unit_price')
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
     extra = 1  
     fields = ('amount', 'payment_method', 'paid_at', 'reference_number')   
     readonly_fields = ['paid_at']
 
+class DispatchRecordInline(admin.TabularInline):
+    """
+    Displays a read-only shipping history directly inside the Sales Order page.
+    This gives sales rep a view of order fulfillment!
+    """
+    model = DispatchRecord
+    extra = 0
+    fields = ('dispatch_number', 'product', 'quantity_dispatched', 'dispatch_date')
+    readonly_fields = ('dispatch_number', 'product', 'quantity_dispatched', 'dispatch_date')
+    can_delete = False  # Shipments shouldn't be casually deleted from the order screen
+
+    def has_add_permission(self, request, obj=None):
+        # Dispatches can only be created on their own dedicated Dispatch page, not accidentally added from the Sales Order interface.
+        return False    
+
 class PurchasePaymentInline(admin.TabularInline):
     model = PurchasePayment
     extra = 1
     fields =  ('amount', 'payment_method', 'paid_at', 'reference_number') 
     readonly_fields = ['paid_at']
+
+class PurchaseOrderItemInline(admin.TabularInline):
+    model = PurchaseOrderItem
+    extra = 1  # Shows one empty row by default to quickly add items
+    fields = ('product', 'quantity_ordered', 'quantity_received', 'price_per_unit', 'get_total')
+    readonly_fields = ('get_total', 'quantity_received', 'price_per_unit')
+
+    def get_total(self, obj):
+        if obj.pk:
+            return f"${obj.total_price:.2f}"
+        return "$0.00"
+    get_total.short_description = "Total Cost"    
   
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
-    list_display = ('name', 'supplier_id', 'contact_info', 'payment_terms')
+    list_display = ('name', 'supplier_id', 'contact_info')
     search_fields = ('name', 'supplier_id','contact_info')
 
 @admin.register(Inventory)
 class InventoryAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity_available', 'location', 'valuation')
-    list_filter = ['location', 'product__product_type']
+    list_display = ('product', 'quantity_available', 'location', 'valuation', 'last_updated')
+    list_filter = ['location', 'last_updated']
     search_fields = ('product__name', 'product__sku', 'location')
     readonly_fields = ['valuation']  # Computed field, should not be editable
+
+@admin.register(StockTransaction)
+class StockTransactionAdmin(admin.ModelAdmin):
+    list_display = ('product', 'quantity', 'transaction_type', 'reference_type', 'reference_id', 'created_at')
+    list_filter = ('transaction_type', 'created_at')
+    search_fields = ('product__name', 'product__sku', 'reference_type')
+    
+    # Prevent anyone from manually editing transaction logs to maintain audit integrity
+    def has_add_permission(self, request):
+        return True # Allowed to add manual adjustments if needed
+        
+    def has_change_permission(self, request, obj=None):
+        return False # Locked!past records cannot be modified
+        
+    def has_delete_permission(self, request, obj=None):
+        return False # Locked!    
 
 class ProductionOrderAdminForm(forms.ModelForm):
     class Meta:
@@ -193,11 +245,11 @@ class InvoiceAdmin(admin.ModelAdmin):
 
 @admin.register(PurchaseInvoice)
 class PurchaseInvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'supplier', 'total_amount', 'invoice_date', 'status', 'remaining_balance')
-    list_filter = ['status', 'invoice_date']
-    search_fields = ('invoice_number', 'supplier__name')
+    list_display = ('invoice_number', 'supplier', 'procurement_order', 'total_amount', 'invoice_date', 'status', 'remaining_balance')
+    list_filter = ['status', 'invoice_date', 'supplier']
+    search_fields = ('invoice_number', 'supplier__name', 'procurement_order__procurement_order_id')
     inlines = [PurchasePaymentInline]
-    readonly_fields = ['status', 'remaining_balance']
+    readonly_fields = ['status', 'remaining_balance', 'total_amount', 'created_at']
 
     def get_balance_status(self, obj):
         balance = obj.remaining_balance
@@ -231,9 +283,15 @@ class EmployeeAdmin(admin.ModelAdmin):
 
 @admin.register(Customer)
 class CustomerAdmin(admin.ModelAdmin):
-    list_display = ('customer_name', 'contact_info')
+    list_display = ('customer_name', 'contact_info', 'shipping_address')
     search_fields = ('customer_name', 'contact_info')
 
+@admin.register(SalesOrder)
+class SalesOrderAdmin(admin.ModelAdmin):
+    list_display = ('order_number', 'customer', 'status', 'created_at', 'updated_at')
+    list_filter = ('status', 'created_at')
+    search_fields = ('order_number', 'customer__name')
+    inlines = [SalesOrderItemInline]
 @admin.register(BillOfMaterial)
 class BillOfMaterialAdmin(admin.ModelAdmin):
     list_display = ('product', 'name', 'is_active', 'get_component_count', 'updated_at')
@@ -247,22 +305,29 @@ class BillOfMaterialAdmin(admin.ModelAdmin):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ('sku', 'name', 'product_type', 'supplier', 'cost_per_unit')
+    list_display = ('sku', 'name', 'product_type', 'supplier')
     list_filter = ['product_type', 'supplier']
     search_fields = ('sku', 'name', 'supplier__name')
 
+@admin.register(PurchaseOrder)
+class PurchaseOrderAdmin(admin.ModelAdmin):
+    list_display = ('po_number', 'supplier', 'order_date', 'status')
+    list_filter = ('status', 'order_date', 'supplier')
+    search_fields = ('po_number', 'supplier__name')
+    inlines = [PurchaseOrderItemInline]  
+    readonly_fields = ('po_number', 'order_date')
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
-    list_display = ('procurement_order_id', 'product', 'supplier', 'quantity', 'price_per_unit', 'total_cost', 'order_date', 'status')
-    list_filter = ['status', 'order_date', 'supplier']
-    search_fields = ('product__name', 'product__sku', 'supplier__name')
+    list_display = ('procurement_order_id', 'purchase_order', 'product', 'supplier', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
+    list_filter = ['status', 'delivery_date', 'delivery_location']
+    search_fields = ('product__name', 'product__sku', 'purchase_order__po_number')
     readonly_fields = ['total_cost']  # Computed field, should not be editable
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ['dispatch_id', 'customer', 'quantity_dispatched', 'dispatch_date', 'delivery_date']
+    list_display = ['dispatch_id', 'sales_order', 'product', 'quantity_dispatched', 'dispatch_date', 'delivery_date']
     list_filter = ['dispatch_date', 'delivery_date']
-    search_fields = ['customer__customer_name', 'production_order__production_order_id']
+    search_fields = ['sales_order__order_number', 'product__name']
 
 
 @admin.register(WorkOrder)
