@@ -3,7 +3,7 @@ from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
 from django import forms
-from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment
+from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
 )
 
 admin.register(Supplier)
@@ -29,6 +29,7 @@ admin.register(FinanceEntry)
 admin.register(WorkOrder)
 admin.register(WorkOrderInstruction)
 admin.register(BillOfMaterial)
+admin.register(WorkOrderMaterialLine)
 admin.register(BOMItem)
 
 # Register your models here.
@@ -44,6 +45,12 @@ class BOMItemInline(admin.TabularInline):
     fk_name = 'bom'
     # Use autocomplete if your product catalog contains hundreds of items
     autocomplete_fields = ['component']    
+
+class WorkOrderMaterialLineInline(admin.TabularInline):
+    model = WorkOrderMaterialLine
+    readonly_fields = ('quantity_expected', 'variance')
+    extra = 0  # Don't show empty lines by default
+    fields = ('raw_material', 'quantity_expected', 'quantity_actual', 'variance')    
 class SalesOrderItemInline(admin.TabularInline):
     model = SalesOrderItem
     extra = 1  #
@@ -102,11 +109,12 @@ class InventoryAdmin(admin.ModelAdmin):
 
 @admin.register(StockTransaction)
 class StockTransactionAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity', 'transaction_type', 'reference_type', 'reference_id', 'created_at')
+    list_display = ('product', 'quantity', 'transaction_type', 'created_at')
     list_filter = ('transaction_type', 'created_at')
     search_fields = ('product__name', 'product__sku', 'reference_type')
+    readonly_fields = ('created_at', 'work_order', 'dispatch_record')
     
-    # Prevent anyone from manually editing transaction logs to maintain audit integrity
+    # Prevents anyone from manually editing transaction logs to maintain audit integrity
     def has_add_permission(self, request):
         return True # Allowed to add manual adjustments if needed
         
@@ -124,9 +132,7 @@ class ProductionOrderAdminForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # THE UX FILTER:
-        # If editing an existing Production Order, 
-        # filter the Work Order choices to only show those for this specific product.
+        # If editing an existing Production Order, filter the Work Order choices to only show those for this specific product.
         if self.instance and self.instance.product_id:
             self.fields['work_order'].queryset = WorkOrder.objects.filter(
                 product=self.instance.product
@@ -325,15 +331,36 @@ class ProcurementOrderAdmin(admin.ModelAdmin):
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ['dispatch_id', 'sales_order', 'product', 'quantity_dispatched', 'dispatch_date', 'delivery_date']
-    list_filter = ['dispatch_date', 'delivery_date']
-    search_fields = ['sales_order__order_number', 'product__name']
+    list_display = ['dispatch_id', 'sales_order', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
+    list_filter = ['dispatch_date', 'status', 'delivery_date']
+    search_fields = ['sales_order__order_number', 'product__sku', 'product__name']
+    readonly_fields = ('delivery_date', 'is_stock_deducted')
+
+    # DYNAMIC FIELD LOCKDOWN: Once delivered, lock the whole form!
+    def get_readonly_fields(self, request, obj=None):
+        # If the record already exists and stock has already been deducted...
+        if obj and obj.is_stock_deducted:
+            # Return ALL fields as read-only to prevent tampering with historical data
+            return [field.name for field in self.model._meta.fields]
+        
+        # If it's still pending/shipped, only the automated fields are read-only
+        return self.readonly_fields
+
+    # better UI presentation grouping
+    fieldsets = (
+        ('Order & Logistics Information', {
+            'fields': ('sales_order', 'product', 'quantity_dispatched')
+        }),
+        ('Status & Timestamps', {
+            'fields': ('status', 'dispatch_date', 'delivery_date', 'is_stock_deducted')
+        }),
+    )
 
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'product', 'display_employees', 'quantity', 'production_start_date', 'production_end_date')
-    inlines = [WorkOrderInstructionInline]
+    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date')
+    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
     search_fields = ('product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
 

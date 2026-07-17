@@ -31,8 +31,6 @@ class Product(models.Model):
     name = models.CharField(max_length=255)
     category = models.CharField(max_length=255)
     unit_of_measurement = models.CharField(max_length=255)
-    cost_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Cost per unit must be a positive amount greater than zero.")
-    ordered_quantity = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Ordered quantity cannot be negative.")
 
     # Added field-level validation rules
     def clean(self):       
@@ -42,11 +40,6 @@ class Product(models.Model):
         if self.product_type in ['FINISHED', 'INTERMEDIATE'] and self.supplier:
             raise ValidationError({'supplier': 'Finished and intermediate goods cannot have an externally associated supplier.'})
         
-        if self.product_type == 'FINISHED' and self.ordered_quantity is not None and self.ordered_quantity > Decimal('0.00'):
-            raise ValidationError({
-                'ordered_quantity': 'Finished goods are manufactured internally and cannot have an ordered quantity. '
-                                    'To increase stock, please use a Production Order or an Inventory Adjustment.'
-            })
         
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -300,17 +293,20 @@ class StockTransaction(models.Model):
     ]
     transaction_id = models.AutoField(primary_key=True)
     product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='stock_transactions')
+    work_order = models.ForeignKey('WorkOrder', on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_transactions')
+    dispatch_record = models.ForeignKey('DispatchRecord', on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_transactions')
     quantity = models.DecimalField(max_digits=10, decimal_places=2, help_text="Use positive numbers for stock additions, negative numbers for deductions.")
     transaction_type = models.CharField(max_length=30, choices=TRANSACTION_TYPE_CHOICES)
     # Generic references to link this transaction back to the system document that caused it
-    reference_type = models.CharField(max_length=50, blank=True, help_text="The document type (e.g., 'PO', 'PRODUCTION_ORDER', 'INVOICE')")
-    reference_id = models.IntegerField(null=True, blank=True, help_text="The exact ID of the source document.")   
     notes = models.TextField(blank=True, help_text="Reason for adjustment, operator name, etc.")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        sign = "+" if self.quantity >= 0 else ""
-        return f"{self.product.sku} | {sign}{self.quantity} | {self.get_transaction_type_display()} | {self.created_at.strftime('%Y-%m-%d')}"
+        sign = "+" if self.quantity > 0 else ""
+        formatted_date = self.created_at.strftime('%Y-%m-%d') if self.created_at else "Draft"
+        sku = self.product.sku if self.product else "UNKNOWN_SKU"
+        
+        return f"{sku} | {sign}{self.quantity} | {self.get_transaction_type_display()} | {formatted_date}"
 class Employee(models.Model):
     employee_id = models.AutoField(primary_key=True)    
     employee_name = models.CharField(max_length=255)
@@ -326,26 +322,121 @@ class WorkOrder(models.Model):
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type': 'FINISHED'})
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
-    quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
+    quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     production_start_date = models.DateField()
     production_end_date = models.DateField(null=True, blank=True)  # Can be null until production is completed
 # validation to ensure that production end date is not before production start date and quantity produced does not exceed quantity consumed
     def clean(self):
+        super().clean()
+        
+        # Prevents completion without a valid quantity
+        if self.status == 'completed' and not self.is_inventory_updated:
+            if not self.quantity_produced or self.quantity_produced <= 0:
+                raise ValidationError({'quantity_produced': "Quantity produced must be greater than 0 to complete."})
+            
+            # VALIDATES RAW MATERIAL STOCK USING ACTUAL CONSUMPTION (quantity_actual)
+            for line in self.material_lines.all():
+                available_stock = line.raw_material.stock.aggregate(
+                    total=Sum('quantity_available')
+                )['total'] or Decimal('0.00')
+                
+                if available_stock < line.quantity_actual:
+                    raise ValidationError({
+                        'status': f"Cannot complete Work Order. Insufficient stock for raw material: {line.raw_material.name}. "
+                                  f"Actual required: {line.quantity_actual}, Available in warehouse: {available_stock}."
+                    })
+                    
+        # Date validation
         if self.production_end_date and self.production_start_date:
             if self.production_end_date < self.production_start_date:
-             raise ValidationError('Production end date cannot be before production start date.')
+                raise ValidationError({'production_end_date': 'Production end date cannot be before production start date.'})
 
         if self.product and self.product.product_type not in ['FINISHED', 'INTERMEDIATE']:
             raise ValidationError({'product': 'Work orders can only be created for finished or intermediate products.'})
 
     def save(self, *args, **kwargs):
-        # AUTOMATION: Default to the active recipe for this product if left blank
+        # automation that defaults to the active recipe for this product if left blank
         if not self.bill_of_material and self.product:
             active_bom = self.product.boms.filter(is_active=True).first()
             if active_bom:
                 self.bill_of_material = active_bom
-        self.full_clean()  # Ensure validation is performed before saving
-        super().save(*args, **kwargs)        
+        
+        self.full_clean()  # Force validation check
+        
+        # Save parent first so we have an ID for the material lines
+        super().save(*args, **kwargs)   
+
+        # Auto update on material line
+        # only calculates/re-calculates raw materials if the inventory hasn't been locked and deducted yet.
+        if not self.is_inventory_updated and self.bill_of_material:
+            # fetches from the specific linked bill_of_material snapshot!
+            for item in self.bill_of_material.items.all():
+                # Expected amount: (BOM usage per unit) * (parent output)
+                qty_produced_factor = self.quantity_produced or Decimal('0.00')
+                expected_qty = item.quantity_required * qty_produced_factor
+                
+                line, created = WorkOrderMaterialLine.objects.get_or_create(
+                    work_order=self,
+                    raw_material=item.raw_material,
+                    defaults={
+                        'quantity_expected': expected_qty, 
+                        'quantity_actual': expected_qty  # Matches standard naming
+                    }
+                )
+                
+                # If the line already exists but the parent quantity changed before completion:
+                if not created:
+                    line.quantity_expected = expected_qty
+                    # If they haven't customized the actual usage yet, keep actual in sync with expected
+                    if line.quantity_actual == line.quantity_expected:
+                        line.quantity_actual = expected_qty
+                    line.save(update_fields=['quantity_expected', 'quantity_actual'])
+
+        # RUNS PHYSICAL DEDUCTIONS AND WRITES TRANSACTION LEDGER ON COMPLETION
+        if self.status == 'completed' and not self.is_inventory_updated:
+            # Wrap in a database transaction block to ensure all stock changes succeed or fail together (No partial stock updates)
+            with transaction.atomic():
+                from .models import Inventory, StockTransaction
+                
+                # Finished Product is Added to stock and log transaction is carried out
+                finished_inventory, _ = Inventory.objects.get_or_create(
+                    product=self.product, 
+                    defaults={'quantity_available': Decimal('0.00')}
+                )
+                finished_inventory.quantity_available += self.quantity_produced
+                finished_inventory.save(update_fields=['quantity_available'])
+                
+                StockTransaction.objects.create(product=self.product, quantity=self.quantity_produced, transaction_type='PRODUCTION_OUTPUT', work_order=self)
+                
+                # Raw Materials is Deducted from stock and log transaction carried out
+                for line in self.material_lines.all():
+                    needed_to_deduct = line.quantity_actual  # The real physical usage!
+                    
+                    # Log raw material usage to history
+                    StockTransaction.objects.create(
+                        product=line.raw_material,
+                        quantity=-needed_to_deduct,  # Negative (-)
+                        transaction_type='PRODUCTION_CONSUMPTION',
+                        work_order=self
+                    )
+                    
+                    # Deduct from actual physical batch inventory records
+                    stock_records = line.raw_material.stock.filter(quantity_available__gt=0).order_by('pk')
+                    for stock_record in stock_records:
+                        if needed_to_deduct <= 0:
+                            break
+                        
+                        if stock_record.quantity_available >= needed_to_deduct:
+                            stock_record.quantity_available -= needed_to_deduct
+                            stock_record.save(update_fields=['quantity_available'])
+                            needed_to_deduct = Decimal('0.00')
+                        else:
+                            needed_to_deduct -= stock_record.quantity_available
+                            stock_record.quantity_available = Decimal('0.00')
+                            stock_record.save(update_fields=['quantity_available'])               
+                # Lock the record
+                self.is_inventory_updated = True
+                super().save(update_fields=['is_inventory_updated'])     
         
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
@@ -447,6 +538,22 @@ class BOMItem(models.Model):
 
     def __str__(self):
         return f"{self.quantity_required}x {self.component.name} inside {self.bom}"
+    
+class WorkOrderMaterialLine(models.Model):
+    work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='material_lines')
+    raw_material = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order_usages')
+    # What the recipe (BOM) says we should use for the PLANNED quantity
+    quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="Theoretical quantity calculated from BOM.") 
+    # What the team ACTUALLY consumed (default matches expected, but can be edited)
+    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="The actual physical quantity consumed during this run.")
+
+    @property
+    def variance(self):
+        """Positive variance means production used MORE than expected (waste)."""
+        return self.quantity_actual - self.quantity_expected
+
+    def __str__(self):
+        return f"{self.raw_material.name} for {self.work_order.work_order_number}"    
 
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
@@ -596,40 +703,48 @@ class SalesOrderItem(models.Model):
         return f"{self.quantity_ordered}x {self.product.name} for SO-{self.sales_order.order_number}"    
 
 class DispatchRecord(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending / Preparing'),
+        ('shipped', 'Shipped / In Transit'),
+        ('delivered', 'Delivered'),
+        ('cancelled', 'Cancelled'),
+    ]
     dispatch_id = models.AutoField(primary_key=True)  
     sales_order = models.ForeignKey('SalesOrder', on_delete=models.PROTECT, related_name='dispatches')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
     dispatch_date = models.DateField()
-    delivery_date = models.DateField(blank=True, null=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    delivery_date = models.DateField(blank=True, null=True, editable=False)
     is_stock_deducted = models.BooleanField(default=False, editable=False)
 
     # validation to ensure that delivery date is not before dispatch date and quantity dispatched does not exceed quantity produced in the production order
     def clean(self):
-        if self.dispatch_date and self.delivery_date:
-            if self.delivery_date < self.dispatch_date:
-                raise ValidationError('Delivery date cannot be before dispatch date.')
+        super().clean()
+        
         if not self.product or not self.quantity_dispatched or not self.sales_order:
             return
-        # sums up the 'quantity_available' across all stock lines for this product
-        total_available = self.product.stock.aggregate(
-            total=Sum('quantity_available')
-        )['total'] or Decimal('0.00')
 
-        if self.quantity_dispatched > total_available:
-            raise ValidationError({
-                'quantity_dispatched': f"Cannot dispatch {self.quantity_dispatched} units. "
-                                      f"Only {total_available} units are currently available across all inventory locations."
-            })
-        # Finds the line item on the Sales Order matching this product
+        # stock validation evaluates if stock hasn't been deducted yet.
+        if not self.is_stock_deducted:
+            total_available = self.product.stock.aggregate(
+                total=Sum('quantity_available')
+            )['total'] or Decimal('0.00')
+
+            if self.quantity_dispatched > total_available:
+                raise ValidationError({
+                    'quantity_dispatched': f"Cannot dispatch {self.quantity_dispatched} units. "
+                                          f"Only {total_available} units are currently available across all inventory locations."
+                })
+
+        # ORDER QUANTITY VALIDATION
         sales_order_item = self.sales_order.items.filter(product=self.product).first()
         if not sales_order_item:
             raise ValidationError({
                 'product': f"This product is not part of Sales Order #{self.sales_order.order_number}."
             })
 
-        # Sum up all *other* dispatches for this specific product on this Sales Order
-        # If editing an existing dispatch (self.pk exists), we exclude it from the sum.
+        # Aggregate sibling dispatch balances safely
         other_dispatches = DispatchRecord.objects.filter(
             sales_order=self.sales_order,
             product=self.product
@@ -641,70 +756,88 @@ class DispatchRecord(models.Model):
             total=Sum('quantity_dispatched')
         )['total'] or Decimal('0.00')
 
-        # Calculating remaining quantity the customer is allowed to receive
         remaining_to_ship = sales_order_item.quantity_ordered - already_shipped
 
         if self.quantity_dispatched > remaining_to_ship:
             raise ValidationError({
                 'quantity_dispatched': f"Cannot dispatch {self.quantity_dispatched} units. "
                                       f"Only {remaining_to_ship} units are remaining to complete this order line. "
-                                      f"({already_shipped} out of {sales_order_item.quantity_ordered} already shipped)."
+                                      f"({already_shipped} out of {sales_order_item.quantity_ordered} already processed)."
             })
 
     def save(self, *args, **kwargs):
         self.full_clean()  
-        # If this is a brand new dispatch, it deducts the quantity from inventory. Since a product can have multiple stock rows, it deduct sequentially from records that actually have stock until our dispatch total is met.
-        if not self.is_stock_deducted:
-            remaining_to_deduct = self.quantity_dispatched
-            stock_records = self.product.stock.filter(quantity_available__gt=0).order_by('pk')
-            
-            for stock_record in stock_records:
-                if remaining_to_deduct <= 0:
-                    break
+        
+        # Executes once when status is marked 'delivered'
+        if self.status == 'delivered' and not self.is_stock_deducted:
+            with transaction.atomic():
+                from .models import StockTransaction
                 
-                if stock_record.quantity_available >= remaining_to_deduct:
-                    stock_record.quantity_available -= remaining_to_deduct
-                    stock_record.save(update_fields=['quantity_available'])
-                    remaining_to_deduct = Decimal('0.00')
-                else:
-                    remaining_to_deduct -= stock_record.quantity_available
-                    stock_record.quantity_available = Decimal('0.00')
-                    stock_record.save(update_fields=['quantity_available'])
-            # Automatically recalculates and set the parent Sales Order status, Checks if all items on the order have been fully shipped
-            # Update the quantity_dispatched on the SalesOrderItem itself
-            sales_order_item = self.sales_order.items.filter(product=self.product).first()
-            if sales_order_item:
-                sales_order_item.quantity_dispatched += self.quantity_dispatched
-                sales_order_item.save(update_fields=['quantity_dispatched'])
+                # Auto-capture the system date right now
+                self.delivery_date = timezone.now().date()
+                
+                # Sequentially deduct physical warehouse inventory batches
+                remaining_to_deduct = self.quantity_dispatched
+                stock_records = self.product.stock.filter(quantity_available__gt=0).order_by('pk')
+                
+                for stock_record in stock_records:
+                    if remaining_to_deduct <= 0:
+                        break
+                    
+                    if stock_record.quantity_available >= remaining_to_deduct:
+                        stock_record.quantity_available -= remaining_to_deduct
+                        stock_record.save(update_fields=['quantity_available'])
+                        remaining_to_deduct = Decimal('0.00')
+                    else:
+                        remaining_to_deduct -= stock_record.quantity_available
+                        stock_record.quantity_available = Decimal('0.00')
+                        stock_record.save(update_fields=['quantity_available'])
+                
+                # Write matching transaction history entry 
+                StockTransaction.objects.create(
+                    product=self.product,
+                    quantity=-self.quantity_dispatched,  # Negative deduction
+                    transaction_type='SHIPMENT',          # Matches the choices dictionary
+                    dispatch_record=self
+                )
 
-            total_items = self.sales_order.items.count()
-            fully_shipped_count = 0
-            any_shipped = False
-            
-            for item in self.sales_order.items.all():
-                # Compare live values
-                qty_ordered = item.quantity_ordered
-                qty_shipped = item.quantity_dispatched
+                # Updates shipped tally directly on SalesOrderItem line
+                sales_order_item = self.sales_order.items.filter(product=self.product).first()
+                if sales_order_item:
+                    sales_order_item.quantity_dispatched += self.quantity_dispatched
+                    sales_order_item.save(update_fields=['quantity_dispatched'])
+
+                # Evaluates total progress of parent Sales Order
+                total_items = self.sales_order.items.count()
+                fully_shipped_count = 0
+                any_shipped = False
                 
-                if qty_shipped >= qty_ordered:
-                    fully_shipped_count += 1
-                if qty_shipped > 0:
-                    any_shipped = True
-            
-            if fully_shipped_count == total_items and total_items > 0:
-                self.sales_order.status = 'completed'
-            elif any_shipped:
-                self.sales_order.status = 'partially_dispatched'
-            else:
-                self.sales_order.status = 'approved'
+                # Refreshes from DB to verify updated quantity_dispatched metrics
+                for item in self.sales_order.items.all():
+                    if item.quantity_dispatched >= item.quantity_ordered:
+                        fully_shipped_count += 1
+                    if item.quantity_dispatched > 0:
+                        any_shipped = True
                 
-            self.sales_order.save(update_fields=['status'])  
-            self.is_stock_deducted = True    
+                if fully_shipped_count == total_items and total_items > 0:
+                    self.sales_order.status = 'completed'
+                elif any_shipped:
+                    self.sales_order.status = 'partially_dispatched'
+                else:
+                    self.sales_order.status = 'approved'
+                    
+                self.sales_order.save(update_fields=['status'])  
+                
+                # Locks safety gate before exiting transaction block context
+                self.is_stock_deducted = True  
+        
+        # Save modifications cleanly
         super().save(*args, **kwargs)   
-  
         
     def __str__(self):
-        return f"Dispatch {self.dispatch_id} — {self.quantity_dispatched}x {self.product.name}"
+        status_str = f" [{self.get_status_display()}]"
+        date_str = f" delivered {self.delivery_date}" if self.delivery_date else ""
+        return f"Dispatch {self.dispatch_id}{status_str} — {self.quantity_dispatched}x {self.product.name}{date_str}"
 class Invoice(models.Model):
     ENTRY_TYPE_CHOICES = [
         ('Paid', 'Paid'),
