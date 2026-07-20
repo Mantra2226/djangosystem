@@ -77,7 +77,7 @@ class Product(models.Model):
                     defaults={'quantity_available': Decimal('0.00')}
                 )
                 if not created:
-                    inventory_item.quantity_available = self.ordered_quantity
+                    inventory_item.quantity_available = Decimal('0.00')
                     inventory_item.save()
     # Essential for making dropdown menus and lists readable in the dashboard
     def __str__(self):
@@ -217,10 +217,17 @@ class ProcurementOrder(models.Model):
             super().save(*args, **kwargs)
 
             if self.status == 'DELIVERED' and not previously_delivered:
-                current_total_qty = Inventory.objects.filter(
-                    product=self.product
-                ).aggregate(total=Sum('quantity_available'))['total'] or Decimal('0.00')
-                
+                # Fetches or initializes the specific location inventory record bucket
+                inventory_item, created = Inventory.objects.get_or_create(
+                    product=self.product,
+                    location=self.delivery_location,
+                    defaults={
+                        'quantity_available': Decimal('0.00'),
+                        'unit_cost': self.price_per_unit  # Initial cost matches first delivery
+                    }
+                )
+                # Pulls figures directly from the target inventory row for AVCO calculation
+                current_total_qty = inventory_item.quantity_available
                 current_cost = self.product.cost_per_unit
                 incoming_qty = self.quantity
                 incoming_price = self.price_per_unit
@@ -232,16 +239,15 @@ class ProcurementOrder(models.Model):
                     new_weighted_cost = (
                         (current_total_qty * current_cost) + (incoming_qty * incoming_price)
                     ) / total_qty_after
-                    
-                    # Update and save Product master with the new average asset cost
-                    self.product.cost_per_unit = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    # Increment stock levels and trigger inventory save processing mechanics
+                    inventory_item.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                     self.product.save()
                 inventory_item, created = Inventory.objects.get_or_create(
                     product=self.product,
                     location=self.delivery_location,
                     defaults={'quantity_available': Decimal('0.00')}
                 )
-
+                # Increment stock levels and trigger inventory save processing mechanics
                 inventory_item.quantity_available += self.quantity
                 inventory_item.save()
                 # Write to StockTransaction Ledger for audit trailing
@@ -267,6 +273,7 @@ class ProcurementOrder(models.Model):
 class Inventory(models.Model):
     Inventory_id = models.AutoField(primary_key=True) 
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='stock')   
+    unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Moving weighted average cost calculated from delivered procurements.")
     quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity available cannot drop below zero.")
     location = models.CharField(max_length=255, default='Main Warehouse') 
     last_updated = models.DateTimeField(auto_now=True)
@@ -278,11 +285,15 @@ class Inventory(models.Model):
         verbose_name_plural = "Inventory"
     # valuation is calculated based on quantity available and cost per unit of the raw material
     def save(self, *args, **kwargs):
-        self.valuation = self.quantity_available * self.product.cost_per_unit
+        if self.quantity_available and self.unit_cost:
+            raw_valuation = self.quantity_available * self.unit_cost
+            self.valuation = raw_valuation.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            self.valuation = Decimal('0.00')
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.product.sku} - {self.location}: {self.quantity_available} {self.product.unit_of_measurement}"
+        return f"{self.product.sku} - {self.location}: {self.quantity_available} (Valued at ${self.valuation})"
 class StockTransaction(models.Model):
     TRANSACTION_TYPE_CHOICES = [
         ('RECEIPT', 'Goods Receipt (Supplier Purchase)'),
@@ -317,6 +328,44 @@ class Employee(models.Model):
 
     def __str__(self):
         return f"{self.employee_name} ({self.role})"
+    
+class WorkOrderInstruction(models.Model):
+    STATUS_CHOICES = [
+        ('CANCELLED', 'Cancelled'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('COMPLETED', 'Completed'),
+    ]
+    instruction_id = models.AutoField(primary_key=True)
+    work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='instructions')
+    product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
+    step_number = models.PositiveIntegerField(null=True, blank=True)
+    step_name = models.CharField(max_length=255, null=True, blank=True)
+    machine=models.CharField(max_length=255, blank=True, null=True, default='No machine assigned')
+    instruction_text = models.TextField()    
+    estimated_time_minutes = models.PositiveIntegerField(blank=True, null=True, default=0, validators=[MinValueValidator(0)])
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
+    
+
+    class Meta:
+        unique_together = ('work_order', 'step_number')
+        ordering = ['step_number']
+
+    def save(self, *args, **kwargs):
+        if not self.step_number:
+            highest_step = WorkOrderInstruction.objects.filter(work_order=self.work_order).aggregate(models.Max('step_number'))['step_number__max']
+            self.step_number = (highest_step or 0) + 1
+
+        self.full_clean()  # Ensure validation is performed before saving
+        super().save(*args, **kwargs)    
+        # Pushes updates up to the parent WorkOrder after saving the step
+        if self.work_order:
+            self.work_order.recalculate_status()
+
+# string representation of the instruction showing work order id, step number and first 50 characters of instruction text
+    def __str__(self):
+        text_preview = self.instruction_text[:50]
+        snippet = f"{text_preview}..." if len(self.instruction_text) > 50 else text_preview
+        return f"step {self.step_number}: {self.step_name} ({self.status})"     
 class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
@@ -324,16 +373,37 @@ class WorkOrder(models.Model):
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     production_start_date = models.DateField()
-    production_end_date = models.DateField(null=True, blank=True)  # Can be null until production is completed
-# validation to ensure that production end date is not before production start date and quantity produced does not exceed quantity consumed
+    is_inventory_updated = models.BooleanField(default=False, editable=False)    
+    status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, help_text="Automatically managed based on step completion statuses.")
+    # automated state evaluation machine logic
+    def recalculate_status(self):
+        """Scans all child instructions to dynamically compute macro status."""
+        instructions = self.instructions.all()
+        if not instructions.exists():
+            return
+            
+        total_steps = instructions.count()
+        completed_steps = instructions.filter(status='COMPLETED').count()
+        cancelled_steps = instructions.filter(status='CANCELLED').count()
+        
+        # State translation math rules
+        if completed_steps == total_steps:
+            new_status = 'COMPLETED'
+        elif cancelled_steps == total_steps:
+            new_status = 'CANCELLED'
+        else:
+            new_status = 'IN_PROGRESS'
+            
+        # Only issue a save request if an actual status boundary change occurs
+        if self.status != new_status:
+            self.status = new_status
+            self.save()    
     def clean(self):
         super().clean()
-        
         # Prevents completion without a valid quantity
         if self.status == 'completed' and not self.is_inventory_updated:
             if not self.quantity_produced or self.quantity_produced <= 0:
                 raise ValidationError({'quantity_produced': "Quantity produced must be greater than 0 to complete."})
-            
             # VALIDATES RAW MATERIAL STOCK USING ACTUAL CONSUMPTION (quantity_actual)
             for line in self.material_lines.all():
                 available_stock = line.raw_material.stock.aggregate(
@@ -361,7 +431,39 @@ class WorkOrder(models.Model):
             if active_bom:
                 self.bill_of_material = active_bom
         
-        self.full_clean()  # Force validation check
+        self.full_clean()  
+        # Protect raw materials using the automated state engine gate
+        if self.status == 'COMPLETED' and not self.is_inventory_updated:
+            with transaction.atomic():
+                
+                # --- [INSERT BILL OF MATERIALS / COMPONENT ITERATION LOOP HERE] ---
+                # For example: for line in self.bom_lines.all():
+                
+                # Log raw material usage to history
+                StockTransaction.objects.create(
+                    product=line.raw_material,
+                    quantity=-needed_to_deduct,  # Negative (-)
+                    transaction_type='PRODUCTION_CONSUMPTION',
+                    work_order=self
+                )
+                
+                # Deduct from actual physical batch inventory records
+                stock_records = line.raw_material.stock.filter(quantity_available__gt=0).order_by('pk')
+                for stock_record in stock_records:
+                    if needed_to_deduct <= 0:
+                        break
+                    
+                    if stock_record.quantity_available >= needed_to_deduct:
+                        stock_record.quantity_available -= needed_to_deduct
+                        stock_record.save(update_fields=['quantity_available'])
+                        needed_to_deduct = Decimal('0.00')
+                    else:
+                        needed_to_deduct -= stock_record.quantity_available
+                        stock_record.quantity_available = Decimal('0.00')
+                        stock_record.save(update_fields=['quantity_available'])               
+                
+                # Flip the one-way safety gate switch
+                self.is_inventory_updated = True
         
         # Save parent first so we have an ID for the material lines
         super().save(*args, **kwargs)   
@@ -441,40 +543,7 @@ class WorkOrder(models.Model):
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
-class WorkOrderInstruction(models.Model):
-    STATUS_CHOICES = [
-        ('CANCELLED', 'Cancelled'),
-        ('IN_PROGRESS', 'In Progress'),
-        ('COMPLETED', 'Completed'),
-    ]
-    instruction_id = models.AutoField(primary_key=True)
-    work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='instructions')
-    product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
-    step_number = models.PositiveIntegerField(null=True, blank=True)
-    step_name = models.CharField(max_length=255, null=True, blank=True)
-    machine=models.CharField(max_length=255, blank=True, null=True, default='No machine assigned')
-    instruction_text = models.TextField()    
-    estimated_time_minutes = models.PositiveIntegerField(blank=True, null=True, default=0, validators=[MinValueValidator(0)])
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
-    
-
-    class Meta:
-        unique_together = ('work_order', 'step_number')
-        ordering = ['step_number']
-
-    def save(self, *args, **kwargs):
-        if not self.step_number:
-            highest_step = WorkOrderInstruction.objects.filter(work_order=self.work_order).aggregate(models.Max('step_number'))['step_number__max']
-            self.step_number = (highest_step or 0) + 1
-
-        self.full_clean()  # Ensure validation is performed before saving
-        super().save(*args, **kwargs)    
-
-# string representation of the instruction showing work order id, step number and first 50 characters of instruction text
-    def __str__(self):
-        text_preview = self.instruction_text[:50]
-        snippet = f"{text_preview}..." if len(self.instruction_text) > 50 else text_preview
-        return f"step {self.step_number}: {self.step_name} ({self.status})"    
+   
 
 class BillOfMaterial(models.Model):
     bom_id = models.AutoField(primary_key=True)
@@ -695,13 +764,25 @@ class SalesOrder(models.Model):
 class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type': 'FINISHED'})  
-    quantity_ordered = models.PositiveIntegerField()
+    quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2)
     quantity_dispatched = models.PositiveIntegerField(default=0)  # Crucial for tracking partial shipments
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
+    # Use Sum Aggregation instead of `+=` to handle additions, updates, and deletes
+    def update_dispatched_quantity(self):
+        """Recalculates the exact sum of all related dispatches from the ground truth."""
+        # 'dispatch_records' is the related_name from the ForeignKey on DispatchRecord
+        total = self.dispatch_records.aggregate(
+            total_dispatched=Sum('quantity_dispatched')
+        )['total_dispatched'] or Decimal('0.00')
+        
+        # Only save if the data actually drifted
+        if self.quantity_dispatched != total:
+            self.quantity_dispatched = total
+            # update_fields is a win and avoids overwriting other fields
+            self.save(update_fields=['quantity_dispatched'])
 
     def __str__(self):
-        return f"{self.quantity_ordered}x {self.product.name} for SO-{self.sales_order.order_number}"    
-
+        return f"Item: {self.product.name} ({self.quantity_dispatched}/{self.quantity_ordered} Dispatched)"
 class DispatchRecord(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending / Preparing'),
@@ -710,7 +791,7 @@ class DispatchRecord(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     dispatch_id = models.AutoField(primary_key=True)  
-    sales_order = models.ForeignKey('SalesOrder', on_delete=models.PROTECT, related_name='dispatches')
+    sales_order_item = models.ForeignKey('SalesOrder', on_delete=models.PROTECT, related_name='dispatches')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
     dispatch_date = models.DateField()
@@ -830,6 +911,14 @@ class DispatchRecord(models.Model):
                 
                 # Locks safety gate before exiting transaction block context
                 self.is_stock_deducted = True  
+
+    def delete(self, *args, **kwargs):
+        # Capture the item reference before deleting the row
+        item = self.sales_order_item
+        super().delete(*args, **kwargs)
+        # If a dispatch is deleted, recalculate down to the correct lower number!
+        if item:
+            item.update_dispatched_quantity()            
         
         # Save modifications cleanly
         super().save(*args, **kwargs)   
@@ -875,15 +964,24 @@ class Invoice(models.Model):
             
         
     def save(self, *args, **kwargs):
+        # Auto-calculates total amount based on dispatch volume and true inventory cost
+        if self.dispatch and hasattr(self.dispatch, 'production_order') and self.dispatch.production_order.product:
+            target_product = self.dispatch.production_order.product
+            
+            # Look up the warehouse bucket for this item to grab its live average asset cost
+            inventory_record = Inventory.objects.filter(
+                product=target_product, 
+                location='Main Warehouse' # Adjust to the primary location string if different
+            ).first()
+            # Fall back to 0.00 if no inventory record exists yet
+            current_unit_cost = inventory_record.unit_cost if inventory_record else Decimal('0.00')
+            self.total_amount = self.dispatch.quantity_dispatched * current_unit_cost
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
                 rounding=ROUND_HALF_UP
             )
-        # auto calculate total amount for the invoice based on quantity dispatched and cost per unit
-        if self.total_amount and self.dispatch:
-            self.total_amount = self.dispatch.quantity_dispatched * self.dispatch.production_order.product.cost_per_unit
-
+       
         if not self.invoice_number:
             # Generate a clean corporate format: INV-YEAR-MONTH-ID (e.g., INV-2026-07-0001)
             from datetime import datetime

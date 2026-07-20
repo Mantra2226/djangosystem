@@ -35,7 +35,7 @@ admin.register(BOMItem)
 # Register your models here.
 class WorkOrderInstructionInline(admin.TabularInline):
     model = WorkOrderInstruction
-    extra = 1
+    extra = 0
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
     readonly_fields = ['step_number']  # Auto-incremented field, should not be editable    
 
@@ -51,11 +51,7 @@ class WorkOrderMaterialLineInline(admin.TabularInline):
     readonly_fields = ('quantity_expected', 'variance')
     extra = 0  # Don't show empty lines by default
     fields = ('raw_material', 'quantity_expected', 'quantity_actual', 'variance')    
-class SalesOrderItemInline(admin.TabularInline):
-    model = SalesOrderItem
-    extra = 1  #
-    fields = ('product', 'quantity_ordered', 'quantity_dispatched', )
-    readonly_fields = ('quantity_dispatched', 'unit_price')
+
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
     extra = 1  
@@ -75,8 +71,15 @@ class DispatchRecordInline(admin.TabularInline):
 
     def has_add_permission(self, request, obj=None):
         # Dispatches can only be created on their own dedicated Dispatch page, not accidentally added from the Sales Order interface.
-        return False    
-
+        return False   
+     
+class SalesOrderItemInline(admin.TabularInline):
+    model = SalesOrderItem
+    inlines = [DispatchRecordInline]
+    extra = 1  #
+    fields = ('product', 'quantity_ordered', 'quantity_dispatched', )
+    search_fields = ['product__name']
+    readonly_fields = ('quantity_dispatched', 'unit_price')
 class PurchasePaymentInline(admin.TabularInline):
     model = PurchasePayment
     extra = 1
@@ -331,7 +334,7 @@ class ProcurementOrderAdmin(admin.ModelAdmin):
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ['dispatch_id', 'sales_order', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
+    list_display = ['dispatch_id', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
     list_filter = ['dispatch_date', 'status', 'delivery_date']
     search_fields = ['sales_order__order_number', 'product__sku', 'product__name']
     readonly_fields = ('delivery_date', 'is_stock_deducted')
@@ -359,7 +362,8 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date')
+    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'status', 'is_inventory_updated')
+    readonly_fields = ['status', 'is_inventory_updated']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
     search_fields = ('product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
