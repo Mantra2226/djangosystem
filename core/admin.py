@@ -37,6 +37,7 @@ class WorkOrderInstructionInline(admin.TabularInline):
     model = WorkOrderInstruction
     extra = 0
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
+    ordering = ['step_number']
     readonly_fields = ['step_number']  # Auto-incremented field, should not be editable    
 
 class BOMItemInline(admin.TabularInline):
@@ -48,9 +49,20 @@ class BOMItemInline(admin.TabularInline):
 
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
-    readonly_fields = ('quantity_expected', 'variance')
+    readonly_fields = ('quantity_expected', 'get_variance')
     extra = 0  # Don't show empty lines by default
-    fields = ('raw_material', 'quantity_expected', 'quantity_actual', 'variance')    
+    fields = ('component', 'quantity_expected', 'quantity_actual', 'get_variance')  
+
+    @admin.display(description='Variance (Over/Under)')
+    def get_variance(self, instance):
+        if instance.pk:
+            var = instance.variance
+            if var > 0:
+                return format_html('<span style="color: red; font-weight: bold;">+{} (Waste)</span>', var)
+            elif var < 0:
+                return format_html('<span style="color: green; font-weight: bold;">{} (Saved)</span>', var)
+            return "0.00"
+        return "-"  
 
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
@@ -65,7 +77,7 @@ class DispatchRecordInline(admin.TabularInline):
     """
     model = DispatchRecord
     extra = 0
-    fields = ('dispatch_number', 'product', 'quantity_dispatched', 'dispatch_date')
+    fields = ('dispatch_number',  'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date')
     readonly_fields = ('dispatch_number', 'product', 'quantity_dispatched', 'dispatch_date')
     can_delete = False  # Shipments shouldn't be casually deleted from the order screen
 
@@ -79,7 +91,7 @@ class SalesOrderItemInline(admin.TabularInline):
     extra = 1  #
     fields = ('product', 'quantity_ordered', 'quantity_dispatched', )
     search_fields = ['product__name']
-    readonly_fields = ('quantity_dispatched', 'unit_price')
+    readonly_fields = ['quantity_dispatched']
 class PurchasePaymentInline(admin.TabularInline):
     model = PurchasePayment
     extra = 1
@@ -97,6 +109,28 @@ class PurchaseOrderItemInline(admin.TabularInline):
             return f"${obj.total_price:.2f}"
         return "$0.00"
     get_total.short_description = "Total Cost"    
+
+class ProcurementOrderForm(forms.ModelForm):
+    class Meta:
+        model = ProcurementOrder
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Check if a purchase order is selected in POST data or existing instance
+        po_id = None
+        if self.data and self.data.get('purchase_order'):
+            po_id = self.data.get('purchase_order')
+        elif self.instance and self.instance.purchase_order_id:
+            po_id = self.instance.purchase_order_id
+
+        # Filters the 'product' field choices to match the Purchase Order's items
+        if po_id:
+            po = PurchaseOrder.objects.filter(pk=po_id).first()
+            if po:
+                valid_product_ids = po.items.values_list('product_id', flat=True)
+                self.fields['product'].queryset = Product.objects.filter(pk__in=valid_product_ids)    
   
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
@@ -327,10 +361,12 @@ class PurchaseOrderAdmin(admin.ModelAdmin):
     readonly_fields = ('po_number', 'order_date')
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
-    list_display = ('procurement_order_id', 'purchase_order', 'product', 'supplier', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
+    form = ProcurementOrderForm
+    autocomplete_fields = ['purchase_order']    # Optional: Use autocomplete for quick search if POs grow large
+    list_display = ('procurement_order_id', 'purchase_order', 'product', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
     list_filter = ['status', 'delivery_date', 'delivery_location']
     search_fields = ('product__name', 'product__sku', 'purchase_order__po_number')
-    readonly_fields = ['total_cost']  # Computed field, should not be editable
+    readonly_fields = ['total_cost', 'delivery_date']  # Computed field, should not be editable
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
@@ -352,7 +388,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
     # better UI presentation grouping
     fieldsets = (
         ('Order & Logistics Information', {
-            'fields': ('sales_order', 'product', 'quantity_dispatched')
+            'fields': ('sales_order_item', 'product', 'quantity_dispatched')
         }),
         ('Status & Timestamps', {
             'fields': ('status', 'dispatch_date', 'delivery_date', 'is_stock_deducted')
@@ -362,15 +398,52 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['status', 'is_inventory_updated']
+    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
+    readonly_fields = ['status', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
+    list_filter = ['status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
-
+    fieldsets = (
+        ('Order Overview', {
+            'fields': (
+                'product',
+                'bill_of_material',
+                'quantity_produced',
+                'employee',
+            )
+        }),
+        ('Execution Tracking', {
+            'fields': (
+                'status',
+                'production_start_date',
+                'production_end_date',
+                'is_inventory_updated',
+            )
+        }),
+    )
+    @admin.display(description='Assigned Employees')
     def display_employees(self, obj):
-        return ", ".join([employee.employee_name for employee in obj.employee.all()])
-    display_employees.short_description = 'Assigned Crew Members'
+        employees = obj.employee.all()
+        if employees.exists():
+            return ", ".join([str(emp) for emp in employees])
+        return "-"
+
+    @admin.display(description='Status')
+    def status_badge(self, obj):
+        colors = {
+            'COMPLETED': 'green',
+            'IN_PROGRESS': '#3182ce',  # blue
+            'CANCELLED': 'red',
+        }
+        color = colors.get(obj.status, 'gray')
+        return format_html(
+            '<b style="color: {};">{}</b>', 
+            color, 
+            obj.get_status_display()
+        )
+
+
 
 
    

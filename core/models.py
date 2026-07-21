@@ -184,20 +184,33 @@ class ProcurementOrder(models.Model):
     ]
     procurement_order_id = models.AutoField(primary_key=True)
     purchase_order = models.ForeignKey('PurchaseOrder', on_delete=models.SET_NULL, null=True, blank=True, related_name='procurements', help_text="The source Purchase Order this delivery belongs to.")
-    supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='procurement_order')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='procurement_order', limit_choices_to={'product_type': 'RAW'}, help_text="Only raw materials can be selected for procurement.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Price per unit must be a positive amount greater than zero.")
     total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True, default=Decimal('0.00'), help_text="Total cost is automatically calculated based on quantity ordered and price per unit.")
     order_date = models.DateField()
-    delivery_date = models.DateField()
+    delivery_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captures when status changes to Delivered.")
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING')   
     delivery_location = models.CharField(max_length=255, default='Main Warehouse')
     
+    @property
+    def supplier(self):
+        return self.purchase_order.supplier if self.purchase_order else None
     # when status is updated to 'Delivered', the quantity should be added to inventory and total cost should be calculated based on quantity ordered and price per unit
     def clean(self):
+        super().clean()
         if self.product and self.product.product_type == 'FINISHED':
             raise ValidationError({'product': 'finished products are manufactured internally. Use a production order instead of a procurement order for finished products.'})
+        
+        if self.purchase_order and self.product:
+            # Gets the list of product IDs present on this Purchase Order's items
+            valid_product_ids = self.purchase_order.items.values_list('product_id', flat=True)
+
+            if self.product.pk not in valid_product_ids:
+                raise ValidationError({
+                    'product': f"'{self.product.name}' is not listed on Purchase Order #{self.purchase_order.pk}. "
+                               f"Please select a product included in this purchase order."
+                })
 
     def save(self, *args, **kwargs):
         # Calculate total cost of this delivery
@@ -212,6 +225,9 @@ class ProcurementOrder(models.Model):
         previously_delivered = False
         if self.pk:
             previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='DELIVERED').exists()
+        # Captures timestamp when status changes to DELIVERED
+        if self.status == 'DELIVERED' and not previously_delivered:
+            self.delivery_date = timezone.now()
         # Wrapped inventory modifications in an atomic transaction to avoid data corruption if a crash happens mid-save
         with transaction.atomic():
             super().save(*args, **kwargs)
@@ -228,7 +244,7 @@ class ProcurementOrder(models.Model):
                 )
                 # Pulls figures directly from the target inventory row for AVCO calculation
                 current_total_qty = inventory_item.quantity_available
-                current_cost = self.product.cost_per_unit
+                current_cost = inventory_item.unit_cost
                 incoming_qty = self.quantity
                 incoming_price = self.price_per_unit
                 
@@ -241,23 +257,17 @@ class ProcurementOrder(models.Model):
                     ) / total_qty_after
                     # Increment stock levels and trigger inventory save processing mechanics
                     inventory_item.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    self.product.save()
-                inventory_item, created = Inventory.objects.get_or_create(
-                    product=self.product,
-                    location=self.delivery_location,
-                    defaults={'quantity_available': Decimal('0.00')}
-                )
-                # Increment stock levels and trigger inventory save processing mechanics
-                inventory_item.quantity_available += self.quantity
+                    # Increment stock & save inventory once
+                inventory_item.quantity_available += incoming_qty
                 inventory_item.save()
+                # Safe supplier reference for stock transaction
+                supplier_name = self.supplier.name if self.supplier else "Unassigned Supplier"
                 # Write to StockTransaction Ledger for audit trailing
                 StockTransaction.objects.create(
                     product=self.product,
                     quantity=self.quantity,
                     transaction_type='RECEIPT',
-                    reference_type='PROCUREMENT_ORDER',
-                    reference_id=self.procurement_order_id,
-                    notes=f"Received delivery via Procurement Order #{self.procurement_order_id} from {self.supplier.name}."
+                    notes=f"Receipt via Procurement Order #{self.procurement_order_id} from {supplier_name}."
                 )
 
                 # Update the matching PurchaseOrderItem if linked to a PO
@@ -266,7 +276,7 @@ class ProcurementOrder(models.Model):
                     if po_item:
                         po_item.quantity_received += self.quantity
                         po_item.save()
-
+                    
     def __str__(self):
         return f"PO #{self.procurement_order_id} - {self.product.name} ({self.status})"           
                
@@ -373,6 +383,7 @@ class WorkOrder(models.Model):
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     production_start_date = models.DateField()
+    production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
     status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, help_text="Automatically managed based on step completion statuses.")
     # automated state evaluation machine logic
@@ -401,12 +412,14 @@ class WorkOrder(models.Model):
     def clean(self):
         super().clean()
         # Prevents completion without a valid quantity
-        if self.status == 'completed' and not self.is_inventory_updated:
+        if self.status == 'COMPLETED' and not self.is_inventory_updated:
             if not self.quantity_produced or self.quantity_produced <= 0:
                 raise ValidationError({'quantity_produced': "Quantity produced must be greater than 0 to complete."})
             # VALIDATES RAW MATERIAL STOCK USING ACTUAL CONSUMPTION (quantity_actual)
             for line in self.material_lines.all():
-                available_stock = line.raw_material.stock.aggregate(
+                from .models import Inventory
+                available_stock = Inventory.objects.filter(
+                    product=line.component).aggregate(
                     total=Sum('quantity_available')
                 )['total'] or Decimal('0.00')
                 
@@ -418,7 +431,8 @@ class WorkOrder(models.Model):
                     
         # Date validation
         if self.production_end_date and self.production_start_date:
-            if self.production_end_date < self.production_start_date:
+            end_date = self.production_end_date.date() if isinstance(self.production_end_date, datetime) else self.production_end_date
+            if end_date < self.production_start_date:
                 raise ValidationError({'production_end_date': 'Production end date cannot be before production start date.'})
 
         if self.product and self.product.product_type not in ['FINISHED', 'INTERMEDIATE']:
@@ -431,45 +445,10 @@ class WorkOrder(models.Model):
             if active_bom:
                 self.bill_of_material = active_bom
         
-        self.full_clean()  
-        # Protect raw materials using the automated state engine gate
-        if self.status == 'COMPLETED' and not self.is_inventory_updated:
-            with transaction.atomic():
-                
-                # --- [INSERT BILL OF MATERIALS / COMPONENT ITERATION LOOP HERE] ---
-                # For example: for line in self.bom_lines.all():
-                
-                # Log raw material usage to history
-                StockTransaction.objects.create(
-                    product=line.raw_material,
-                    quantity=-needed_to_deduct,  # Negative (-)
-                    transaction_type='PRODUCTION_CONSUMPTION',
-                    work_order=self
-                )
-                
-                # Deduct from actual physical batch inventory records
-                stock_records = line.raw_material.stock.filter(quantity_available__gt=0).order_by('pk')
-                for stock_record in stock_records:
-                    if needed_to_deduct <= 0:
-                        break
-                    
-                    if stock_record.quantity_available >= needed_to_deduct:
-                        stock_record.quantity_available -= needed_to_deduct
-                        stock_record.save(update_fields=['quantity_available'])
-                        needed_to_deduct = Decimal('0.00')
-                    else:
-                        needed_to_deduct -= stock_record.quantity_available
-                        stock_record.quantity_available = Decimal('0.00')
-                        stock_record.save(update_fields=['quantity_available'])               
-                
-                # Flip the one-way safety gate switch
-                self.is_inventory_updated = True
-        
-        # Save parent first so we have an ID for the material lines
-        super().save(*args, **kwargs)   
-
-        # Auto update on material line
-        # only calculates/re-calculates raw materials if the inventory hasn't been locked and deducted yet.
+        self.full_clean() 
+        if self.status == 'COMPLETED' and not self.production_end_date:
+            self.production_end_date = timezone.now()
+        super().save(*args, **kwargs)    
         if not self.is_inventory_updated and self.bill_of_material:
             # fetches from the specific linked bill_of_material snapshot!
             for item in self.bill_of_material.items.all():
@@ -479,7 +458,7 @@ class WorkOrder(models.Model):
                 
                 line, created = WorkOrderMaterialLine.objects.get_or_create(
                     work_order=self,
-                    raw_material=item.raw_material,
+                    component=item.component,
                     defaults={
                         'quantity_expected': expected_qty, 
                         'quantity_actual': expected_qty  # Matches standard naming
@@ -494,12 +473,10 @@ class WorkOrder(models.Model):
                         line.quantity_actual = expected_qty
                     line.save(update_fields=['quantity_expected', 'quantity_actual'])
 
-        # RUNS PHYSICAL DEDUCTIONS AND WRITES TRANSACTION LEDGER ON COMPLETION
-        if self.status == 'completed' and not self.is_inventory_updated:
-            # Wrap in a database transaction block to ensure all stock changes succeed or fail together (No partial stock updates)
+        # Protect raw materials using the automated state engine gate
+        if self.status == 'COMPLETED' and not self.is_inventory_updated:
             with transaction.atomic():
-                from .models import Inventory, StockTransaction
-                
+                from .models import Inventory, StockTransaction    
                 # Finished Product is Added to stock and log transaction is carried out
                 finished_inventory, _ = Inventory.objects.get_or_create(
                     product=self.product, 
@@ -516,29 +493,33 @@ class WorkOrder(models.Model):
                     
                     # Log raw material usage to history
                     StockTransaction.objects.create(
-                        product=line.raw_material,
+                        product=line.component,
                         quantity=-needed_to_deduct,  # Negative (-)
                         transaction_type='PRODUCTION_CONSUMPTION',
                         work_order=self
                     )
+                # Deduct from actual physical batch inventory records
+                stock_records = Inventory.objects.filter(
+                        product=line.component, 
+                        quantity_available__gt=0
+                    ).order_by('pk')
+                for stock_record in stock_records:
+                    if needed_to_deduct <= 0:
+                        break
                     
-                    # Deduct from actual physical batch inventory records
-                    stock_records = line.raw_material.stock.filter(quantity_available__gt=0).order_by('pk')
-                    for stock_record in stock_records:
-                        if needed_to_deduct <= 0:
-                            break
-                        
-                        if stock_record.quantity_available >= needed_to_deduct:
-                            stock_record.quantity_available -= needed_to_deduct
-                            stock_record.save(update_fields=['quantity_available'])
-                            needed_to_deduct = Decimal('0.00')
-                        else:
-                            needed_to_deduct -= stock_record.quantity_available
-                            stock_record.quantity_available = Decimal('0.00')
-                            stock_record.save(update_fields=['quantity_available'])               
-                # Lock the record
+                    if stock_record.quantity_available >= needed_to_deduct:
+                        stock_record.quantity_available -= needed_to_deduct
+                        stock_record.save(update_fields=['quantity_available'])
+                        needed_to_deduct = Decimal('0.00')
+                    else:
+                        needed_to_deduct -= stock_record.quantity_available
+                        stock_record.quantity_available = Decimal('0.00')
+                        stock_record.save(update_fields=['quantity_available'])               
+                
+                # Flip the one-way safety gate switch
                 self.is_inventory_updated = True
-                super().save(update_fields=['is_inventory_updated'])     
+                # Lock safety gate switch
+                super().save(update_fields=['is_inventory_updated', 'production_end_date'])   
         
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
@@ -588,7 +569,7 @@ class BillOfMaterial(models.Model):
 # The ingredient going into the recipe
 class BOMItem(models.Model):
     bom_item_id = models.AutoField(primary_key=True)
-    bom = models.ForeignKey('BillOfMaterial', on_delete=models.CASCADE, related_name='components') 
+    bom = models.ForeignKey('BillOfMaterial', on_delete=models.CASCADE, related_name='items') 
     component = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='used_in_boms', limit_choices_to={'product_type__in': ['RAW', 'INTERMEDIATE']}, help_text="A raw material, retail item or intermediate sub-assembly required for production.")
     # Quantity required to manufacture exactly ONE unit of the parent product
     quantity_required = models.DecimalField(max_digits=10, decimal_places=4, validators=[MinValueValidator(Decimal('0.0001'))], help_text="The precise amount needed to create 1 unit of the parent product.")
@@ -598,7 +579,7 @@ class BOMItem(models.Model):
             raise ValidationError({
                 'component': f"Circular Dependency Error: '{self.component.name}' cannot be an ingredient in its own build recipe."
             })
-        # DEEP NESTED LOOP CHECK. Checks if the component you are adding already relies on the parent product in its own BOM
+        # DEEP NESTED LOOP CHECK. Checks if the component being added already relies on the parent product in its own BOM
         if self.component.boms.filter(components__component=self.bom.product).exists():
             raise ValidationError({
                 'component': f"Circular Dependency Detected: You are trying to add '{self.component.name}' here, "
@@ -610,20 +591,24 @@ class BOMItem(models.Model):
     
 class WorkOrderMaterialLine(models.Model):
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='material_lines')
-    raw_material = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order_usages')
+    component = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order_usages', limit_choices_to={'product_type__in': ['RAW', 'INTERMEDIATE']})
     # What the recipe (BOM) says we should use for the PLANNED quantity
     quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="Theoretical quantity calculated from BOM.") 
     # What the team ACTUALLY consumed (default matches expected, but can be edited)
     quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="The actual physical quantity consumed during this run.")
 
+    class Meta:
+        # Prevents adding the same raw material/component to the same work order twice
+        unique_together = ('work_order', 'component')
+        verbose_name = "Work Order Material Line"
+        verbose_name_plural = "Work Order Material Lines"
     @property
     def variance(self):
         """Positive variance means production used MORE than expected (waste)."""
         return self.quantity_actual - self.quantity_expected
 
     def __str__(self):
-        return f"{self.raw_material.name} for {self.work_order.work_order_number}"    
-
+        return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
         ('IN_PROGRESS', 'in_progress'),
@@ -766,7 +751,6 @@ class SalesOrderItem(models.Model):
     product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type': 'FINISHED'})  
     quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2)
     quantity_dispatched = models.PositiveIntegerField(default=0)  # Crucial for tracking partial shipments
-    unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     # Use Sum Aggregation instead of `+=` to handle additions, updates, and deletes
     def update_dispatched_quantity(self):
         """Recalculates the exact sum of all related dispatches from the ground truth."""
@@ -803,7 +787,7 @@ class DispatchRecord(models.Model):
     def clean(self):
         super().clean()
         
-        if not self.product or not self.quantity_dispatched or not self.sales_order:
+        if not self.product or not self.quantity_dispatched or not self.sales_order_item:
             return
 
         # stock validation evaluates if stock hasn't been deducted yet.
@@ -819,7 +803,7 @@ class DispatchRecord(models.Model):
                 })
 
         # ORDER QUANTITY VALIDATION
-        sales_order_item = self.sales_order.items.filter(product=self.product).first()
+        sales_order_item = self.sales_order_items.filter(product=self.product).first()
         if not sales_order_item:
             raise ValidationError({
                 'product': f"This product is not part of Sales Order #{self.sales_order.order_number}."
@@ -827,7 +811,7 @@ class DispatchRecord(models.Model):
 
         # Aggregate sibling dispatch balances safely
         other_dispatches = DispatchRecord.objects.filter(
-            sales_order=self.sales_order,
+            sales_order_item=self.sales_order_item,
             product=self.product
         )
         if self.pk:
@@ -903,11 +887,11 @@ class DispatchRecord(models.Model):
                 if fully_shipped_count == total_items and total_items > 0:
                     self.sales_order.status = 'completed'
                 elif any_shipped:
-                    self.sales_order.status = 'partially_dispatched'
+                    self.sales_orde_item.status = 'partially_dispatched'
                 else:
-                    self.sales_order.status = 'approved'
+                    self.sales_order_item.status = 'approved'
                     
-                self.sales_order.save(update_fields=['status'])  
+                self.sales_order_item.save(update_fields=['status'])  
                 
                 # Locks safety gate before exiting transaction block context
                 self.is_stock_deducted = True  
