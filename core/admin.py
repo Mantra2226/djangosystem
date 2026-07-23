@@ -89,9 +89,15 @@ class SalesOrderItemInline(admin.TabularInline):
     model = SalesOrderItem
     inlines = [DispatchRecordInline]
     extra = 1  #
-    fields = ('product', 'quantity_ordered', 'quantity_dispatched', )
+    fields = ('product', 'quantity_ordered', 'quantity_dispatched', 'unit_price', 'get_total_price')
     search_fields = ['product__name']
-    readonly_fields = ['quantity_dispatched']
+    readonly_fields = ('quantity_dispatched', 'get_total_price')
+
+    @admin.display(description='Line Total')
+    def get_total_price(self, obj):
+        if obj.total_price:
+            return f"${obj.total_price:,.2f}"
+        return "$0.00"
 class PurchasePaymentInline(admin.TabularInline):
     model = PurchasePayment
     extra = 1
@@ -139,10 +145,18 @@ class SupplierAdmin(admin.ModelAdmin):
 
 @admin.register(Inventory)
 class InventoryAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity_available', 'location', 'valuation', 'last_updated')
+    list_display = ('product', 'quantity_available', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
     list_filter = ['location', 'last_updated']
     search_fields = ('product__name', 'product__sku', 'location')
-    readonly_fields = ['valuation']  # Computed field, should not be editable
+    readonly_fields = ['get_total_valuation']  # Computed field, should not be editable
+
+    @admin.display(description='Avg Unit Cost')
+    def get_unit_cost(self, obj):
+        return f"${obj.unit_cost:,.2f}"
+
+    @admin.display(description='Total Valuation')
+    def get_total_valuation(self, obj):
+        return f"${obj.total_valuation:,.2f}"
 
 @admin.register(StockTransaction)
 class StockTransactionAdmin(admin.ModelAdmin):
@@ -178,11 +192,15 @@ class ProductionOrderAdminForm(forms.ModelForm):
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
     form = ProductionOrderAdminForm
-    list_display = ('product', 'work_order', 'quantity', 'status', 'created_at')
+    list_display = ('product', 'work_order', 'quantity', 'status', 'get_unit_cost', 'created_at')
     list_filter = ['status', 'created_at']
     search_fields = ('work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
     readonly_fields = ['work_order_details_viewer', 'created_at', 'completed_at']
+
+    @admin.display(description='Batch Unit Cost')
+    def get_unit_cost(self, obj):
+        return f"${obj.unit_cost:,.2f}"
     
     fieldsets = (
        ('Order Information', {
@@ -321,8 +339,9 @@ class FinanceEntryAdmin(admin.ModelAdmin):
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ('employee_name', 'role', 'phone_number', 'email')
-    search_fields = ('employee_name', 'role')    
+    list_display = ('employee_code', 'employee_name', 'role', 'phone_number', 'email')
+    search_fields = ('employee_code', 'employee_name', 'role')    
+    readonly_fields = ['employee_code']
 
 @admin.register(Customer)
 class CustomerAdmin(admin.ModelAdmin):
@@ -331,10 +350,15 @@ class CustomerAdmin(admin.ModelAdmin):
 
 @admin.register(SalesOrder)
 class SalesOrderAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'customer', 'status', 'created_at', 'updated_at')
+    list_display = ('order_number', 'customer', 'status', 'created_at', 'updated_at', 'get_order_total')
     list_filter = ('status', 'created_at')
     search_fields = ('order_number', 'customer__name')
     inlines = [SalesOrderItemInline]
+
+    @admin.display(description='Order Total')
+    def get_order_total(self, obj):
+        total = sum(item.total_price for item in obj.items.all())
+        return f"${total:,.2f}"
 @admin.register(BillOfMaterial)
 class BillOfMaterialAdmin(admin.ModelAdmin):
     list_display = ('product', 'name', 'is_active', 'get_component_count', 'updated_at')
@@ -348,9 +372,15 @@ class BillOfMaterialAdmin(admin.ModelAdmin):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ('sku', 'name', 'product_type', 'supplier')
+    list_display = ('sku', 'name', 'product_type', 'supplier', 'get_selling_price')
     list_filter = ['product_type', 'supplier']
     search_fields = ('sku', 'name', 'supplier__name')
+
+    @admin.display(description='Selling Price')
+    def get_selling_price(self, obj):
+        if obj.selling_price is not None:
+            return f"${obj.selling_price:,.2f}"
+        return "-"  # Shows dash for Raw Materials & Intermediates
 
 @admin.register(PurchaseOrder)
 class PurchaseOrderAdmin(admin.ModelAdmin):
