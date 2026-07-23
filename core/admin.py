@@ -339,10 +339,10 @@ class FinanceEntryAdmin(admin.ModelAdmin):
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ('employee_code', 'employee_name', 'role', 'phone_number', 'email')
-    search_fields = ('employee_code', 'employee_name', 'role')    
+    list_display = ( 'employee_code', 'employee_id', 'employee_name', 'role', 'phone_number', 'email')
+    search_fields = ('employee_id', 'employee_code', 'employee_name', 'role')    
     readonly_fields = ['employee_code']
-
+    ordering=['employee_id']
 @admin.register(Customer)
 class CustomerAdmin(admin.ModelAdmin):
     list_display = ('customer_name', 'contact_info', 'shipping_address')

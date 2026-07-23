@@ -360,7 +360,7 @@ class Employee(models.Model):
             # Look up the last created employee to increment the sequence
             last_employee = Employee.objects.filter(
                 employee_code__startswith=prefix
-            ).order_by('id').last()
+            ).order_by('employee_id').last()
 
             if last_employee and last_employee.employee_code:
                 try:
