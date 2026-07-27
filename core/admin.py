@@ -368,7 +368,7 @@ class BillOfMaterialAdmin(admin.ModelAdmin):
 
     @admin.display(description='Total Ingredients')
     def get_component_count(self, obj):
-        return obj.components.count()    
+        return obj.items.count()    
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
@@ -376,19 +376,78 @@ class ProductAdmin(admin.ModelAdmin):
     list_filter = ['product_type', 'supplier']
     search_fields = ('sku', 'name', 'supplier__name')
 
+    # 'sku' has editable=False on the model, so Django won't include it in the
+    # form automatically. Adding it here as a readonly_field makes it still
+    # visible in the admin detail view — just not as an editable input.
+    readonly_fields = ('sku',)
+
     @admin.display(description='Selling Price')
     def get_selling_price(self, obj):
         if obj.selling_price is not None:
             return f"${obj.selling_price:,.2f}"
         return "-"  # Shows dash for Raw Materials & Intermediates
 
+
 @admin.register(PurchaseOrder)
 class PurchaseOrderAdmin(admin.ModelAdmin):
-    list_display = ('po_number', 'supplier', 'order_date', 'status')
+    list_display = ('po_number', 'supplier', 'order_date', 'status_badge')
     list_filter = ('status', 'order_date', 'supplier')
     search_fields = ('po_number', 'supplier__name')
-    inlines = [PurchaseOrderItemInline]  
-    readonly_fields = ('po_number', 'order_date')
+    inlines = [PurchaseOrderItemInline]
+
+    # -------------------------------------------------------------------------
+    # 'status' is system-managed via signals and update_delivery_status().
+    # Operators must never be able to edit it manually — mark it read-only here.
+    # 'po_number' and 'order_date' are also auto-generated / auto-stamped.
+    # -------------------------------------------------------------------------
+    readonly_fields = ('po_number', 'order_date', 'status')
+
+    fieldsets = (
+        ('Order Details', {
+            'fields': ('po_number', 'supplier', 'order_date', 'notes')
+        }),
+        ('Status (Auto-Managed)', {
+            # Grouped separately to make it obvious this field is read-only
+            'fields': ('status',),
+            'description': (
+                'Status is automatically updated by the system: '
+                'DRAFT → Sent (when items are added) → '
+                'Partially Received / Fully Received (driven by procurement deliveries).'
+            ),
+        }),
+    )
+
+    # -------------------------------------------------------------------------
+    # Dynamic field lockdown: once the PO is in a terminal state (RECEIVED or
+    # CANCELLED) every field on the form becomes read-only to protect the record.
+    # -------------------------------------------------------------------------
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status in ('RECEIVED', 'CANCELLED'):
+            # Lock the entire form — return every field name as read-only
+            return [field.name for field in self.model._meta.fields]
+        # For active orders, only lock the auto-managed fields
+        return self.readonly_fields
+
+    # -------------------------------------------------------------------------
+    # Coloured status badge for the list view — makes the current state
+    # immediately obvious without opening the record.
+    # -------------------------------------------------------------------------
+    @admin.display(description='Status')
+    def status_badge(self, obj):
+        colours = {
+            'DRAFT':      '#718096',   # grey
+            'SENT':       '#3182ce',   # blue  — pending delivery
+            'PARTIAL':    '#d69e2e',   # amber — some goods received
+            'RECEIVED':   '#38a169',   # green — fully received
+            'CANCELLED':  '#e53e3e',   # red
+        }
+        colour = colours.get(obj.status, '#718096')
+        return format_html(
+            '<b style="color: {};">{}</b>',
+            colour,
+            obj.get_status_display()
+        )
+
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
     form = ProcurementOrderForm

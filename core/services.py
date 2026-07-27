@@ -30,7 +30,7 @@ def explode_material_requirements(product, target_quantity=Decimal('1.0000'), vi
     visited.add(product.pk)
     
     # Recursive Step: Dig through nested blueprints
-    for item in active_bom.components.select_related('component'):
+    for item in active_bom.items.select_related('component'):
         sub_component = item.component
         extended_quantity = item.quantity_required * Decimal(target_quantity)
         

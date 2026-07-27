@@ -1,9 +1,12 @@
 from django.shortcuts import render, redirect
 from django.contrib import messages
+from django.http import JsonResponse
+from django.contrib.admin.views.decorators import staff_member_required
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
     ProductionOrder, Invoice, Return, LossRecord, FinanceEntry, 
-    Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder
+    Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder,
+    PurchaseOrder
 )
 
 def index(request):
@@ -141,3 +144,47 @@ def return_form(request):
 
 def generate_work_order_instructions(work_order):
     pass
+
+
+@staff_member_required
+def po_products_json(request):
+    """
+    JSON endpoint used by the ProcurementOrder admin form's client-side JS.
+
+    Returns the list of products linked to a given Purchase Order so the
+    product <select> dropdown can be dynamically filtered in real time as
+    soon as the operator picks a PO from the autocomplete widget.
+
+    URL: /admin/core/procurementorder/po-products/?po_id=<int>
+    Response: { "products": [ {"id": <int>, "name": "<str>"}, ... ] }
+    """
+    po_id = request.GET.get("po_id")
+
+    if not po_id:
+        # No PO specified — return empty list; JS will show placeholder text
+        return JsonResponse({"products": []})
+
+    # Look up the PO and collect the raw-material products on its line items
+    po = PurchaseOrder.objects.filter(pk=po_id).first()
+    if not po:
+        return JsonResponse({"products": []})
+
+    # Fetch only the products actually listed on this PO's items
+    products = (
+        Product.objects
+        .filter(po_items__purchase_order=po)
+        .distinct()
+        .values("product_id", "name", "sku")
+    )
+
+    # Build a clean list for the JS to iterate over
+    product_list = [
+        {
+            "id":   p["product_id"],
+            # Include SKU so operators can identify items at a glance
+            "name": f"{p['name']} ({p['sku']})" if p["sku"] else p["name"],
+        }
+        for p in products
+    ]
+
+    return JsonResponse({"products": product_list})

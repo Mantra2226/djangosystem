@@ -9,6 +9,8 @@ from django.utils.text import slugify
 from django.core.validators import MinValueValidator
 from django.db.models import Sum
 from django.utils import timezone
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 # models.
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
@@ -26,7 +28,9 @@ class Product(models.Model):
     ]
     product_id = models.AutoField(primary_key=True)
     product_type = models.CharField(max_length=20, choices=PRODUCT_TYPE_CHOICES, default='FINISHED')
-    sku = models.CharField(max_length=100, unique=True, blank=True, help_text="Stock Keeping Unit, auto-generated if left blank.")
+    # editable=False prevents the field from appearing in any ModelForm (admin or otherwise).
+    # The SKU is always auto-generated in save(); operators must never be able to type one in manually.
+    sku = models.CharField(max_length=100, unique=True, blank=True, editable=False, help_text="Auto-generated. Format: <TYPE>-<NAME>-<RANDOM>.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, blank=True, null=True, related_name='products')
     name = models.CharField(max_length=255)
     category = models.CharField(max_length=255)
@@ -96,7 +100,7 @@ class Product(models.Model):
 class PurchaseOrder(models.Model):
     STATUS_CHOICES = [
         ('DRAFT', 'Draft'),
-        ('SENT', 'Sent to Supplier'),
+        ('SENT', 'Sent to Supplier, Pending Delivery'),
         ('PARTIAL', 'Partially Received'),
         ('RECEIVED', 'Fully Received / Completed'),
         ('CANCELLED', 'Cancelled'),
@@ -110,13 +114,16 @@ class PurchaseOrder(models.Model):
 
     def clean(self):
         super().clean()
-        
-        # If an operator sets the status to a received state, check the line items
+
+        # Guard against manually setting a received status when no deliveries have happened.
+        # NOTE: This guard only runs during form validation (full_clean). The internal
+        # update_delivery_status() method uses update_fields to skip full_clean entirely,
+        # so the auto-update path is never blocked here.
         if self.status in ['PARTIAL', 'RECEIVED']:
             if self.pk:
-                # Sum up all the quantities received across this PO's line items
+                # Sum all quantities received across this PO's line items
                 total_received = self.items.aggregate(total=Sum('quantity_received'))['total'] or Decimal('0.00')
-                
+
                 if total_received <= Decimal('0.00'):
                     raise ValidationError({
                         'status': f"Cannot set status to '{self.get_status_display()}' because "
@@ -124,11 +131,12 @@ class PurchaseOrder(models.Model):
                                   f"a Procurement Order for this PO first."
                     })
             else:
-                # Prevent creating a brand new PO directly into a received status
+                # Prevent creating a brand-new PO directly into a received status
                 raise ValidationError({
                     'status': "A brand new Purchase Order cannot be created as Partially or Fully Received. "
                               "It must start as 'Draft' or 'Sent to Supplier'."
                 })
+
     def save(self, *args, **kwargs):
         # Only generate a PO number if it doesn't have one yet
         if not self.po_number:
@@ -138,7 +146,7 @@ class PurchaseOrder(models.Model):
             latest_po = PurchaseOrder.objects.filter(
                 po_number__startswith=prefix
             ).order_by('-po_number').first()
-            
+
             if latest_po:
                 try:
                     # Extract the serial suffix (e.g. '00005' from 'PO-2026-00005') and increment it
@@ -148,11 +156,57 @@ class PurchaseOrder(models.Model):
                     next_sequence = 1
             else:
                 next_sequence = 1
-            
+
             # Format to 5 padded digits (e.g., PO-2026-00001)
             self.po_number = f"{prefix}{next_sequence:05d}"
-            
+
         super().save(*args, **kwargs)
+
+    # ---------------------------------------------------------------------------
+    # Auto-status update — called programmatically (never by form validation).
+    # Uses update_fields so full_clean() / clean() is NOT invoked, preventing
+    # the manual-entry guards above from blocking legitimate auto-transitions.
+    # ---------------------------------------------------------------------------
+    def update_delivery_status(self):
+        """
+        Inspects all PurchaseOrderItem records linked to this PO and
+        automatically advances the PO status:
+
+          • Any qty received > 0 but not all lines fully received  → PARTIAL
+          • Every ordered line has been fully received             → RECEIVED
+
+        Cancelled POs are never touched by this logic.
+        """
+        # Do not alter cancelled orders — those are terminal
+        if self.status == 'CANCELLED':
+            return
+
+        items = self.items.all()
+
+        if not items.exists():
+            # No line items yet; nothing to evaluate
+            return
+
+        # Aggregate totals across all line items on this PO
+        total_ordered = items.aggregate(total=Sum('quantity_ordered'))['total'] or Decimal('0.00')
+        total_received = items.aggregate(total=Sum('quantity_received'))['total'] or Decimal('0.00')
+
+        if total_received <= Decimal('0.00'):
+            # Nothing delivered yet — status stays at SENT (pending delivery)
+            new_status = 'SENT'
+        elif total_received >= total_ordered:
+            # Every unit on every line item has been received
+            new_status = 'RECEIVED'
+        else:
+            # Some goods have arrived but the order is not yet complete
+            new_status = 'PARTIAL'
+
+        # Only write to the database if something actually changed
+        if self.status != new_status:
+            self.status = new_status
+            # update_fields limits the UPDATE to just this column,
+            # which also bypasses full_clean() to avoid circular validation
+            PurchaseOrder.objects.filter(pk=self.pk).update(status=new_status)
 
     def __str__(self):
         return f"{self.po_number} - {self.supplier.name} ({self.get_status_display()})"    
@@ -284,8 +338,17 @@ class ProcurementOrder(models.Model):
                 if self.purchase_order:
                     po_item = self.purchase_order.items.filter(product=self.product).first()
                     if po_item:
+                        # Accumulate received quantity on the line item
                         po_item.quantity_received += self.quantity
                         po_item.save()
+
+                    # -------------------------------------------------------
+                    # Auto-update the parent PO's delivery status.
+                    # After every successful delivery, re-evaluate whether the
+                    # PO is now Partially or Fully Received and persist the
+                    # new status automatically — no manual operator input needed.
+                    # -------------------------------------------------------
+                    self.purchase_order.update_delivery_status()
                     
     def __str__(self):
         return f"PO #{self.procurement_order_id} - {self.product.name} ({self.status})"           
@@ -613,16 +676,42 @@ class BOMItem(models.Model):
     # Quantity required to manufacture exactly ONE unit of the parent product
     quantity_required = models.DecimalField(max_digits=10, decimal_places=4, validators=[MinValueValidator(Decimal('0.0001'))], help_text="The precise amount needed to create 1 unit of the parent product.")
     def clean(self):
+        super().clean()
+        if not self.bom or not self.component or not getattr(self.bom, 'product', None):
+            return
+
         # Infinite Loop Prevention: A product cannot be an ingredient in its own recipe card!
         if self.bom and self.component == self.bom.product:
             raise ValidationError({
                 'component': f"Circular Dependency Error: '{self.component.name}' cannot be an ingredient in its own build recipe."
             })
         # DEEP NESTED LOOP CHECK. Checks if the component being added already relies on the parent product in its own BOM
-        if self.component.boms.filter(components__component=self.bom.product).exists():
+        if self.component.boms.filter(items__component=self.bom.product).exists():
             raise ValidationError({
                 'component': f"Circular Dependency Detected: You are trying to add '{self.component.name}' here, "
                              f"but '{self.component.name}' already requires '{self.bom.product.name}' in its own active BOM!"
+            })
+        has_circular_dependency = self.component.boms.filter(
+            is_active=True,
+            items__component=self.bom.product
+        ).exists()
+
+        if has_circular_dependency:
+            raise ValidationError({
+                'component': (
+                    f"Circular Dependency Detected: You are trying to add '{self.component.name}' here, "
+                    f"but '{self.component.name}' already requires '{self.bom.product.name}' in its own active BOM!"
+                )
+            })
+        # Prevent Zero or Negative Quantities    
+        if not self.quantity_required > 0:
+            raise ValidationError({'quantity_required': 'Quantity must be greater than 0.'})
+        
+        # Prevent CreatingAssemblies From Raw Materials    
+        if self.component.product_type == 'RAW' and self.bom.product.product_type == 'RAW':
+            raise ValidationError({
+                'component': f"Invalid Assembly: Both the parent item ('{self.bom.product.name}') "
+                             f"and the ingredient ('{self.component.name}') are set as Raw Materials."
             })
 
     def __str__(self):
@@ -751,7 +840,7 @@ class ProductionOrder(models.Model):
                 bom = self.work_order.bill_of_material
                 target_quantity = self.work_order.quantity
 
-                for item in bom.components.all():
+                for item in bom.items.all():
                     total_needed = item.quantity_required * target_quantity
 
                     inventory_item = Inventory.objects.filter(
@@ -1450,3 +1539,33 @@ class FinanceEntry(models.Model):
     def __str__(self):
         return f"[{self.get_entry_type_display()}] ${self.amount} — {self.get_category_display()} ({self.entry_date})"
     
+
+# =============================================================================
+# SIGNALS: PurchaseOrder Auto-Status Transitions
+# =============================================================================
+
+@receiver(post_save, sender=PurchaseOrderItem)
+def auto_advance_po_to_sent(sender, instance, created, **kwargs):
+    """
+    Signal handler: fires every time a PurchaseOrderItem is saved.
+
+    Purpose – DRAFT → SENT auto-transition
+    -----------------------------------------
+    When an operator saves a PO with line items for the first time
+    (i.e. the PO is still in DRAFT), this signal advances the parent
+    PurchaseOrder status to 'SENT' automatically, signalling that the
+    order has been committed and is now pending delivery from the supplier.
+
+    Rules:
+      • Only fires when the PO is currently in DRAFT status.
+      • Uses a direct queryset update (no full_clean) to avoid
+        triggering form-level validation guards.
+      • Cancelled POs are never touched.
+    """
+    po = instance.purchase_order
+
+    # Only auto-advance orders that are still in the initial draft stage
+    if po.status == 'DRAFT':
+        # Use a queryset update so full_clean() is not invoked — this is
+        # an internal system transition, not an operator-driven form save.
+        PurchaseOrder.objects.filter(pk=po.pk).update(status='SENT')
