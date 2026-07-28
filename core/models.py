@@ -1,3 +1,4 @@
+from django.db.models import aggregates
 from datetime import datetime
 from itertools import product
 import secrets
@@ -481,7 +482,7 @@ class WorkOrderInstruction(models.Model):
 class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
-    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type': 'FINISHED'})
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     production_start_date = models.DateField()
@@ -527,8 +528,8 @@ class WorkOrder(models.Model):
                 
                 if available_stock < line.quantity_actual:
                     raise ValidationError({
-                        'status': f"Cannot complete Work Order. Insufficient stock for raw material: {line.raw_material.name}. "
-                                  f"Actual required: {line.quantity_actual}, Available in warehouse: {available_stock}."
+                        'status': f"Cannot complete Work Order. Insufficient stock for raw material: {line.component.name}."
+                                  f"Actual required: {line.quantity_actual} units, Available in warehouse: {available_stock}"
                     })
                     
         # Date validation
@@ -541,74 +542,101 @@ class WorkOrder(models.Model):
             raise ValidationError({'product': 'Work orders can only be created for finished or intermediate products.'})
 
     def save(self, *args, **kwargs):
-        # automation that defaults to the active recipe for this product if left blank
+        # Default to active BOM if left empty
         if not self.bill_of_material and self.product:
             active_bom = self.product.boms.filter(is_active=True).first()
             if active_bom:
                 self.bill_of_material = active_bom
-        
-        self.full_clean() 
+
+        # Set completion timestamp
         if self.status == 'COMPLETED' and not self.production_end_date:
             self.production_end_date = timezone.now()
-        super().save(*args, **kwargs)    
-        if not self.is_inventory_updated and self.bill_of_material:
-            # fetches from the specific linked bill_of_material snapshot!
-            for item in self.bill_of_material.items.all():
-                # Expected amount: (BOM usage per unit) * (parent output)
-                qty_produced_factor = self.quantity_produced or Decimal('0.00')
-                expected_qty = item.quantity_required * qty_produced_factor
-                
-                line, created = WorkOrderMaterialLine.objects.get_or_create(
-                    work_order=self,
-                    component=item.component,
-                    defaults={
-                        'quantity_expected': expected_qty, 
-                        'quantity_actual': expected_qty  # Matches standard naming
-                    }
-                )
-                
-                # If the line already exists but the parent quantity changed before completion:
-                if not created:
-                    line.quantity_expected = expected_qty
-                    # If they haven't customized the actual usage yet, keep actual in sync with expected
-                    if line.quantity_actual == line.quantity_expected:
-                        line.quantity_actual = expected_qty
-                    line.save(update_fields=['quantity_expected', 'quantity_actual'])
 
-        # Protect raw materials using the automated state engine gate
+        self.full_clean()
+
+        # Save initial instance to ensure PK exists before processing relations
+        super().save(*args, **kwargs)
+
+        # Synchronize material requirement lines from BOM
+        if not self.is_inventory_updated and self.bill_of_material:
+            self._sync_material_lines()
+
+        # Atomic inventory execution upon completion
         if self.status == 'COMPLETED' and not self.is_inventory_updated:
-            with transaction.atomic():
-                from .models import Inventory, StockTransaction    
-                # Finished Product is Added to stock and log transaction is carried out
-                finished_inventory, _ = Inventory.objects.get_or_create(
-                    product=self.product, 
-                    defaults={'quantity_available': Decimal('0.00')}
+            self._process_inventory_completion()
+
+    def _sync_material_lines(self):
+        """Generates or updates material lines based on target production quantity."""
+        qty_produced_factor = self.quantity_produced or Decimal('0.00')
+
+        # Aggregate components in case BOM contains duplicate items
+        bom_requirements = {}
+        for item in self.bill_of_material.items.all():
+            bom_requirements[item.component] = (
+                bom_requirements.get(item.component, Decimal('0.00')) + item.quantity_required
+            )
+
+        for component, req_per_unit in bom_requirements.items():
+            expected_qty = req_per_unit * qty_produced_factor
+
+            line, created = WorkOrderMaterialLine.objects.get_or_create(
+                work_order=self,
+                component=component,
+                defaults={
+                    'quantity_expected': expected_qty,
+                    'quantity_actual': expected_qty,
+                }
+            )
+
+            if not created:
+                # Compare against current line value BEFORE updating expected_qty
+                if line.quantity_actual == line.quantity_expected:
+                    line.quantity_actual = expected_qty
+                line.quantity_expected = expected_qty
+                line.save(update_fields=['quantity_expected', 'quantity_actual'])
+
+    def _process_inventory_completion(self):
+        """Executes atomic stock deduction for raw materials and intake for finished goods."""
+        from .models import Inventory, StockTransaction
+
+        with transaction.atomic():
+            # A. Finished Product Stock Intake
+            finished_inventory, _ = Inventory.objects.get_or_create(
+                product=self.product,
+                defaults={'quantity_available': Decimal('0.00')}
+            )
+            finished_inventory.quantity_available += self.quantity_produced
+            finished_inventory.save(update_fields=['quantity_available'])
+
+            StockTransaction.objects.create(
+                product=self.product,
+                quantity=self.quantity_produced,
+                transaction_type='PRODUCTION_OUTPUT',
+                work_order=self
+            )
+
+            # B. Raw Material Stock Deduction (Fixed Loop Indentation)
+            for line in self.material_lines.all():
+                needed_to_deduct = line.quantity_actual
+
+                # Log consumption transaction
+                StockTransaction.objects.create(
+                    product=line.component,
+                    quantity=-needed_to_deduct,
+                    transaction_type='PRODUCTION_CONSUMPTION',
+                    work_order=self
                 )
-                finished_inventory.quantity_available += self.quantity_produced
-                finished_inventory.save(update_fields=['quantity_available'])
-                
-                StockTransaction.objects.create(product=self.product, quantity=self.quantity_produced, transaction_type='PRODUCTION_OUTPUT', work_order=self)
-                
-                # Raw Materials is Deducted from stock and log transaction carried out
-                for line in self.material_lines.all():
-                    needed_to_deduct = line.quantity_actual  # The real physical usage!
-                    
-                    # Log raw material usage to history
-                    StockTransaction.objects.create(
-                        product=line.component,
-                        quantity=-needed_to_deduct,  # Negative (-)
-                        transaction_type='PRODUCTION_CONSUMPTION',
-                        work_order=self
-                    )
-                # Deduct from actual physical batch inventory records
+
+                # Deduct from available inventory batches
                 stock_records = Inventory.objects.filter(
-                        product=line.component, 
-                        quantity_available__gt=0
-                    ).order_by('pk')
+                    product=line.component,
+                    quantity_available__gt=0
+                ).order_by('pk')
+
                 for stock_record in stock_records:
                     if needed_to_deduct <= 0:
                         break
-                    
+
                     if stock_record.quantity_available >= needed_to_deduct:
                         stock_record.quantity_available -= needed_to_deduct
                         stock_record.save(update_fields=['quantity_available'])
@@ -616,13 +644,20 @@ class WorkOrder(models.Model):
                     else:
                         needed_to_deduct -= stock_record.quantity_available
                         stock_record.quantity_available = Decimal('0.00')
-                        stock_record.save(update_fields=['quantity_available'])               
-                
-                # Flip the one-way safety gate switch
-                self.is_inventory_updated = True
-                # Lock safety gate switch
-                super().save(update_fields=['is_inventory_updated', 'production_end_date'])   
-        
+                        stock_record.save(update_fields=['quantity_available'])
+
+                # If total stock was insufficient, record remaining deficit on primary inventory
+                if needed_to_deduct > 0:
+                    primary_stock, _ = Inventory.objects.get_or_create(
+                        product=line.component,
+                        defaults={'quantity_available': Decimal('0.00')}
+                    )
+                    primary_stock.quantity_available -= needed_to_deduct
+                    primary_stock.save(update_fields=['quantity_available'])
+
+            # C. Lock state switch
+            self.is_inventory_updated = True
+            super().save(update_fields=['is_inventory_updated'])
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
@@ -744,7 +779,7 @@ class ProductionOrder(models.Model):
         ('CANCELLED', 'cancelled'),
     ]
     production_order_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type': 'FINISHED'})
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.01'))], help_text="Quantity to be produced in this specific run.")
@@ -770,7 +805,7 @@ class ProductionOrder(models.Model):
 
         current_qty = inventory.quantity_available
         current_cost = inventory.unit_cost
-        batch_qty = self.quantity_produced
+        batch_qty = self.quantity
         batch_cost = self.unit_cost
 
         total_qty = current_qty + batch_qty
@@ -788,22 +823,20 @@ class ProductionOrder(models.Model):
 
     def clean(self):
         super().clean()   
-        # Fallback quantity calculation
-        if (not self.quantity or self.quantity == Decimal('0.00')) and self.work_order_id:
-            self.quantity = self.work_order.quantity
-
-        # Enforce finished goods only
-        if self.product_id and not self.product.product_type != 'Finished Goods': # Or self.product.product_type != 'FINISHED_GOOD'
-            raise ValidationError({
-                'product': "Only products designated as 'Finished Goods' can be selected for a production run."
-            })       
         if self.work_order_id:
             if not self.product_id:
                 self.product = self.work_order.product
-
+        # Fallback quantity calculation
         if (not self.quantity or self.quantity == Decimal('0.00')) and self.work_order_id:
-            self.quantity = self.work_order.quantity    
-       # Checks if product and work_order match
+            self.quantity = self.work_order.quantity_produced
+
+        # Enforce finished goods only
+        if self.product_id and self.product.product_type not in ['FINISHED', 'INTERMEDIATE']:
+            raise ValidationError({
+                'product': "Only products designated as 'Finished Goods' or 'Intermediate' can be selected for a production run."
+            })       
+            
+        # Checks if product and work_order match
         if self.product and self.work_order:
         # Assuming your WorkOrder model has a 'product' field (e.g. self.work_order.product)
             if self.work_order.product != self.product:
@@ -812,21 +845,44 @@ class ProductionOrder(models.Model):
                     f"Conflict: The selected Work Order ({self.work_order}) is for '{self.work_order.product}', "
                     f"but this Production Order is set to produce '{self.product}'."
                 )
-            })     
+            })  
+        # PASS 1: INVENTORY VALIDATION (Must be in clean() for Admin UI)
+        old_status = None
+        if self.pk:
+            old_status = ProductionOrder.objects.filter(pk=self.pk).values_list('status', flat=True).first()
+        is_transitioning_to_progress = (old_status != 'IN_PROGRESS' and self.status == 'IN_PROGRESS')
+        if is_transitioning_to_progress and self.work_order and self.work_order.bill_of_material:
+            bom = self.work_order.bill_of_material
+                # Guard against None values
+            target_quantity = self.quantity or Decimal('0.00')               
+            for item in bom.items.all():
+                total_needed = item.quantity_required * target_quantity
+
+                # Query inventory (preferring primary warehouse location if specified)
+                inventory_item = Inventory.objects.select_for_update().filter(
+                    product=item.component
+                ).order_by('-quantity_available').first()
+
+                available_qty = inventory_item.quantity_available if inventory_item else Decimal('0.00')
+
+                if not inventory_item or available_qty < total_needed:
+                    raise ValidationError(
+                        f"Insolvent Stock Error: Insufficient inventory for ingredient '{item.component.name}'. "
+                        f"Required: {total_needed}, Available: {available_qty}"
+                    )     
 
     def save(self, *args, **kwargs):
-        is_new = self.pk is None        
-        # Capture status transitions BEFORE super().save() runs
+        is_new = self.pk is None   
         old_status = None
         if not is_new:
-            old_status = ProductionOrder.objects.filter(pk=self.pk).values_list('status', flat=True).first()
-
+            old_status = ProductionOrder.objects.filter(pk=self.pk).values_list('status', flat=True).first()     
+        # Capture status transitions BEFORE super().save() runs
         is_transitioning_to_progress = (old_status != 'IN_PROGRESS' and self.status == 'IN_PROGRESS')
         is_transitioning_to_completed = (old_status != 'COMPLETED' and self.status == 'COMPLETED')
         # Sets Timestamps
-        if self.status == 'IN_PROGRESS' and not getattr(self, 'created_at', None):
+        if self.status == 'IN_PROGRESS' and not self.created_at:
             self.created_at = timezone.now()
-        elif self.status == 'COMPLETED' and not getattr(self, 'completed_at', None):
+        elif self.status == 'COMPLETED' and not self.completed_at:
             self.completed_at = timezone.now()
         elif self.status == 'CANCELLED':
             self.completed_at = None
@@ -834,37 +890,36 @@ class ProductionOrder(models.Model):
         self.full_clean()
         # Single Atomic Transaction Execution
         with transaction.atomic():
-            
-            # AUTOMATED INGREDIENT CONSUMPTION (IN_PROGRESS) 
-            if is_transitioning_to_progress and hasattr(self, 'work_order') and self.work_order.bill_of_material:
+            super().save(*args, **kwargs)
+
+            if is_new and self.work_order and hasattr(self.work_order, 'employee'):
+                self.employee.set(self.work_order.employee.all())
+
+            # DEDUCT INVENTORY (PASS 2 - Execution Only)
+            if is_transitioning_to_progress and self.work_order and self.work_order.bill_of_material:
                 bom = self.work_order.bill_of_material
-                target_quantity = self.work_order.quantity
+                target_quantity = self.quantity or Decimal('0.00')
 
                 for item in bom.items.all():
                     total_needed = item.quantity_required * target_quantity
 
-                    inventory_item = Inventory.objects.filter(
-                        product=item.component, 
-                        location='Main Warehouse'
-                    ).first()
+                    # Lock row for atomic deduction
+                    inventory_item = Inventory.objects.select_for_update().filter(
+                        product=item.component
+                    ).order_by('-quantity_available').first()
 
-                    if not inventory_item or inventory_item.quantity_available < total_needed:
-                        raise ValidationError(
-                            f"Insolvent Stock Error: Insufficient inventory for ingredient '{item.component.name}'. "
-                            f"Required: {total_needed}, Available: {inventory_item.quantity_available if inventory_item else 0.00}"
+                    if inventory_item:
+                        inventory_item.quantity_available -= total_needed
+                        inventory_item.save(update_fields=['quantity_available'])
+
+                        StockTransaction.objects.create(
+                            product=item.component,
+                            quantity=-total_needed,
+                            transaction_type='PRODUCTION_CONSUMPTION',
+                            work_order=self.work_order
                         )
 
-                    inventory_item.quantity_available -= total_needed
-                    inventory_item.save()
-
-            super().save(*args, **kwargs)
-
-            # ASSIGN EMPLOYEES (IF NEW)
-            if is_new and hasattr(self, 'work_order') and self.work_order:
-                if hasattr(self.work_order, 'employee'):
-                    self.employee.set(self.work_order.employee.all())
-
-            # --- D. AUTOMATED FINISHED GOODS ADDITION (COMPLETED) ---
+            # Finish Goods
             if is_transitioning_to_completed:
                 self.complete_production()
                 
