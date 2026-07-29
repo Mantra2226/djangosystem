@@ -485,11 +485,11 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['status', 'is_inventory_updated', 'production_end_date']
+    list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
+    readonly_fields = ['work_order_code', 'status', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
     list_filter = ['status', 'is_inventory_updated', 'production_start_date']
-    search_fields = ('product__name', 'product__sku', 'employee__employee_name')
+    search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
     fieldsets = (
         ('Order Specification', {
