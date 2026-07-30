@@ -555,7 +555,7 @@ class WorkOrder(models.Model):
                     if needed_to_deduct <= Decimal('0.00'):
                         continue
 
-                    # Log actual consumption transaction
+                    # 1. Log transaction
                     StockTransaction.objects.create(
                         product=line.component,
                         quantity=-needed_to_deduct,
@@ -563,25 +563,15 @@ class WorkOrder(models.Model):
                         work_order=self
                     )
 
-                    # Deduct from actual physical warehouse rows
-                    stock_records = Inventory.objects.select_for_update().filter(
+                    # 2. Get or create primary inventory record for this component
+                    inventory_item, _ = Inventory.objects.select_for_update().get_or_create(
                         product=line.component,
-                        quantity_available__gt=0
-                    ).order_by('pk')
+                        defaults={'quantity_available': Decimal('0.00')}
+                    )
 
-                    for stock_record in stock_records:
-                        if needed_to_deduct <= 0:
-                            break
-
-                        if stock_record.quantity_available >= needed_to_deduct:
-                            stock_record.quantity_available -= needed_to_deduct
-                            stock_record.save(update_fields=['quantity_available'])
-                            needed_to_deduct = Decimal('0.00')
-                        else:
-                            needed_to_deduct -= stock_record.quantity_available
-                            stock_record.quantity_available = Decimal('0.00')
-                            stock_record.save(update_fields=['quantity_available'])
-
+                    # 3. Direct deduction
+                    inventory_item.quantity_available -= needed_to_deduct
+                    inventory_item.save(update_fields=['quantity_available'])
                 # LOCK SAFETY SWITCH
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
