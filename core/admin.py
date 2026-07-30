@@ -542,10 +542,10 @@ class WorkOrderAdmin(admin.ModelAdmin):
             obj.delete()
 
     def save_related(self, request, form, formsets, change):
-        # save inline formsets (material lines) to database
+        print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...")
         super().save_related(request, form, formsets, change)
-
-        # trigger inventory processing after inline data is committed
+        
+        print("[ADMIN SAVE_RELATED] Inline material lines saved. Calling process_inventory()...")
         work_order = form.instance
         work_order.process_inventory()
 
