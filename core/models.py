@@ -451,6 +451,13 @@ class WorkOrder(models.Model):
             self.save()    
     def clean(self):
         super().clean()
+        # Validate that all instruction steps are complete before allowing status = COMPLETED
+        if self.status == 'COMPLETED' and self.pk:
+            incomplete_steps = self.instructions.exclude(status__iexact='COMPLETED').count()
+            if incomplete_steps > 0:
+                raise ValidationError({
+                    'status': f"Cannot complete Work Order. There are still {incomplete_steps} incomplete instruction step(s)."
+                })
         # Prevents completion without a valid quantity
         if self.status == 'COMPLETED' and not self.is_inventory_updated:
             if not self.quantity_produced or self.quantity_produced <= 0:
@@ -462,11 +469,13 @@ class WorkOrder(models.Model):
                     product=line.component).aggregate(
                     total=Sum('quantity_available')
                 )['total'] or Decimal('0.00')
-                
-                if available_stock < line.quantity_actual:
+
+                actual_used = line.quantity_actual or Decimal('0.00')
+
+                if available_stock < actual_used:
                     raise ValidationError({
                         'status': f"Cannot complete Work Order. Insufficient stock for raw material: {line.component.name}. "
-                                  f"Actual required: {line.quantity_actual}, Available in warehouse: {available_stock}."
+                                  f"Actual required: {actual_used}, Available in warehouse: {available_stock}."
                     })
                     
         # Date validation
@@ -527,7 +536,8 @@ class WorkOrder(models.Model):
                 )
 
         # EXECUTE PHYSICAL INVENTORY DEDUCTION (UNTOUCHED BY BOM MATH)
-        if self.status == 'COMPLETED' and not self.is_inventory_updated:
+        current_status = (self.status or '').upper().strip()
+        if current_status == 'COMPLETED' and not self.is_inventory_updated:
             with transaction.atomic():
                 from .models import Inventory, StockTransaction
 
@@ -549,32 +559,65 @@ class WorkOrder(models.Model):
                     )
 
                 # DEDUCT RAW MATERIALS (Deducts EXACTLY what the operator entered in quantity_actual)
-                for line in self.material_lines.all():
-                    needed_to_deduct = line.quantity_actual or Decimal('0.00')
+                if current_status == 'COMPLETED' and not self.is_inventory_updated:
+                    with transaction.atomic():
+                        from .models import Inventory, StockTransaction
 
-                    if needed_to_deduct <= Decimal('0.00'):
-                        continue
+                        # --- A. FINISHED GOODS (ADD TO STOCK) ---
+                        finished_qty = self.quantity_produced or Decimal('0.00')
+                        if finished_qty > Decimal('0.00'):
+                            finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                                product=self.product,
+                                defaults={'quantity_available': Decimal('0.00')}
+                            )
+                            finished_inv.quantity_available += finished_qty
+                            finished_inv.save(update_fields=['quantity_available'])
 
-                    # 1. Log transaction
-                    StockTransaction.objects.create(
-                        product=line.component,
-                        quantity=-needed_to_deduct,
-                        transaction_type='PRODUCTION_CONSUMPTION',
-                        work_order=self
-                    )
+                            StockTransaction.objects.create(
+                                product=self.product,
+                                quantity=finished_qty,
+                                transaction_type='PRODUCTION_OUTPUT',
+                                work_order=self
+                            )
 
-                    # 2. Get or create primary inventory record for this component
-                    inventory_item, _ = Inventory.objects.select_for_update().get_or_create(
-                        product=line.component,
-                        defaults={'quantity_available': Decimal('0.00')}
-                    )
+                    # B. RAW MATERIALS (DEDUCT EVERY LINE RELIABLY)
+                        for line in self.material_lines.all():
+                            needed_to_deduct = line.quantity_actual or Decimal('0.00')
+                            if needed_to_deduct <= Decimal('0.00'):
+                                continue
 
-                    # 3. Direct deduction
-                    inventory_item.quantity_available -= needed_to_deduct
-                    inventory_item.save(update_fields=['quantity_available'])
+                    # Log Consumption History
+                            StockTransaction.objects.create(
+                                product=line.component,
+                                quantity=-needed_to_deduct,
+                                transaction_type='PRODUCTION_CONSUMPTION',
+                                work_order=self
+                            )
+
+                    # Deduct directly from Inventory record
+                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                                product=line.component,
+                                defaults={'quantity_available': Decimal('0.00')}
+                            )
+                            raw_inv.quantity_available -= needed_to_deduct
+                            raw_inv.save(update_fields=['quantity_available'])
                 # LOCK SAFETY SWITCH
                 self.is_inventory_updated = True
-                super().save(update_fields=['is_inventory_updated', 'production_end_date'])
+                super().save(update_fields=['is_inventory_updated', 'production_end_date'])    
+
+        # AUTOMATED PRODUCTION ORDER STATUS SYNC
+        if self.pk:
+            from .models import ProductionOrder
+            linked_production_orders = ProductionOrder.objects.filter(work_order=self)
+            for po in linked_production_orders:
+                if self.status == 'COMPLETED' and po.status != 'COMPLETED':
+                    po.status = 'COMPLETED'
+                    po.completed_at = timezone.now()
+                    po.save(update_fields=['status', 'completed_at'])
+                elif self.status == 'IN_PROGRESS' and po.status != 'IN_PROGRESS':
+                    po.status = 'IN_PROGRESS'
+                    po.save(update_fields=['status'])
+                
         
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"

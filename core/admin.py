@@ -197,7 +197,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     list_filter = ['status', 'created_at']
     search_fields = ('work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
-    readonly_fields = ['work_order_details_viewer', 'created_at', 'completed_at']
+    readonly_fields = ['status', 'work_order_details_viewer', 'created_at', 'completed_at']
 
     @admin.display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
