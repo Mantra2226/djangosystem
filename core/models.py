@@ -487,69 +487,23 @@ class WorkOrder(models.Model):
         if self.product and self.product.product_type not in ['FINISHED', 'INTERMEDIATE']:
             raise ValidationError({'product': 'Work orders can only be created for finished or intermediate products.'})
 
-    def save(self, *args, **kwargs):
-        is_new = self.pk is None
-        # AUTO-GENERATE WORK ORDER CODE
-        if not self.work_order_code:
-            prefix = "WOC"
-            last_work_order = WorkOrder.objects.filter(
-                work_order_code__startswith=prefix
-            ).order_by('work_order_id').last()
-
-            if last_work_order and last_work_order.work_order_code:
-                try:
-                    last_sequence = int(last_work_order.work_order_code.split('-')[-1])
-                    new_sequence = last_sequence + 1
-                except (ValueError, IndexError):
-                    new_sequence = 1
-            else:
-                new_sequence = 1
-
-            self.work_order_code = f"{prefix}-{new_sequence:04d}"
-
-        # AUTO-ASSIGN ACTIVE BOM
-        if not self.bill_of_material and self.product:
-            active_bom = self.product.boms.filter(is_active=True).first()
-            if active_bom:
-                self.bill_of_material = active_bom
-
-        # Set end date timestamp if completed
-        if self.status == 'COMPLETED' and not self.production_end_date:
-            self.production_end_date = timezone.now()
-
-        # Save main instance
-        super().save(*args, **kwargs)
-
-        # INITIALIZE MATERIAL LINES (ONLY ON CREATION - ONE TIME)
-        if is_new and self.bill_of_material:
-            for item in self.bill_of_material.items.all():
-                # Initial baseline reference calculation based on BOM item default
-                base_qty = item.quantity_required or Decimal('0.00')
-
-                WorkOrderMaterialLine.objects.get_or_create(
-                    work_order=self,
-                    component=item.component,
-                    defaults={
-                        'quantity_expected': base_qty,
-                        'quantity_actual': base_qty  # Initial suggestion only; operator can edit anytime
-                    }
-                )
-
-        # EXECUTE PHYSICAL INVENTORY DEDUCTION (UNTOUCHED BY BOM MATH)
+    def process_inventory(self):
+        """Processes finished goods additions and raw material deductions after inline formsets are saved."""
         current_status = (self.status or '').upper().strip()
+
         if current_status == 'COMPLETED' and not self.is_inventory_updated:
             with transaction.atomic():
                 from .models import Inventory, StockTransaction
 
-                # ADD FINISHED PRODUCT TO STOCK
+                #FINISHED GOODS (ADD TO STOCK)
                 finished_qty = self.quantity_produced or Decimal('0.00')
                 if finished_qty > Decimal('0.00'):
-                    finished_inventory, _ = Inventory.objects.select_for_update().get_or_create(
+                    finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=self.product,
                         defaults={'quantity_available': Decimal('0.00')}
                     )
-                    finished_inventory.quantity_available += finished_qty
-                    finished_inventory.save(update_fields=['quantity_available'])
+                    finished_inv.quantity_available += finished_qty
+                    finished_inv.save(update_fields=['quantity_available'])
 
                     StockTransaction.objects.create(
                         product=self.product,
@@ -558,65 +512,169 @@ class WorkOrder(models.Model):
                         work_order=self
                     )
 
-                # DEDUCT RAW MATERIALS (Deducts EXACTLY what the operator entered in quantity_actual)
-                if current_status == 'COMPLETED' and not self.is_inventory_updated:
-                    with transaction.atomic():
-                        from .models import Inventory, StockTransaction
-
-                        # --- A. FINISHED GOODS (ADD TO STOCK) ---
-                        finished_qty = self.quantity_produced or Decimal('0.00')
-                        if finished_qty > Decimal('0.00'):
-                            finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                                product=self.product,
-                                defaults={'quantity_available': Decimal('0.00')}
-                            )
-                            finished_inv.quantity_available += finished_qty
-                            finished_inv.save(update_fields=['quantity_available'])
-
-                            StockTransaction.objects.create(
-                                product=self.product,
-                                quantity=finished_qty,
-                                transaction_type='PRODUCTION_OUTPUT',
-                                work_order=self
-                            )
-
-                    # B. RAW MATERIALS (DEDUCT EVERY LINE RELIABLY)
-                        for line in self.material_lines.all():
-                            needed_to_deduct = line.quantity_actual or Decimal('0.00')
-                            if needed_to_deduct <= Decimal('0.00'):
-                                continue
+                # RAW MATERIALS (DEDUCT ACTUAL CONSUMPTION)
+                for line in self.material_lines.all():
+                    needed_to_deduct = line.quantity_actual or Decimal('0.00')
+                    if needed_to_deduct <= Decimal('0.00'):
+                        continue
 
                     # Log Consumption History
-                            StockTransaction.objects.create(
-                                product=line.component,
-                                quantity=-needed_to_deduct,
-                                transaction_type='PRODUCTION_CONSUMPTION',
-                                work_order=self
-                            )
+                    StockTransaction.objects.create(
+                        product=line.component,
+                        quantity=-needed_to_deduct,
+                        transaction_type='PRODUCTION_CONSUMPTION',
+                        work_order=self
+                    )
 
                     # Deduct directly from Inventory record
-                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                                product=line.component,
-                                defaults={'quantity_available': Decimal('0.00')}
-                            )
-                            raw_inv.quantity_available -= needed_to_deduct
-                            raw_inv.save(update_fields=['quantity_available'])
-                # LOCK SAFETY SWITCH
-                self.is_inventory_updated = True
-                super().save(update_fields=['is_inventory_updated', 'production_end_date'])    
+                    raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                        product=line.component,
+                        defaults={'quantity_available': Decimal('0.00')}
+                    )
+                    raw_inv.quantity_available -= needed_to_deduct
+                    raw_inv.save(update_fields=['quantity_available'])
 
-        # AUTOMATED PRODUCTION ORDER STATUS SYNC
+                # IMMUTABLE SAFETY GATE 
+                self.is_inventory_updated = True
+                super().save(update_fields=['is_inventory_updated', 'production_end_date'])        
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        print("\n==================================================")
+        print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}")
+
+        # AUTO-GENERATE CODE & ASSIGN BOM
+        if not self.work_order_code:
+            prefix = "WOC"
+            last_wo = WorkOrder.objects.filter(work_order_code__startswith=prefix).order_by('work_order_id').last()
+            new_seq = (int(last_wo.work_order_code.split('-')[-1]) + 1) if (last_wo and last_wo.work_order_code) else 1
+            self.work_order_code = f"{prefix}-{new_seq:04d}"
+            print(f"[LOG] Generated new Work Order Code: {self.work_order_code}")
+
+        if not self.bill_of_material and self.product:
+            active_bom = self.product.boms.filter(is_active=True).first()
+            if active_bom:
+                self.bill_of_material = active_bom
+                print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}")
+
+        # Normalize status string for case-insensitive checking
+        current_status = (self.status or '').upper().strip()
+        is_completed = (current_status == 'COMPLETED')
+
+        print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}")
+        print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}")
+
+        if is_completed and not self.production_end_date:
+            self.production_end_date = timezone.now()
+
+        # SAVE MAIN RECORD
+        super().save(*args, **kwargs)
+        print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})")
+
+        # INITIALIZE MATERIAL LINES FROM BOM (NEW RECORDS ONLY)
+        if is_new and self.bill_of_material:
+            print("[LOG] Creating initial material lines from BOM...")
+            for item in self.bill_of_material.items.all():
+                base_qty = item.quantity_required or Decimal('0.00')
+                line, created = WorkOrderMaterialLine.objects.get_or_create(
+                    work_order=self,
+                    component=item.component,
+                    defaults={'quantity_expected': base_qty, 'quantity_actual': base_qty}
+                )
+                print(f"      -> Material line for {item.component.name}: Expected={base_qty} (Created: {created})")
+
+        # EXECUTE INVENTORY DEDUCTIONS & FINISHED GOODS ADDITION
+        if is_completed and not self.is_inventory_updated:
+            print("--------------------------------------------------")
+            print("[INVENTORY ENGINE START] Status is COMPLETED and is_inventory_updated is False.")
+            with transaction.atomic():
+                from .models import Inventory, StockTransaction
+
+                # FINISHED GOODS (ADD TO STOCK) 
+                finished_qty = self.quantity_produced or Decimal('0.00')
+                print(f"[FINISHED GOODS] Output Quantity Produced: {finished_qty}")
+
+                if finished_qty > Decimal('0.00'):
+                    finished_inv, created = Inventory.objects.select_for_update().get_or_create(
+                        product=self.product,
+                        defaults={'quantity_available': Decimal('0.00')}
+                    )
+                    old_qty = finished_inv.quantity_available
+                    finished_inv.quantity_available += finished_qty
+                    finished_inv.save(update_fields=['quantity_available'])
+
+                    StockTransaction.objects.create(
+                        product=self.product,
+                        quantity=finished_qty,
+                        transaction_type='PRODUCTION_OUTPUT',
+                        work_order=self
+                    )
+                    print(f"    ADDED FINISHED PRODUCT ({self.product.name}): Old Stock={old_qty} -> New Stock={finished_inv.quantity_available}")
+                else:
+                    print("    SKIPPED FINISHED GOODS: quantity_produced is 0 or None.")
+
+                # --- B. RAW MATERIALS (DEDUCT EVERY LINE RELIABLY) ---
+                lines = self.material_lines.all()
+                print(f"[RAW MATERIALS] Found {lines.count()} material line(s) to process.")
+
+                if lines.count() == 0:
+                    print(" WARNING: self.material_lines.all() returned 0 rows! Ensure material lines are saved before completing.")
+
+                for line in lines:
+                    needed_to_deduct = line.quantity_actual or Decimal('0.00')
+                    print(f" Processing Raw Material: '{line.component.name}' | Quantity Actual: {needed_to_deduct}")
+
+                    if needed_to_deduct <= Decimal('0.00'):
+                        print(" SKIPPED: quantity_actual is 0.00 or None.")
+                        continue
+
+                    # Log Consumption History
+                    StockTransaction.objects.create(
+                        product=line.component,
+                        quantity=-needed_to_deduct,
+                        transaction_type='PRODUCTION_CONSUMPTION',
+                        work_order=self
+                    )
+
+                    # Deduct directly from Inventory record
+                    raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                        product=line.component,
+                        defaults={'quantity_available': Decimal('0.00')}
+                    )
+                    old_stock = raw_inv.quantity_available
+                    raw_inv.quantity_available -= needed_to_deduct
+                    raw_inv.save(update_fields=['quantity_available'])
+                    print(f"      ✓ DEDUCTED: Old Stock={old_stock} -> New Stock={raw_inv.quantity_available}")
+
+                # --- C. IMMUTABLE SAFETY GATE ---
+                self.is_inventory_updated = True
+                super().save(update_fields=['is_inventory_updated', 'production_end_date'])
+                print("[SAFETY GATE] Flipped self.is_inventory_updated = True")
+
+        elif not is_completed:
+            print(f"[INVENTORY ENGINE] Skipped because Work Order status is '{current_status}' (Not 'COMPLETED').")
+        elif self.is_inventory_updated:
+            print("[INVENTORY ENGINE] Skipped because self.is_inventory_updated is ALREADY True.")
+
+        # 5. AUTOMATED PRODUCTION ORDER STATUS SYNC
         if self.pk:
             from .models import ProductionOrder
-            linked_production_orders = ProductionOrder.objects.filter(work_order=self)
-            for po in linked_production_orders:
-                if self.status == 'COMPLETED' and po.status != 'COMPLETED':
+            linked_pos = ProductionOrder.objects.filter(work_order=self)
+            print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).")
+            for po in linked_pos:
+                po_status = (po.status or '').upper().strip()
+                if is_completed and po_status != 'COMPLETED':
                     po.status = 'COMPLETED'
                     po.completed_at = timezone.now()
                     po.save(update_fields=['status', 'completed_at'])
-                elif self.status == 'IN_PROGRESS' and po.status != 'IN_PROGRESS':
+                    print(f"   ✓ Updated ProductionOrder #{po.pk} status to COMPLETED.")
+                elif current_status == 'IN_PROGRESS' and po_status != 'IN_PROGRESS':
                     po.status = 'IN_PROGRESS'
                     po.save(update_fields=['status'])
+                    print(f"   ✓ Updated ProductionOrder #{po.pk} status to IN_PROGRESS.")
+
+        print("[WORK ORDER SAVE END]")
+        print("==================================================\n")
                 
         
     def __str__(self):
@@ -678,7 +736,7 @@ class BOMItem(models.Model):
                 'component': f"Circular Dependency Error: '{self.component.name}' cannot be an ingredient in its own build recipe."
             })
         # DEEP NESTED LOOP CHECK. Checks if the component being added already relies on the parent product in its own BOM
-        if self.component.boms.filter(components__component=self.bom.product).exists():
+        if self.component.boms.filter(items__component=self.bom.product).exists():
             raise ValidationError({
                 'component': f"Circular Dependency Detected: You are trying to add '{self.component.name}' here, "
                              f"but '{self.component.name}' already requires '{self.bom.product.name}' in its own active BOM!"
