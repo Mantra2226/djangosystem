@@ -294,7 +294,8 @@ class Inventory(models.Model):
     Inventory_id = models.AutoField(primary_key=True) 
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='stock')   
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Moving weighted average cost calculated from delivered procurements.")
-    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity available cannot drop below zero.")
+    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Unreserved stock physically available for new production orders. Cannot drop below zero.")
+    quantity_allocated = models.DecimalField(max_digits=12, decimal_places=4, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Stock reserved for active Work Orders currently IN_PROGRESS.")
     location = models.CharField(max_length=255, default='Main Warehouse') 
     last_updated = models.DateTimeField(auto_now=True)
     valuation = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True)
@@ -425,6 +426,7 @@ class WorkOrder(models.Model):
     production_start_date = models.DateField()
     production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
+    is_inventory_allocated = models.BooleanField(default=False, help_text="Flag indicating BOM expected stock has been reserved on IN_PROGRESS.")
     status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, help_text="Automatically managed based on step completion statuses.")
     # automated state evaluation machine logic
     def recalculate_status(self):
@@ -489,24 +491,136 @@ class WorkOrder(models.Model):
 
     def process_inventory(self):
         """
-        Executes finished goods additions and raw material deductions.
-        Designed to be called after inline material lines are committed.
+        HYBRID INVENTORY ENGINE:
+        Phase 1: Reserve stock (Allocations) when status moves to IN_PROGRESS.
+        Phase 2: Deduct incremental actuals (Deltas) during intermediate saves.
+        Phase 3: Add finished goods & clear remaining allocations on COMPLETED.
         """
         current_status = (self.status or '').upper().strip()
 
-        print("\n--------------------------------------------------")
-        print(f"[INVENTORY ENGINE START] Work Order PK: {self.pk} | Status: '{current_status}' | is_inventory_updated: {self.is_inventory_updated}")
+        print("\n==================================================")
+        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} | Status: '{current_status}'")
+        print(f"[LOG] Flags -> Allocated: {self.is_inventory_allocated} | Fully Updated: {self.is_inventory_updated}")
 
-        if current_status == 'COMPLETED' and not self.is_inventory_updated:
-            with transaction.atomic():
-                from .models import Inventory, StockTransaction
+        with transaction.atomic():
+            from .models import Inventory, StockTransaction
 
-                # FINISHED GOODS (ADD TO STOCK) 
+            # =========================================================================
+            # PHASE 1: STOCK ALLOCATION (Runs once when status moves to IN_PROGRESS)
+            # =========================================================================
+            if current_status == 'IN_PROGRESS' and not self.is_inventory_allocated:
+                print("--------------------------------------------------")
+                print("[PHASE 1: STOCK ALLOCATION START]")
+                
+                for line in self.material_lines.all():
+                    expected_qty = line.quantity_expected or Decimal('0.00')
+                    if expected_qty <= Decimal('0.00'):
+                        continue
+
+                    raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                        product=line.component,
+                        defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                    )
+
+                    # Reserve expected stock: Shift from quantity_available to quantity_allocated
+                    old_avail = raw_inv.quantity_available
+                    old_alloc = raw_inv.quantity_allocated
+                    
+                    raw_inv.quantity_available -= expected_qty
+                    raw_inv.quantity_allocated += expected_qty
+                    raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                    print(f"    RESERVED ({line.component.name}): Expected={expected_qty}")
+                    print(f"    Available: {old_avail} -> {raw_inv.quantity_available} | Allocated: {old_alloc} -> {raw_inv.quantity_allocated}")
+
+                # Flip allocation lock
+                self.is_inventory_allocated = True
+                super().save(update_fields=['is_inventory_allocated'])
+                print("[SAFETY GATE] Flipped self.is_inventory_allocated = True")
+
+            # =========================================================================
+            # PHASE 2: INCREMENTAL DELTA ISSUING (Runs during IN_PROGRESS or COMPLETED)
+            # =========================================================================
+            if current_status in ['IN_PROGRESS', 'COMPLETED'] and not self.is_inventory_updated:
+                print("--------------------------------------------------")
+                print("[PHASE 2: INCREMENTAL DELTA ISSUING START]")
+
+                for line in self.material_lines.all():
+                    actual_qty = line.quantity_actual or Decimal('0.00')
+                    issued_qty = line.quantity_issued or Decimal('0.00')
+                    
+                    # Compute Line Delta (New consumption since last save)
+                    delta = actual_qty - issued_qty
+
+                    print(f"    Line '{line.component.name}': Actual={actual_qty} | Already Issued={issued_qty} | Delta={delta}")
+
+                    if delta > Decimal('0.00'):
+                        raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                            product=line.component,
+                            defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                        )
+
+                        old_alloc = raw_inv.quantity_allocated
+                        
+                        # Reduce allocation pool if available, otherwise deduct directly
+                        if raw_inv.quantity_allocated >= delta:
+                            raw_inv.quantity_allocated -= delta
+                        else:
+                            # Used more than originally allocated
+                            excess = delta - raw_inv.quantity_allocated
+                            raw_inv.quantity_allocated = Decimal('0.00')
+                            raw_inv.quantity_available -= excess
+
+                        raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                        # Record transaction history for delta
+                        StockTransaction.objects.create(
+                            product=line.component,
+                            quantity=-delta,
+                            transaction_type='PRODUCTION_CONSUMPTION',
+                            work_order=self
+                        )
+
+                        # Update background issued counter
+                        line.quantity_issued = actual_qty
+                        line.save(update_fields=['quantity_issued'])
+
+                        print(f"      ✓ DEDUCTED DELTA ({delta}): Allocated: {old_alloc} -> {raw_inv.quantity_allocated} | Issued Counter set to {line.quantity_issued}")
+
+            # =========================================================================
+            # PHASE 3: FINAL RECONCILIATION & OUTPUT (Runs when COMPLETED)
+            # =========================================================================
+            if current_status == 'COMPLETED' and not self.is_inventory_updated:
+                print("--------------------------------------------------")
+                print("[PHASE 3: FINAL RECONCILIATION & FINISHED GOODS START]")
+
+                # --- A. Release any unconsumed allocated stock back to available pool ---
+                if self.is_inventory_allocated:
+                    for line in self.material_lines.all():
+                        expected = line.quantity_expected or Decimal('0.00')
+                        issued = line.quantity_issued or Decimal('0.00')
+                        
+                        unconsumed_alloc = expected - issued
+                        if unconsumed_alloc > Decimal('0.00'):
+                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                                product=line.component,
+                                defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                            )
+                            old_alloc = raw_inv.quantity_allocated
+                            old_avail = raw_inv.quantity_available
+
+                            # Release unused allocation back to available stock
+                            raw_inv.quantity_allocated = max(Decimal('0.00'), raw_inv.quantity_allocated - unconsumed_alloc)
+                            raw_inv.quantity_available += unconsumed_alloc
+                            raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                            print(f"   ✓ RELEASED UNUSED ALLOCATION ({line.component.name}): Released={unconsumed_alloc}")
+                            print(f"      Allocated: {old_alloc} -> {raw_inv.quantity_allocated} | Available: {old_avail} -> {raw_inv.quantity_available}")
+
+                # --- B. Record Finished Goods Output ---
                 finished_qty = self.quantity_produced or Decimal('0.00')
-                print(f"[FINISHED GOODS] Output Quantity Produced: {finished_qty}")
-
                 if finished_qty > Decimal('0.00'):
-                    finished_inv, created = Inventory.objects.select_for_update().get_or_create(
+                    finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=self.product,
                         defaults={'quantity_available': Decimal('0.00')}
                     )
@@ -520,59 +634,15 @@ class WorkOrder(models.Model):
                         transaction_type='PRODUCTION_OUTPUT',
                         work_order=self
                     )
-                    print(f"   ADDED FINISHED PRODUCT ({self.product.name}): Old Stock={old_qty} -> New Stock={finished_inv.quantity_available}")
-                else:
-                    print("  SKIPPED FINISHED GOODS: quantity_produced is 0 or None.")
+                    print(f"   ✓ ADDED FINISHED GOODS ({self.product.name}): +{finished_qty} | Stock: {old_qty} -> {finished_inv.quantity_available}")
 
-                #  RAW MATERIALS (DEDUCT EVERY LINE RELIABLY) 
-                lines = self.material_lines.all()
-                print(f"[RAW MATERIALS] Found {lines.count()} material line(s) in DB to process.")
-
-                if lines.count() == 0:
-                    print("   WARNING: self.material_lines.all() returned 0 rows!")
-
-                for line in lines:
-                    # Smart Fallback: Use quantity_actual if > 0, otherwise fall back to quantity_expected
-                    needed_to_deduct = line.quantity_actual
-                    if not needed_to_deduct or needed_to_deduct <= Decimal('0.00'):
-                        needed_to_deduct = line.quantity_expected or Decimal('0.00')
-
-                    print(f"   -> Processing Raw Material: '{line.component.name}' | Actual: {line.quantity_actual} | Deducting: {needed_to_deduct}")
-
-                    if needed_to_deduct <= Decimal('0.00'):
-                        print("  SKIPPED: Deduction amount is 0.00 or None.")
-                        continue
-
-                    # Log Consumption History
-                    StockTransaction.objects.create(
-                        product=line.component,
-                        quantity=-needed_to_deduct,
-                        transaction_type='PRODUCTION_CONSUMPTION',
-                        work_order=self
-                    )
-
-                    # Deduct directly from Inventory record
-                    raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                        product=line.component,
-                        defaults={'quantity_available': Decimal('0.00')}
-                    )
-                    old_stock = raw_inv.quantity_available
-                    raw_inv.quantity_available -= needed_to_deduct
-                    raw_inv.save(update_fields=['quantity_available'])
-                    print(f"  DEDUCTED ({line.component.name}): Old Stock={old_stock} -> New Stock={raw_inv.quantity_available}")
-
-                #  IMMUTABLE SAFETY GATE 
+                # --- C. Final Safety Gate ---
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
                 print("[SAFETY GATE] Flipped self.is_inventory_updated = True")
 
-        elif not (current_status == 'COMPLETED'):
-            print(f"[INVENTORY ENGINE] Skipped because Work Order status is '{current_status}' (Not 'COMPLETED').")
-        elif self.is_inventory_updated:
-            print("[INVENTORY ENGINE] Skipped because self.is_inventory_updated is ALREADY True.")
-
-        print("[INVENTORY ENGINE END]")
-        print("--------------------------------------------------\n")
+        print("[HYBRID INVENTORY ENGINE END]")
+        print("==================================================\n")
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -609,16 +679,34 @@ class WorkOrder(models.Model):
         # INITIALIZE MATERIAL LINES ON CREATION ONLY
         if is_new and self.bill_of_material:
             print("[LOG] Creating initial material lines from BOM...")
-            multiplier = self.quantity_produced or Decimal('1.00')
+            
+            # Direct Query to find linked ProductionOrder quantity
+            from .models import ProductionOrder
+            po = ProductionOrder.objects.filter(work_order=self).first()
+            
+            if po and po.quantity:
+                target_qty = po.quantity
+            elif self.quantity_produced and self.quantity_produced > Decimal('0.00'):
+                target_qty = self.quantity_produced
+            else:
+                target_qty = Decimal('1.00')
+
+            print(f"[LOG] Calculated Target Batch Quantity: {target_qty}")
+
             for item in self.bill_of_material.items.all():
                 per_unit_req = item.quantity_required or Decimal('0.00')
-                total_expected = per_unit_req * multiplier
+                total_expected = per_unit_req * target_qty
+                
                 line, created = WorkOrderMaterialLine.objects.get_or_create(
                     work_order=self,
                     component=item.component,
-                    defaults={'quantity_expected': total_expected, 'quantity_actual': total_expected}
+                    defaults={
+                        'quantity_expected': total_expected, 
+                        'quantity_actual': Decimal('0.00'),
+                        'quantity_issued': Decimal('0.00')
+                    }
                 )
-                print(f"      -> Created material line for {item.component.name}: Expected={total_expected}")
+                print(f"      Created material line for {item.component.name}: Expected={total_expected}")
 
         # AUTOMATED PRODUCTION ORDER STATUS SYNC
         if self.pk:
@@ -631,7 +719,7 @@ class WorkOrder(models.Model):
                     po.status = 'COMPLETED'
                     po.completed_at = timezone.now()
                     po.save(update_fields=['status', 'completed_at'])
-                    print(f"   ✓ Updated ProductionOrder #{po.pk} status to COMPLETED.")
+                    print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.")
 
         print("[WORK ORDER SAVE END]")
         print("==================================================\n")
@@ -711,8 +799,10 @@ class WorkOrderMaterialLine(models.Model):
     # What the recipe (BOM) says we should use for the PLANNED quantity
     quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="Theoretical quantity calculated from BOM.") 
     # What the team ACTUALLY consumed (default matches expected, but can be edited)
-    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="The actual physical quantity consumed during this run.")
-
+    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="The actual physical quantity consumed during this run.")   
+    # Automated counter tracking stock already deducted for this line in prior saves.
+    quantity_issued = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0.00'),help_text="Automated counter tracking stock already deducted for this line in prior saves.")
+    
     class Meta:
         # Prevents adding the same raw material/component to the same work order twice
         unique_together = ('work_order', 'component')
@@ -950,7 +1040,7 @@ class SalesOrder(models.Model):
 
 class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE, related_name='items')
-    product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type': 'FINISHED'})  
+    product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})  
     quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2)
     quantity_dispatched = models.PositiveIntegerField(default=0)  # Crucial for tracking partial shipments
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, blank=True)

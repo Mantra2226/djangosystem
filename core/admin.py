@@ -50,9 +50,9 @@ class BOMItemInline(admin.TabularInline):
 
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
-    readonly_fields = ('quantity_expected', 'get_variance')
+    readonly_fields = ('quantity_expected', 'quantity_issued', 'get_variance')
     extra = 0  # Don't show empty lines by default
-    fields = ('component', 'quantity_expected', 'quantity_actual', 'get_variance')  
+    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued', 'get_variance')  
 
     @admin.display(description='Variance (Over/Under)')
     def get_variance(self, instance):
@@ -146,10 +146,11 @@ class SupplierAdmin(admin.ModelAdmin):
 
 @admin.register(Inventory)
 class InventoryAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity_available', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
-    list_filter = ['location', 'last_updated']
+    list_display = ('product', 'quantity_available', 'quantity_allocated', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
+    list_filter = ['location', 'last_updated', 'quantity_available', 'quantity_allocated']
     search_fields = ('product__name', 'product__sku', 'location')
-    readonly_fields = ['get_total_valuation']  # Computed field, should not be editable
+    readonly_fields = ['get_total_valuation', 'quantity_allocated']  
+    autocomplete_fields = ['product']  # Enables searching products
 
     @admin.display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
@@ -486,7 +487,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
     list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['work_order_code', 'status', 'is_inventory_updated', 'production_end_date']
+    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
     list_filter = ['status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
