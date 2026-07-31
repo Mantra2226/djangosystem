@@ -42,16 +42,17 @@ class WorkOrderInstructionInline(admin.TabularInline):
 
 class BOMItemInline(admin.TabularInline):
     model = BOMItem
-    extra = 1  # Provides one empty row by default for quick typing
+    extra = 1  
     fk_name = 'bom'
+    fields = ['component', 'quantity_required']
     # Use autocomplete if your product catalog contains hundreds of items
     autocomplete_fields = ['component']    
 
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
-    readonly_fields = ('quantity_expected', 'get_variance')
+    readonly_fields = ('quantity_expected', 'quantity_issued', 'get_variance')
     extra = 0  # Don't show empty lines by default
-    fields = ('component', 'quantity_expected', 'quantity_actual', 'get_variance')  
+    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued', 'get_variance')  
 
     @admin.display(description='Variance (Over/Under)')
     def get_variance(self, instance):
@@ -145,10 +146,11 @@ class SupplierAdmin(admin.ModelAdmin):
 
 @admin.register(Inventory)
 class InventoryAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity_available', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
-    list_filter = ['location', 'last_updated']
+    list_display = ('product', 'quantity_available', 'quantity_allocated', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
+    list_filter = ['location', 'last_updated', 'quantity_available', 'quantity_allocated']
     search_fields = ('product__name', 'product__sku', 'location')
-    readonly_fields = ['get_total_valuation']  # Computed field, should not be editable
+    readonly_fields = ['get_total_valuation', 'quantity_allocated']  
+    autocomplete_fields = ['product']  # Enables searching products
 
     @admin.display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
@@ -173,7 +175,7 @@ class StockTransactionAdmin(admin.ModelAdmin):
         return False # Locked!past records cannot be modified
         
     def has_delete_permission(self, request, obj=None):
-        return False # Locked!    
+        return False # Locked    
 
 class ProductionOrderAdminForm(forms.ModelForm):
     class Meta:
@@ -196,7 +198,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     list_filter = ['status', 'created_at']
     search_fields = ('work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
-    readonly_fields = ['work_order_details_viewer', 'created_at', 'completed_at']
+    readonly_fields = ['status', 'work_order_details_viewer', 'created_at', 'completed_at']
 
     @admin.display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
@@ -363,18 +365,20 @@ class SalesOrderAdmin(admin.ModelAdmin):
 class BillOfMaterialAdmin(admin.ModelAdmin):
     list_display = ('product', 'name', 'is_active', 'get_component_count', 'updated_at')
     list_filter = ['is_active']
-    search_fields = ('product__name', 'name', 'product__sku')
+    search_fields = ('product__name', 'name', 'product__sku', 'items__component__name')
     inlines = [BOMItemInline]
 
     @admin.display(description='Total Ingredients')
     def get_component_count(self, obj):
-        return obj.components.count()    
+        return obj.items.count()    
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = ('sku', 'name', 'product_type', 'supplier', 'get_selling_price')
     list_filter = ['product_type', 'supplier']
     search_fields = ('sku', 'name', 'supplier__name')
+    # 'sku' has editable=False on the model
+    readonly_fields = ('sku',)
 
     @admin.display(description='Selling Price')
     def get_selling_price(self, obj):
@@ -382,13 +386,67 @@ class ProductAdmin(admin.ModelAdmin):
             return f"${obj.selling_price:,.2f}"
         return "-"  # Shows dash for Raw Materials & Intermediates
 
+
 @admin.register(PurchaseOrder)
 class PurchaseOrderAdmin(admin.ModelAdmin):
-    list_display = ('po_number', 'supplier', 'order_date', 'status')
+    list_display = ('po_number', 'supplier', 'order_date', 'status_badge')
     list_filter = ('status', 'order_date', 'supplier')
     search_fields = ('po_number', 'supplier__name')
-    inlines = [PurchaseOrderItemInline]  
-    readonly_fields = ('po_number', 'order_date')
+    inlines = [PurchaseOrderItemInline]
+
+    # -------------------------------------------------------------------------
+    # 'status' is system-managed via signals and update_delivery_status().
+    # Operators must never be able to edit it manually — mark it read-only here.
+    # 'po_number' and 'order_date' are also auto-generated / auto-stamped.
+    # -------------------------------------------------------------------------
+    readonly_fields = ('po_number', 'order_date', 'status')
+
+    fieldsets = (
+        ('Order Details', {
+            'fields': ('po_number', 'supplier', 'order_date', 'notes')
+        }),
+        ('Status (Auto-Managed)', {
+            # Grouped separately to make it obvious this field is read-only
+            'fields': ('status',),
+            'description': (
+                'Status is automatically updated by the system: '
+                'DRAFT → Sent (when items are added) → '
+                'Partially Received / Fully Received (driven by procurement deliveries).'
+            ),
+        }),
+    )
+
+    # -------------------------------------------------------------------------
+    # Dynamic field lockdown: once the PO is in a terminal state (RECEIVED or
+    # CANCELLED) every field on the form becomes read-only to protect the record.
+    # -------------------------------------------------------------------------
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status in ('RECEIVED', 'CANCELLED'):
+            # Lock the entire form — return every field name as read-only
+            return [field.name for field in self.model._meta.fields]
+        # For active orders, only lock the auto-managed fields
+        return self.readonly_fields
+
+    # -------------------------------------------------------------------------
+    # Coloured status badge for the list view — makes the current state
+    # immediately obvious without opening the record.
+    # -------------------------------------------------------------------------
+    @admin.display(description='Status')
+    def status_badge(self, obj):
+        colours = {
+            'DRAFT':      '#718096',   # grey
+            'SENT':       '#3182ce',   # blue  — pending delivery
+            'PARTIAL':    '#d69e2e',   # amber — some goods received
+            'RECEIVED':   '#38a169',   # green — fully received
+            'CANCELLED':  '#e53e3e',   # red
+        }
+        colour = colours.get(obj.status, '#718096')
+        return format_html(
+            '<b style="color: {};">{}</b>',
+            colour,
+            obj.get_status_display()
+        )
+
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
     form = ProcurementOrderForm
@@ -428,14 +486,14 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['status', 'is_inventory_updated', 'production_end_date']
+    list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
+    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
     list_filter = ['status', 'is_inventory_updated', 'production_start_date']
-    search_fields = ('product__name', 'product__sku', 'employee__employee_name')
+    search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
     fieldsets = (
-        ('Order Overview', {
+        ('Order Specification', {
             'fields': (
                 'product',
                 'bill_of_material',
@@ -443,15 +501,55 @@ class WorkOrderAdmin(admin.ModelAdmin):
                 'employee',
             )
         }),
-        ('Execution Tracking', {
+        ('Execution & Timestamps', {
             'fields': (
                 'status',
                 'production_start_date',
                 'production_end_date',
-                'is_inventory_updated',
             )
         }),
+        ('Automation & Audit Gates', {
+            'classes': ('collapse',),
+            'fields': (
+                'is_inventory_updated',
+            ),
+        }),
     )
+
+    def save_formset(self, request, form, formset, change):
+        """
+        Prevents UNIQUE constraint crashes by merging Admin Inline edits 
+        with records auto-generated by WorkOrder.save().
+        """
+        instances = formset.save(commit=False)
+        
+        for instance in instances:
+            if isinstance(instance, WorkOrderMaterialLine) and instance.component:
+                WorkOrderMaterialLine.objects.update_or_create(
+                    work_order=form.instance,
+                    component=instance.component,
+                    defaults={
+                        'quantity_expected': instance.quantity_expected,
+                        'quantity_actual': instance.quantity_actual,
+                    }
+                )
+            else:
+                instance.work_order = form.instance
+                instance.save()
+        
+        formset.save_m2m()
+        
+        for obj in formset.deleted_objects:
+            obj.delete()
+
+    def save_related(self, request, form, formsets, change):
+        print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...")
+        super().save_related(request, form, formsets, change)
+        
+        print("[ADMIN SAVE_RELATED] Inline material lines saved. Calling process_inventory()...")
+        work_order = form.instance
+        work_order.process_inventory()
+
     @admin.display(description='Assigned Employees')
     def display_employees(self, obj):
         employees = obj.employee.all()
@@ -463,7 +561,7 @@ class WorkOrderAdmin(admin.ModelAdmin):
     def status_badge(self, obj):
         colors = {
             'COMPLETED': 'green',
-            'IN_PROGRESS': '#3182ce',  # blue
+            'IN_PROGRESS': '#3182ce',
             'CANCELLED': 'red',
         }
         color = colors.get(obj.status, 'gray')
