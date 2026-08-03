@@ -1,3 +1,4 @@
+from django.utils.safestring import mark_safe
 from django.contrib import admin
 from django.utils.html import format_html
 import json
@@ -198,7 +199,14 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     list_filter = ['status', 'created_at']
     search_fields = ('work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
-    readonly_fields = ['status', 'work_order_details_viewer', 'created_at', 'completed_at']
+    readonly_fields = ['status', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
+    actions = ['trigger_mrp_auto_resume']
+
+    @admin.action(description="Check Stock & Auto-Resume On-Hold Orders")
+    def trigger_mrp_auto_resume(self, request, queryset):
+        from .services import check_and_auto_resume_on_hold_orders
+        resumed = check_and_auto_resume_on_hold_orders()
+        self.message_user(request, f"MRP evaluation complete. Auto-resumed {len(resumed)} order(s).")
 
     @admin.display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
@@ -208,11 +216,130 @@ class ProductionOrderAdmin(admin.ModelAdmin):
        ('Order Information', {
             'fields': ('product', 'work_order', 'quantity', 'status')
         }),
+        ('MRP Shortage Resolution Pathways', {
+            'fields': ('mrp_resolution_pathways_viewer',),
+        }),
         ('System Details (Read Only)', {
             'fields': ('work_order_details_viewer', 'created_at', 'completed_at'),
             'classes': ('collapse',), # Collapses this section by default to keep screen clean
         }),
     )
+
+    def mrp_resolution_pathways_viewer(self, obj):
+        if not obj or not obj.pk:
+            return "Save record to evaluate MRP shortages."
+
+        from .services import evaluate_mrp_shortages
+        report = evaluate_mrp_shortages(obj)
+
+        if not report:
+            return mark_safe("<span style='color: #666;'>No material blueprint / BOM requirements evaluated.</span>")
+
+        shortage_items = [r for r in report if r['has_shortage']]
+        if not shortage_items:
+            return mark_safe("<div style='padding: 10px; background: #e8f8f5; border-left: 4px solid #2ecc71; color: #27ae60; border-radius: 4px;'><strong>✓ All Stock Satisfied:</strong> All component inventory levels meet or exceed batch requirements.</div>")
+
+        cards_html = []
+        for item in shortage_items:
+            comp = item['component']
+            shortfall = item['shortfall_qty']
+            req = item['required_qty']
+            avail = item['available_qty']
+            p_type = item['product_type']
+            supplier_name = item['supplier'].name if item['supplier'] else "No Supplier Assigned"
+
+            options_html = ""
+            if p_type == 'RAW':
+                options_html = f"""
+                <div style="margin-top: 8px; font-size: 12px; background: #fff; padding: 10px; border-radius: 4px; border: 1px solid #e2e8f0;">
+                    <strong style="color: #2b6cb0;">Tailored Resolution Pathways (Raw Material):</strong>
+                    <div style="margin-top: 6px; display: grid; gap: 8px;">
+                        <div style="background: #ebf8ff; padding: 8px; border-radius: 4px; border-left: 3px solid #3182ce;">
+                            <strong>Option 1: Auto-Draft PO</strong> — Append {shortfall:.2f} units to an open DRAFT Purchase Order for supplier <em>{supplier_name}</em>.
+                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
+                                <input type="hidden" name="production_order_id" value="{obj.pk}">
+                                <input type="hidden" name="component_id" value="{comp.pk}">
+                                <input type="hidden" name="shortfall_qty" value="{shortfall}">
+                                <input type="hidden" name="resolution_action" value="raw_autodraft_po">
+                                <button type="submit" style="background: #3182ce; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 1: Auto-Draft PO</button>
+                            </form>
+                        </div>
+                        <div style="background: #feebc8; padding: 8px; border-radius: 4px; border-left: 3px solid #dd6b20;">
+                            <strong>Option 2: Direct Procurement</strong> — Spawn a Fast-Track Procurement Order (PENDING status).
+                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
+                                <input type="hidden" name="production_order_id" value="{obj.pk}">
+                                <input type="hidden" name="component_id" value="{comp.pk}">
+                                <input type="hidden" name="shortfall_qty" value="{shortfall}">
+                                <input type="hidden" name="resolution_action" value="raw_direct_procurement">
+                                <button type="submit" style="background: #dd6b20; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 2: Direct Procurement</button>
+                            </form>
+                        </div>
+                        <div style="background: #edf2f7; padding: 8px; border-radius: 4px; border-left: 3px solid #718096;">
+                            <strong>Option 3: Hold for Inbound Stock</strong> — Maintain ON_HOLD status to consume stock from in-transit POs (In-Transit Qty: {item['inbound_po_qty']:.2f}).
+                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
+                                <input type="hidden" name="production_order_id" value="{obj.pk}">
+                                <input type="hidden" name="component_id" value="{comp.pk}">
+                                <input type="hidden" name="resolution_action" value="raw_hold_inbound">
+                                <button type="submit" style="background: #718096; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 3: Hold for Inbound POs</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                """
+            else:
+                max_prod = item['max_producible']
+                options_html = f"""
+                <div style="margin-top: 8px; font-size: 12px; background: #fff; padding: 10px; border-radius: 4px; border: 1px solid #e2e8f0;">
+                    <strong style="color: #6b46c1;">Tailored Resolution Pathways (Sub-Assembly / Intermediate Good):</strong>
+                    <div style="margin-top: 6px; display: grid; gap: 8px;">
+                        <div style="background: #faf5ff; padding: 8px; border-radius: 4px; border-left: 3px solid #805ad5;">
+                            <strong>Option 1: Build Sub-Assembly</strong> — Spawn a child Work Order & Production Run for {shortfall:.2f} units of {comp.name}.
+                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
+                                <input type="hidden" name="production_order_id" value="{obj.pk}">
+                                <input type="hidden" name="component_id" value="{comp.pk}">
+                                <input type="hidden" name="shortfall_qty" value="{shortfall}">
+                                <input type="hidden" name="resolution_action" value="intermediate_build">
+                                <button type="submit" style="background: #805ad5; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 1: Build Sub-Assembly</button>
+                            </form>
+                        </div>
+                        <div style="background: #ebf8ff; padding: 8px; border-radius: 4px; border-left: 3px solid #3182ce;">
+                            <strong>Option 2: Hold for Active Run</strong> — Link parent order to active shop floor runs (Active Run Qty: {item['active_run_qty']:.2f}).
+                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
+                                <input type="hidden" name="production_order_id" value="{obj.pk}">
+                                <input type="hidden" name="component_id" value="{comp.pk}">
+                                <input type="hidden" name="resolution_action" value="intermediate_hold_active">
+                                <button type="submit" style="background: #3182ce; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 2: Hold for Active Run</button>
+                            </form>
+                        </div>
+                        <div style="background: #f0fff4; padding: 8px; border-radius: 4px; border-left: 3px solid #38a169;">
+                            <strong>Option 3: Partial Batch Run</strong> — Down-scale parent batch target size to match available stock ({max_prod:.2f} units).
+                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
+                                <input type="hidden" name="production_order_id" value="{obj.pk}">
+                                <input type="hidden" name="component_id" value="{comp.pk}">
+                                <input type="hidden" name="max_producible" value="{max_prod}">
+                                <input type="hidden" name="resolution_action" value="intermediate_partial_batch">
+                                <button type="submit" style="background: #38a169; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 3: Scale Batch to {max_prod:.2f} Units</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                """
+
+            card = f"""
+            <div style="margin-bottom: 12px; padding: 12px; background: #fff5f5; border-left: 4px solid #e53e3e; border-radius: 4px; color: #2d3748;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <strong style="color: #c53030; font-size: 14px;">⚠ Shortage: {comp.name} [{p_type}]</strong>
+                    <span style="font-size: 12px; background: #feb2b2; color: #9b2c2c; padding: 2px 8px; border-radius: 10px; font-weight: bold;">Shortfall: -{shortfall:.2f}</span>
+                </div>
+                <div style="font-size: 12px; margin-top: 4px; color: #4a5568;">
+                    <strong>Required:</strong> {req:.2f} | <strong>Available:</strong> {avail:.2f}
+                </div>
+                {options_html}
+            </div>
+            """
+            cards_html.append(card)
+
+        return mark_safe("".join(cards_html))
 
     @admin.display(description='Product')
     def get_product(self, obj):

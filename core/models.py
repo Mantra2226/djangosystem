@@ -198,7 +198,7 @@ class ProcurementOrder(models.Model):
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Price per unit must be a positive amount greater than zero.")
     total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True, default=Decimal('0.00'), help_text="Total cost is automatically calculated based on quantity ordered and price per unit.")
-    order_date = models.DateField()
+    order_date = models.DateField(default=timezone.now)
     delivery_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captures when status changes to Delivered.")
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING')   
     delivery_location = models.CharField(max_length=255, default='Main Warehouse')
@@ -841,9 +841,10 @@ class WorkOrderMaterialLine(models.Model):
         return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
-        ('IN_PROGRESS', 'in_progress'),
-        ('COMPLETED', 'completed'),
-        ('CANCELLED', 'cancelled'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('ON_HOLD_SHORTAGE', 'On Hold (Stock Shortage)'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
     ]
     production_order_id = models.AutoField(primary_key=True)
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
@@ -851,15 +852,15 @@ class ProductionOrder(models.Model):
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.01'))], help_text="Quantity to be produced in this specific run.")
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Manufacturing cost per unit for this specific batch.")
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='IN_PROGRESS')
     notes = models.TextField(blank=True, null=True, help_text="Any issues or notes during this production run.")
 
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(auto_now=True)
 
     def complete_production(self):
-        """Calculates moving average cost and adds finished goods to Inventory."""
-        if self.status != 'completed':
+        """Calculates moving average cost (AVCO) without modifying quantity_available."""
+        if (self.status or '').upper().strip() != 'COMPLETED':
             return
 
         inventory, created = Inventory.objects.get_or_create(
@@ -870,21 +871,19 @@ class ProductionOrder(models.Model):
             }
         )
 
-        current_qty = inventory.quantity_available
-        current_cost = inventory.unit_cost
-        batch_qty = self.quantity_produced
-        batch_cost = self.unit_cost
+        current_qty = inventory.quantity_available or Decimal('0.00')
+        current_cost = inventory.unit_cost or Decimal('0.00')
+        batch_qty = self.quantity or Decimal('0.00')
+        batch_cost = self.unit_cost or Decimal('0.00')
 
         total_qty = current_qty + batch_qty
 
-        if total_qty > 0:
+        if total_qty > Decimal('0.00'):
             current_value = current_qty * current_cost
             batch_value = batch_qty * batch_cost
             
             new_weighted_cost = (current_value + batch_value) / total_qty
-            
-            inventory.unit_cost = round(new_weighted_cost, 2)
-            inventory.quantity_available = total_qty
+            inventory.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             inventory.save()
  
 
@@ -921,7 +920,7 @@ class ProductionOrder(models.Model):
                 old_status = old_status.upper().strip()
 
         is_now_in_progress = (current_status == 'IN_PROGRESS')
-        was_in_progress = (old_status == 'IN_PROGRESS')
+        was_in_progress = (old_status in ['IN_PROGRESS', 'COMPLETED'])
 
         # Trigger stock pre-check when starting production run
         if is_now_in_progress and not was_in_progress:
@@ -938,6 +937,7 @@ class ProductionOrder(models.Model):
                 bom = self.work_order.bill_of_material
 
             if bom:
+                shortage_msgs = []
                 for item in bom.items.all():
                     item_req = item.quantity_required or Decimal('0.00')
                     total_needed = item_req * target_qty
@@ -951,10 +951,15 @@ class ProductionOrder(models.Model):
 
                     if total_available < total_needed:
                         shortage = total_needed - total_available
-                        raise ValidationError(
-                            f"Insolvent Stock Error: Insufficient inventory for ingredient '{item.component.name}'. "
-                            f"Required for planned run: {total_needed:.2f}, Available: {total_available:.2f} (Shortage: {shortage:.2f})."
-                        )
+                        shortage_msgs.append(f"{item.component.name} (Need: {total_needed:.2f}, Avail: {total_available:.2f}, Short: {shortage:.2f})")
+
+                if shortage_msgs:
+                    self.status = 'ON_HOLD_SHORTAGE'
+                    shortage_note = f"[MRP SHORTAGE FLAGGED] Insufficient inventory: {'; '.join(shortage_msgs)}"
+                    if not self.notes:
+                        self.notes = shortage_note
+                    elif shortage_note not in self.notes:
+                        self.notes = f"{self.notes}\n{shortage_note}"
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -1078,7 +1083,7 @@ class DispatchRecord(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     dispatch_id = models.AutoField(primary_key=True)  
-    sales_order_item = models.ForeignKey('SalesOrder', on_delete=models.PROTECT, related_name='dispatches')
+    sales_order_item = models.ForeignKey('SalesOrderItem', on_delete=models.PROTECT, related_name='dispatch_records')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
     dispatch_date = models.DateField()
@@ -1121,15 +1126,14 @@ class DispatchRecord(models.Model):
                 })
 
         # 3. Order line validation based on current DB state
-        order_item = self.sales_order_item.items.filter(product=self.product).first()
-        if not order_item:
+        order_item = self.sales_order_item
+        if order_item and order_item.product != self.product:
             raise ValidationError({
-                'product': f"This product is not part of Sales Order #{self.sales_order_item.order_number}."
+                'product': f"Selected product '{self.product.name}' does not match Sales Order line item product '{order_item.product.name}'."
             })
 
         other_dispatches = DispatchRecord.objects.filter(
-            sales_order_item=self.sales_order_item,
-            product=self.product
+            sales_order_item=self.sales_order_item
         )
         if self.pk:
             other_dispatches = other_dispatches.exclude(pk=self.pk)
@@ -1176,11 +1180,35 @@ class DispatchRecord(models.Model):
             # Recalculate parent order item state dynamically from database
             self._sync_parent_order_status()
 
+    def _apply_stock_change(self, qty_to_deduct):
+        """
+        Deducts (or restores) stock in Inventory for this dispatch record's product
+        and records a StockTransaction entry.
+        """
+        qty = Decimal(str(qty_to_deduct))
+        if qty == Decimal('0.00'):
+            return
+
+        inventory_item, _ = Inventory.objects.select_for_update().get_or_create(
+            product=self.product,
+            defaults={'quantity_available': Decimal('0.00')}
+        )
+
+        inventory_item.quantity_available -= qty
+        inventory_item.save()
+
+        StockTransaction.objects.create(
+            product=self.product,
+            dispatch_record=self,
+            quantity=-qty,
+            transaction_type='SHIPMENT',
+            notes=f"Stock adjustment of {-qty} units via Dispatch #{self.dispatch_id or 'New'}"
+        )
+
     def _sync_parent_order_status(self):
         # Calculate total shipped for this order item
         total_shipped = DispatchRecord.objects.filter(
             sales_order_item=self.sales_order_item,
-            product=self.product,
             status='delivered'
         ).aggregate(total=Sum('quantity_dispatched'))['total'] or Decimal('0.00')
         
@@ -1188,7 +1216,7 @@ class DispatchRecord(models.Model):
         sales_order_item.quantity_dispatched = total_shipped
         sales_order_item.save(update_fields=['quantity_dispatched'])
 
-        # Local reference for clarity (self.sales_order_item points to SalesOrderItem)
+        # Local reference for parent SalesOrder
         sales_order = sales_order_item.sales_order
         order_items = sales_order.items.all()
 
@@ -1211,21 +1239,25 @@ class DispatchRecord(models.Model):
         with transaction.atomic():
             if self.is_stock_deducted:
                 self._apply_stock_change(-self.quantity_dispatched)
-            parent_order = self.sales_order_item
+            parent_item = self.sales_order_item
             super().delete(*args, **kwargs)
             
-            # Re-sync parent order after deletion
-            if parent_order:
-                for item in parent_order.items.all():
-                    item.quantity_dispatched = DispatchRecord.objects.filter(
-                        sales_order_item=parent_order,
-                        product=item.product,
-                        status='delivered'
-                    ).aggregate(total=Sum('quantity_dispatched'))['total'] or Decimal('0.00')
-                    item.save(update_fields=['quantity_dispatched'])            
-        
-        # Save modifications cleanly
-        super().save(*args, **kwargs)   
+            # Re-sync parent order item and order status after deletion
+            if parent_item:
+                parent_item.update_dispatched_quantity()
+                sales_order = parent_item.sales_order
+                order_items = sales_order.items.all()
+                if order_items.exists():
+                    all_completed = all(item.quantity_dispatched >= item.quantity_ordered for item in order_items)
+                    any_shipped = any(item.quantity_dispatched > 0 for item in order_items)
+                    if all_completed:
+                        sales_order.status = 'completed'
+                    elif any_shipped:
+                        sales_order.status = 'partially_dispatched'
+                    else:
+                        if sales_order.status in ['completed', 'partially_dispatched']:
+                            sales_order.status = 'approved'
+                    sales_order.save(update_fields=['status'])            
         
     def __str__(self):
         status_str = f" [{self.get_status_display()}]"

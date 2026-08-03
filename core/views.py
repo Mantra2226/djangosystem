@@ -177,7 +177,6 @@ def po_products_json(request):
         .values("product_id", "name", "sku")
     )
 
-    # Build a clean list for the JS to iterate over
     product_list = [
         {
             "id":   p["product_id"],
@@ -187,4 +186,62 @@ def po_products_json(request):
         for p in products
     ]
 
-    return JsonResponse({"products": product_list})
+    return JsonResponse({"products": product_list})
+
+
+def mrp_resolve_action(request):
+    """
+    HTTP POST Handler for executing tailored MRP resolution pathways from Admin/Dashboard.
+    """
+    if request.method == 'POST':
+        from django.contrib import messages
+        from django.shortcuts import redirect
+        from .models import ProductionOrder
+        from .services import (
+            resolve_raw_autodraft_po,
+            resolve_raw_direct_procurement,
+            resolve_raw_hold_inbound,
+            resolve_intermediate_build,
+            resolve_intermediate_hold_active,
+            resolve_intermediate_partial_batch
+        )
+
+        po_id = request.POST.get('production_order_id')
+        component_id = request.POST.get('component_id')
+        shortfall_qty = request.POST.get('shortfall_qty', '0.00')
+        action = request.POST.get('resolution_action')
+        max_producible = request.POST.get('max_producible', '0.00')
+
+        po = ProductionOrder.objects.filter(pk=po_id).first()
+        if not po:
+            messages.error(request, "Production order not found.")
+            return redirect(request.META.get('HTTP_REFERER', '/admin/'))
+
+        try:
+            if action == 'raw_autodraft_po':
+                new_po = resolve_raw_autodraft_po(po, component_id, shortfall_qty)
+                messages.success(request, f"Auto-drafted Purchase Order #{new_po.po_number}.")
+            elif action == 'raw_direct_procurement':
+                proc = resolve_raw_direct_procurement(po, component_id, shortfall_qty)
+                messages.success(request, f"Spawned direct Procurement Order #{proc.procurement_order_id}.")
+            elif action == 'raw_hold_inbound':
+                resolve_raw_hold_inbound(po, component_id)
+                messages.info(request, "Order status held for inbound PO stock.")
+            elif action == 'intermediate_build':
+                wo, child_po = resolve_intermediate_build(po, component_id, shortfall_qty)
+                messages.success(request, f"Spawned child Sub-Assembly Work Order #{wo.pk} (Production Run #{child_po.pk}).")
+            elif action == 'intermediate_hold_active':
+                resolve_intermediate_hold_active(po, component_id)
+                messages.info(request, "Linked order to active intermediate shop floor run.")
+            elif action == 'intermediate_partial_batch':
+                resolve_intermediate_partial_batch(po, max_producible)
+                messages.success(request, f"Down-scaled production batch to {max_producible} units.")
+            else:
+                messages.warning(request, "Unknown resolution action.")
+        except Exception as e:
+            messages.error(request, f"MRP Resolution Error: {str(e)}")
+
+        redirect_url = request.META.get('HTTP_REFERER') or f'/admin/core/productionorder/{po_id}/change/'
+        return redirect(redirect_url)
+
+    return redirect('/admin/')

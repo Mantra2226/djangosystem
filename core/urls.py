@@ -15,6 +15,7 @@ urlpatterns = [
     path('procurement_form/', views.procurement_form, name='procurement_form'),
     path('product_form/', views.product_form, name='product_form'),
     path('return_form/', views.return_form, name='return_form'),
+    path('mrp_resolve_action/', views.mrp_resolve_action, name='mrp_resolve_action'),
 ]   
 
 
