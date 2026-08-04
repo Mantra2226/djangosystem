@@ -376,3 +376,50 @@ class MRPEngineTestCase(TestCase):
         pi.refresh_from_db()
         self.assertEqual(pi.status, "PARTIAL")
         self.assertIsNone(pi.paid_date)
+
+    def test_procurement_order_quantity_update_syncs_purchase_order(self):
+        po = PurchaseOrder.objects.create(supplier=self.supplier, status="SENT")
+        po_item = PurchaseOrderItem.objects.create(
+            purchase_order=po,
+            product=self.raw_mat,
+            quantity_ordered=Decimal("100.00"),
+            price_per_unit=Decimal("10.00")
+        )
+        self.assertEqual(po_item.quantity_received, Decimal("0.00"))
+        self.assertEqual(po.status, "SENT")
+
+        # 1. Create a delivered procurement order of 40 units -> partial delivery
+        proc = ProcurementOrder.objects.create(
+            purchase_order=po,
+            product=self.raw_mat,
+            quantity=Decimal("40.00"),
+            price_per_unit=Decimal("10.00"),
+            status="DELIVERED"
+        )
+        po_item.refresh_from_db()
+        po.refresh_from_db()
+        self.assertEqual(po_item.quantity_received, Decimal("40.00"))
+        self.assertEqual(po.status, "PARTIAL")
+
+        # 2. Update existing procurement order quantity to 100 -> full delivery
+        proc.quantity = Decimal("100.00")
+        proc.save()
+        po_item.refresh_from_db()
+        po.refresh_from_db()
+        self.assertEqual(po_item.quantity_received, Decimal("100.00"))
+        self.assertEqual(po.status, "RECEIVED")
+
+        # 3. Reduce procurement order quantity back down to 50 -> reverts to partial
+        proc.quantity = Decimal("50.00")
+        proc.save()
+        po_item.refresh_from_db()
+        po.refresh_from_db()
+        self.assertEqual(po_item.quantity_received, Decimal("50.00"))
+        self.assertEqual(po.status, "PARTIAL")
+
+        # 4. Delete procurement order -> reverts to sent
+        proc.delete()
+        po_item.refresh_from_db()
+        po.refresh_from_db()
+        self.assertEqual(po_item.quantity_received, Decimal("0.00"))
+        self.assertEqual(po.status, "SENT")

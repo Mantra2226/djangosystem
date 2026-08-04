@@ -145,6 +145,27 @@ class PurchaseOrder(models.Model):
                 PurchaseOrder.objects.filter(pk=self.pk).update(status=new_status)
         return new_status
 
+    def sync_received_quantities(self):
+        """
+        Recalculates quantity_received for all items on this Purchase Order based on linked DELIVERED ProcurementOrders,
+        and updates the Purchase Order status automatically.
+        """
+        if not self.pk:
+            return
+
+        for item in self.items.all():
+            total_received = ProcurementOrder.objects.filter(
+                purchase_order=self,
+                product=item.product,
+                status='DELIVERED'
+            ).aggregate(total=Sum('quantity'))['total'] or Decimal('0.00')
+
+            if item.quantity_received != total_received:
+                item.quantity_received = total_received
+                item.save(update_fields=['quantity_received'])
+
+        self.update_delivery_status(save=True)
+
     def clean(self):
         super().clean()
         
@@ -248,6 +269,15 @@ class ProcurementOrder(models.Model):
     delivery_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captures when status changes to Delivered.")
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING')   
     delivery_location = models.CharField(max_length=255, default='Main Warehouse')
+
+    # Tracking changes for calculations
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._orig_quantity = self.quantity if self.pk else Decimal('0.00')
+        self._orig_status = self.status if self.pk else None
+        self._orig_po_id = self.purchase_order_id if self.pk else None
+        self._orig_product_id = self.product_id if self.pk else None
+        self._orig_location = self.delivery_location if self.pk else None
     
     @property
     def supplier(self):
@@ -283,20 +313,19 @@ class ProcurementOrder(models.Model):
 
         self.full_clean()
 
-        previously_delivered = False
-        if self.pk:
-            previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='DELIVERED').exists()
-
-        if self.status == 'DELIVERED' and not self.delivery_date:
-            self.delivery_date = timezone.now()
+        orig_delivered_qty = self._orig_quantity if (self._orig_status == 'DELIVERED') else Decimal('0.00')
+        new_delivered_qty = self.quantity if (self.status == 'DELIVERED') else Decimal('0.00')
+        qty_delta = new_delivered_qty - orig_delivered_qty
 
         with transaction.atomic():
             super().save(*args, **kwargs)
 
-            if self.status == 'DELIVERED' and not previously_delivered:
-                inventory_item, created = Inventory.objects.get_or_create(
+            # Adjust inventory stock and log transaction if delivered quantity changed
+            if qty_delta != Decimal('0.00') and self.product:
+                target_location = self.delivery_location or 'Main Warehouse'
+                inventory_item, _ = Inventory.objects.select_for_update().get_or_create(
                     product=self.product,
-                    location=self.delivery_location,
+                    location=target_location,
                     defaults={
                         'quantity_available': Decimal('0.00'),
                         'unit_cost': self.price_per_unit
@@ -305,38 +334,68 @@ class ProcurementOrder(models.Model):
                 # Pulls figures directly from the target inventory row for AVCO calculation
                 current_total_qty = inventory_item.quantity_available
                 current_cost = inventory_item.unit_cost
-                incoming_qty = self.quantity
-                incoming_price = self.price_per_unit
-                
-                total_qty_after = current_total_qty + incoming_qty
-                
+                total_qty_after = current_total_qty + qty_delta
+
                 if total_qty_after > 0:
                     # AVCO calculation
                     new_weighted_cost = (
-                        (current_total_qty * current_cost) + (incoming_qty * incoming_price)
+                        (current_total_qty * current_cost) + (qty_delta * self.price_per_unit)
                     ) / total_qty_after
-                    # Increment stock levels and trigger inventory save processing mechanics
                     inventory_item.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
-                inventory_item.quantity_available += incoming_qty
+                inventory_item.quantity_available += qty_delta
                 inventory_item.save()
                 # Safe supplier reference for stock transaction
                 supplier_name = self.supplier.name if self.supplier else "Unassigned Supplier"
+                sign = "+" if qty_delta > 0 else ""
                 StockTransaction.objects.create(
                     product=self.product,
-                    quantity=self.quantity,
+                    quantity=qty_delta,
                     transaction_type='RECEIPT',
-                    notes=f"Receipt via Procurement Order #{self.procurement_order_id} from {supplier_name}."
+                    notes=f"Stock adjustment of {sign}{qty_delta} units via Procurement Order #{self.procurement_order_id} from {supplier_name}."
                 )
 
-                if self.purchase_order:
-                    po_item = self.purchase_order.items.filter(product=self.product).first()
-                    if po_item:
-                        po_item.quantity_received += self.quantity
-                        po_item.save()
-                    
-                    self.purchase_order.update_delivery_status(save=True)
-                    
+            # Sync linked PurchaseOrder(s) received quantities & status
+            if self.purchase_order:
+                self.purchase_order.sync_received_quantities()
+
+            # If PO link was changed, re-sync the old PO as well
+            if self._orig_po_id and self._orig_po_id != self.purchase_order_id:
+                old_po = PurchaseOrder.objects.filter(pk=self._orig_po_id).first()
+                if old_po:
+                    old_po.sync_received_quantities()
+
+            # Refresh tracked properties for instance reuse
+            self._orig_quantity = self.quantity
+            self._orig_status = self.status
+            self._orig_po_id = self.purchase_order_id
+            self._orig_product_id = self.product_id
+            self._orig_location = self.delivery_location
+
+    def delete(self, *args, **kwargs):
+        with transaction.atomic():
+            po = self.purchase_order
+            if self.status == 'DELIVERED' and self.product:
+                inventory_item = Inventory.objects.select_for_update().filter(
+                    product=self.product,
+                    location=self.delivery_location or 'Main Warehouse'
+                ).first()
+                if inventory_item:
+                    inventory_item.quantity_available -= self.quantity
+                    inventory_item.save()
+
+                StockTransaction.objects.create(
+                    product=self.product,
+                    quantity=-self.quantity,
+                    transaction_type='ADJUSTMENT',
+                    notes=f"Rollback of -{self.quantity} units due to deletion of Procurement Order #{self.procurement_order_id}."
+                )
+
+            super().delete(*args, **kwargs)
+
+            if po and po.pk:
+                po.sync_received_quantities()
+
     def __str__(self):
         return f"PO #{self.procurement_order_id} - {self.product.name} ({self.status})"           
                
