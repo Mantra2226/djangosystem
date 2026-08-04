@@ -4,7 +4,7 @@ from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
 from django import forms
-from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, Invoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
+from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
 )
 
 admin.register(Supplier)
@@ -20,12 +20,10 @@ admin.register(Customer)
 admin.register(SalesOrder)
 admin.register(SalesOrderItem)
 admin.register(DispatchRecord)
-admin.register(Invoice)
 admin.register(SalesInvoicePayments)
 admin.register(PurchaseInvoice) 
 admin.register(PurchasePayment)
 admin.register(Return)
-admin.register(LossRecord)
 admin.register(FinanceEntry)
 admin.register(WorkOrder)
 admin.register(WorkOrderInstruction)
@@ -109,10 +107,16 @@ class DispatchRecordInline(admin.TabularInline):
 class SalesOrderItemInline(admin.TabularInline):
     model = SalesOrderItem
     inlines = [DispatchRecordInline]
-    extra = 1  #
-    fields = ('product', 'quantity_ordered', 'quantity_dispatched', 'unit_price', 'get_total_price')
+    extra = 1
+    fields = ('product', 'quantity_ordered', 'quantity_dispatched', 'get_unit_price', 'get_total_price')
     search_fields = ['product__name']
-    readonly_fields = ('quantity_dispatched', 'get_total_price')
+    readonly_fields = ('quantity_dispatched', 'get_unit_price', 'get_total_price')
+
+    @admin.display(description='Catalog Unit Price')
+    def get_unit_price(self, obj):
+        if obj.unit_price is not None:
+            return f"${obj.unit_price:,.2f}"
+        return "$0.00"
 
     @admin.display(description='Line Total')
     def get_total_price(self, obj):
@@ -435,30 +439,32 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     work_order_details_viewer.short_description = "Blueprint Live Specifications"
 
 
-@admin.register(Invoice)
-class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'customer', 'total_amount', 'remaining_balance', 'invoice_date', 'status')
+@admin.register(SalesInvoice)
+class SalesInvoiceAdmin(admin.ModelAdmin):
+    list_display = ('invoice_number', 'customer', 'dispatch', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status')
     list_filter = ['status', 'invoice_date', 'customer']
-    search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_id')
+    search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_code')
     inlines = [SalesInvoicePaymentsInline]
-    readonly_fields = ['status', 'remaining_balance']  # Computed field, should not be editable
+    readonly_fields = ('invoice_number', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'status')
 
-    def get_balance_status(self, obj):
-        balance = obj.remaining_balance
-        if balance < 0:
-            return f"Overpaid (Credit Due): ${abs(balance)}"
-        return f"${balance}"
-    
-    # Renames the column header in the admin table list view
-    get_balance_status.short_description = 'Remaining Balance'
+    @admin.display(description='Total Paid')
+    def get_total_paid(self, obj):
+        return f"${obj.total_paid:,.2f}"
+
+    @admin.display(description='Remaining Balance')
+    def get_remaining_balance(self, obj):
+        bal = obj.remaining_balance
+        if bal > 0:
+            return format_html('<span style="color: #c53030; font-weight: bold;">${:,.2f}</span>', bal)
+        return "$0.00"
 
 @admin.register(PurchaseInvoice)
 class PurchaseInvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'supplier', 'procurement_order', 'total_amount', 'invoice_date', 'status', 'remaining_balance')
+    list_display = ('invoice_number', 'supplier', 'procurement_order', 'total_amount', 'invoice_date', 'status', 'paid_date', 'remaining_balance')
     list_filter = ['status', 'invoice_date', 'supplier']
     search_fields = ('invoice_number', 'supplier__name', 'procurement_order__procurement_order_id')
     inlines = [PurchasePaymentInline]
-    readonly_fields = ['status', 'remaining_balance', 'total_amount', 'created_at']
+    readonly_fields = ['status', 'paid_date', 'remaining_balance', 'total_amount', 'created_at']
 
     def get_balance_status(self, obj):
         balance = obj.remaining_balance
@@ -466,24 +472,19 @@ class PurchaseInvoiceAdmin(admin.ModelAdmin):
             return f"Overpaid (Credit Due): ${abs(balance)}"
         return f"${balance}"
     
-    # Renames the column header in the admin table list view
     get_balance_status.short_description = 'Remaining Balance'
+
 @admin.register(Return)
 class ReturnAdmin(admin.ModelAdmin):
     list_display = ('dispatch_id', 'customer', 'quantity_returned', 'reason_for_return', 'quality_control_status')
     list_filter = ['quality_control_status']
     search_fields = ('dispatch_id__dispatch_id', 'customer__customer_name')
 
-@admin.register(LossRecord)
-class LossRecordAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity_lost', 'reason', 'loss_date')
-    search_fields = ('product__name', 'product__sku', 'reason')
-
 @admin.register(FinanceEntry)
 class FinanceEntryAdmin(admin.ModelAdmin):
     list_display = ('finance_entry_id', 'entry_type', 'amount', 'entry_date', 'category')
     list_filter = ['entry_type', 'category']
-    search_fields = ['category', 'invoice__invoice_id', 'procurement_order__procurement_order_id']
+    search_fields = ['category', 'sales_invoice__invoice_number', 'procurement_order__procurement_order_id']
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
@@ -600,14 +601,14 @@ class ProcurementOrderAdmin(admin.ModelAdmin):
     list_display = ('procurement_order_id', 'purchase_order', 'product', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
     list_filter = ['status', 'delivery_date', 'delivery_location']
     search_fields = ('product__name', 'product__sku', 'purchase_order__po_number')
-    readonly_fields = ['total_cost', 'delivery_date']  # Computed field, should not be editable
+    readonly_fields = ['total_cost', 'delivery_date', 'status']  # Computed field, should not be editable
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ['dispatch_id', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
+    list_display = ['dispatch_code', 'dispatch_id', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
     list_filter = ['dispatch_date', 'status', 'delivery_date']
-    search_fields = ['sales_order__order_number', 'product__sku', 'product__name']
-    readonly_fields = ('delivery_date', 'is_stock_deducted')
+    search_fields = ['dispatch_code', 'sales_order_item__sales_order__order_number', 'product__sku', 'product__name']
+    readonly_fields = ('dispatch_code', 'delivery_date', 'is_stock_deducted')
 
     # DYNAMIC FIELD LOCKDOWN: Once delivered, lock the whole form!
     def get_readonly_fields(self, request, obj=None):
@@ -622,7 +623,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
     # better UI presentation grouping
     fieldsets = (
         ('Order & Logistics Information', {
-            'fields': ('sales_order_item', 'product', 'quantity_dispatched')
+            'fields': ('dispatch_code', 'sales_order_item', 'product', 'quantity_dispatched')
         }),
         ('Status & Timestamps', {
             'fields': ('status', 'dispatch_date', 'delivery_date', 'is_stock_deducted')
@@ -716,6 +717,30 @@ class WorkOrderAdmin(admin.ModelAdmin):
             color, 
             obj.get_status_display()
         )
+
+@admin.register(LossRecord)
+class LossRecordAdmin(admin.ModelAdmin):
+    list_display = ('loss_id', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_lost', 'get_cost_impact', 'get_status_badge', 'recorded_at')
+    list_filter = ['loss_type', 'recorded_at']
+    search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
+    readonly_fields = ('work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_lost', 'unit_cost', 'financial_loss', 'variance_percentage', 'efficiency_rate', 'loss_type', 'notes', 'recorded_at')
+
+    @admin.display(description='Financial Impact')
+    def get_cost_impact(self, obj):
+        cost = obj.financial_loss
+        if cost > 0:
+            return format_html('<span style="color: #c53030; font-weight: bold;">+${:,.2f}</span>', cost)
+        elif cost < 0:
+            return format_html('<span style="color: #27ae60; font-weight: bold;">-${:,.2f}</span>', abs(cost))
+        return "$0.00"
+
+    @admin.display(description='Variance Category')
+    def get_status_badge(self, obj):
+        if obj.loss_type == 'OVER_CONSUMPTION':
+            return format_html('<span style="color: #c53030; font-weight: bold; background: #fff5f5; padding: 2px 6px; border-radius: 4px;">Over-consumption</span>')
+        elif obj.loss_type == 'EFFICIENT_SAVINGS':
+            return format_html('<span style="color: #27ae60; font-weight: bold; background: #e8f8f5; padding: 2px 6px; border-radius: 4px;">Efficient Savings</span>')
+        return format_html('<span style="color: #4a5568; font-weight: bold;">Exact Match</span>')
 
 
 

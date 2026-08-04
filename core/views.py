@@ -4,7 +4,7 @@ from django.http import JsonResponse
 from django.contrib.admin.views.decorators import staff_member_required
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
-    ProductionOrder, Invoice, Return, LossRecord, FinanceEntry, 
+    ProductionOrder, SalesInvoice, Return, LossRecord, FinanceEntry, 
     Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder,
     PurchaseOrder
 )

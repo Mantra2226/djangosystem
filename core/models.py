@@ -108,15 +108,50 @@ class PurchaseOrder(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
     notes = models.TextField(blank=True, help_text="Delivery instructions or terms")
 
+    def update_delivery_status(self, save=True):
+        """
+        Recalculates and updates PO status automatically:
+        - CANCELLED -> remains CANCELLED unless manually changed
+        - No items or total_ordered <= 0 -> DRAFT
+        - items exist and total_received == 0 -> SENT
+        - 0 < total_received < total_ordered -> PARTIAL
+        - total_received >= total_ordered (> 0) -> RECEIVED
+        """
+        if self.status == 'CANCELLED':
+            return self.status
+
+        if not self.pk:
+            return self.status
+
+        items = list(self.items.all())
+        if not items:
+            new_status = 'DRAFT'
+        else:
+            total_ordered = sum((item.quantity_ordered or Decimal('0.00')) for item in items)
+            total_received = sum((item.quantity_received or Decimal('0.00')) for item in items)
+
+            if total_ordered <= Decimal('0.00'):
+                new_status = 'DRAFT'
+            elif total_received <= Decimal('0.00'):
+                new_status = 'SENT'
+            elif total_received < total_ordered:
+                new_status = 'PARTIAL'
+            else:
+                new_status = 'RECEIVED'
+
+        if self.status != new_status:
+            self.status = new_status
+            if save:
+                PurchaseOrder.objects.filter(pk=self.pk).update(status=new_status)
+        return new_status
+
     def clean(self):
         super().clean()
         
         # If an operator sets the status to a received state, check the line items
         if self.status in ['PARTIAL', 'RECEIVED']:
             if self.pk:
-                # Sum up all the quantities received across this PO's line items
                 total_received = self.items.aggregate(total=Sum('quantity_received'))['total'] or Decimal('0.00')
-                
                 if total_received <= Decimal('0.00'):
                     raise ValidationError({
                         'status': f"Cannot set status to '{self.get_status_display()}' because "
@@ -124,24 +159,22 @@ class PurchaseOrder(models.Model):
                                   f"a Procurement Order for this PO first."
                     })
             else:
-                # Prevent creating a brand new PO directly into a received status
                 raise ValidationError({
                     'status': "A brand new Purchase Order cannot be created as Partially or Fully Received. "
                               "It must start as 'Draft' or 'Sent to Supplier'."
                 })
+
     def save(self, *args, **kwargs):
         # Only generate a PO number if it doesn't have one yet
         if not self.po_number:
             current_year = timezone.now().year
             prefix = f"PO-{current_year}-"
-            # Find the highest existing PO number for this year to determine the next sequence
             latest_po = PurchaseOrder.objects.filter(
                 po_number__startswith=prefix
             ).order_by('-po_number').first()
             
             if latest_po:
                 try:
-                    # Extract the serial suffix (e.g. '00005' from 'PO-2026-00005') and increment it
                     last_sequence = int(latest_po.po_number.split('-')[-1])
                     next_sequence = last_sequence + 1
                 except (ValueError, IndexError):
@@ -149,10 +182,12 @@ class PurchaseOrder(models.Model):
             else:
                 next_sequence = 1
             
-            # Format to 5 padded digits (e.g., PO-2026-00001)
             self.po_number = f"{prefix}{next_sequence:05d}"
             
         super().save(*args, **kwargs)
+
+        if self.pk and self.status != 'CANCELLED':
+            self.update_delivery_status(save=True)
 
     def __str__(self):
         return f"{self.po_number} - {self.supplier.name} ({self.get_status_display()})"    
@@ -165,9 +200,10 @@ class PurchaseOrderItem(models.Model):
     # Track physical units received when delivery arrives
     quantity_received = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))])
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Negotiated cost per unit for this order.")
+
     @property
     def total_price(self):
-        return self.quantity_ordered * self.unit_price
+        return self.quantity_ordered * self.price_per_unit
 
     def clean(self):
         # Validation Rule: You cannot buy a product from Supplier A if it's assigned to Supplier B
@@ -177,11 +213,21 @@ class PurchaseOrderItem(models.Model):
                            f"You cannot order it under a PO to '{self.purchase_order.supplier.name}'."
             })
             
-        # Validation Rule: Ensure quantity_received does not exceed quantity_ordered
         if self.quantity_received > self.quantity_ordered:
             raise ValidationError({
                 'quantity_received': "Quantity received cannot exceed quantity ordered."
             })
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.purchase_order_id:
+            self.purchase_order.update_delivery_status(save=True)
+
+    def delete(self, *args, **kwargs):
+        po = self.purchase_order
+        super().delete(*args, **kwargs)
+        if po and po.pk:
+            po.update_delivery_status(save=True)
 
     def __str__(self):
         return f"{self.product.sku} ({self.quantity_ordered} {self.product.unit_of_measurement}) on {self.purchase_order.po_number}"       
@@ -206,14 +252,13 @@ class ProcurementOrder(models.Model):
     @property
     def supplier(self):
         return self.purchase_order.supplier if self.purchase_order else None
-    # when status is updated to 'Delivered', the quantity should be added to inventory and total cost should be calculated based on quantity ordered and price per unit
+
     def clean(self):
         super().clean()
         if self.product and self.product.product_type == 'FINISHED':
-            raise ValidationError({'product': 'finished products are manufactured internally. Use a production order instead of a procurement order for finished products.'})
+            raise ValidationError({'product': 'Finished products are manufactured internally. Use a production order instead of a procurement order for finished products.'})
         
         if self.purchase_order and self.product:
-            # Gets the list of product IDs present on this Purchase Order's items
             valid_product_ids = self.purchase_order.items.values_list('product_id', flat=True)
 
             if self.product.pk not in valid_product_ids:
@@ -229,27 +274,32 @@ class ProcurementOrder(models.Model):
             self.total_cost = raw_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         else:
             self.total_cost = Decimal('0.00')
-            
+
+        if self.status != 'CANCELLED':
+            if self.delivery_date and self.status != 'DELIVERED':
+                self.status = 'DELIVERED'
+            elif self.status == 'DELIVERED' and not self.delivery_date:
+                self.delivery_date = timezone.now()
+
         self.full_clean()
 
         previously_delivered = False
         if self.pk:
             previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='DELIVERED').exists()
-        # Captures timestamp when status changes to DELIVERED
-        if self.status == 'DELIVERED' and not previously_delivered:
+
+        if self.status == 'DELIVERED' and not self.delivery_date:
             self.delivery_date = timezone.now()
-        # Wrapped inventory modifications in an atomic transaction to avoid data corruption if a crash happens mid-save
+
         with transaction.atomic():
             super().save(*args, **kwargs)
 
             if self.status == 'DELIVERED' and not previously_delivered:
-                # Fetches or initializes the specific location inventory record bucket
                 inventory_item, created = Inventory.objects.get_or_create(
                     product=self.product,
                     location=self.delivery_location,
                     defaults={
                         'quantity_available': Decimal('0.00'),
-                        'unit_cost': self.price_per_unit  # Initial cost matches first delivery
+                        'unit_cost': self.price_per_unit
                     }
                 )
                 # Pulls figures directly from the target inventory row for AVCO calculation
@@ -267,12 +317,11 @@ class ProcurementOrder(models.Model):
                     ) / total_qty_after
                     # Increment stock levels and trigger inventory save processing mechanics
                     inventory_item.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    # Increment stock & save inventory once
+
                 inventory_item.quantity_available += incoming_qty
                 inventory_item.save()
                 # Safe supplier reference for stock transaction
                 supplier_name = self.supplier.name if self.supplier else "Unassigned Supplier"
-                # Write to StockTransaction Ledger for audit trailing
                 StockTransaction.objects.create(
                     product=self.product,
                     quantity=self.quantity,
@@ -280,12 +329,13 @@ class ProcurementOrder(models.Model):
                     notes=f"Receipt via Procurement Order #{self.procurement_order_id} from {supplier_name}."
                 )
 
-                # Update the matching PurchaseOrderItem if linked to a PO
                 if self.purchase_order:
                     po_item = self.purchase_order.items.filter(product=self.product).first()
                     if po_item:
                         po_item.quantity_received += self.quantity
                         po_item.save()
+                    
+                    self.purchase_order.update_delivery_status(save=True)
                     
     def __str__(self):
         return f"PO #{self.procurement_order_id} - {self.product.name} ({self.status})"           
@@ -808,22 +858,19 @@ class WorkOrderMaterialLine(models.Model):
         unique_together = ('work_order', 'component')
         verbose_name = "Work Order Material Line"
         verbose_name_plural = "Work Order Material Lines"
+
     @property
     def variance(self):
-        """
-        Calculates material usage quantity variance (actual - expected).
-        Positive = Over-consumption / Unfavorable.
-        Negative = Under-consumption / Savings / Favorable.
-        """
+        if hasattr(self, 'loss_record') and self.loss_record:
+            return self.loss_record.quantity_lost
         actual = self.quantity_actual or Decimal('0.00')
         expected = self.quantity_expected or Decimal('0.00')
-        return (actual - expected).quantize(Decimal('0.01'))
+        return (actual - expected).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     @property
     def variance_percentage(self):
-        """
-        Calculates percentage usage variance relative to expected usage.
-        """
+        if hasattr(self, 'loss_record') and self.loss_record:
+            return self.loss_record.variance_percentage
         expected = self.quantity_expected or Decimal('0.00')
         if expected <= Decimal('0.00'):
             return Decimal('0.00')
@@ -832,9 +879,8 @@ class WorkOrderMaterialLine(models.Model):
 
     @property
     def unit_cost(self):
-        """
-        Retrieves the component's unit cost from Inventory (moving average cost).
-        """
+        if hasattr(self, 'loss_record') and self.loss_record:
+            return self.loss_record.unit_cost
         if self.component:
             inv = self.component.stock.first()
             if inv and inv.unit_cost:
@@ -843,24 +889,19 @@ class WorkOrderMaterialLine(models.Model):
 
     @property
     def cost_variance(self):
-        """
-        Calculates the financial cost impact of the material usage variance.
-        """
+        if hasattr(self, 'loss_record') and self.loss_record:
+            return self.loss_record.financial_loss
         cost = self.variance * self.unit_cost
         return cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     @property
     def waste(self):
-        """
-        Waste is recorded when actual consumption exceeds expected usage.
-        """
         return max(Decimal('0.00'), self.variance)
 
     @property
     def efficiency_rate(self):
-        """
-        Calculates material utilization efficiency percentage (expected / actual * 100).
-        """
+        if hasattr(self, 'loss_record') and self.loss_record:
+            return self.loss_record.efficiency_rate
         actual = self.quantity_actual or Decimal('0.00')
         expected = self.quantity_expected or Decimal('0.00')
         if actual <= Decimal('0.00'):
@@ -870,9 +911,8 @@ class WorkOrderMaterialLine(models.Model):
 
     @property
     def variance_status(self):
-        """
-        Returns categorical status of usage variance.
-        """
+        if hasattr(self, 'loss_record') and self.loss_record:
+            return self.loss_record.loss_type
         var = self.variance
         if var > Decimal('0.00'):
             return 'OVER_CONSUMPTION'
@@ -882,9 +922,6 @@ class WorkOrderMaterialLine(models.Model):
 
     @property
     def variance_summary(self):
-        """
-        Provides a detailed formatted summary string of the variance.
-        """
         var = self.variance
         pct = self.variance_percentage
         cost = self.cost_variance
@@ -906,8 +943,154 @@ class WorkOrderMaterialLine(models.Model):
                 if bom_item and self.work_order.quantity_produced:
                     self.quantity_expected = bom_item.quantity_required * self.work_order.quantity_produced
 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        LossRecord.sync_from_material_line(self)
+
     def __str__(self):
         return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
+
+class LossRecord(models.Model):
+    LOSS_TYPE_CHOICES = [
+        ('OVER_CONSUMPTION', 'Material Over-consumption / Scrap'),
+        ('EFFICIENT_SAVINGS', 'Material Savings / Efficiency'),
+        ('EXACT', 'Exact Match / Zero Variance'),
+        ('DAMAGE', 'Physical Damage / Spoilage'),
+        ('EXPIRATION', 'Expired Stock'),
+    ]
+
+    loss_id = models.AutoField(primary_key=True)
+    work_order_material_line = models.OneToOneField(
+        'WorkOrderMaterialLine',
+        on_delete=models.CASCADE,
+        related_name='loss_record',
+        null=True,
+        blank=True,
+        help_text="The work order material line this usage variance originates from."
+    )
+    work_order = models.ForeignKey(
+        'WorkOrder',
+        on_delete=models.CASCADE,
+        related_name='loss_records',
+        null=True,
+        blank=True,
+        help_text="Parent Work Order."
+    )
+    product = models.ForeignKey(
+        'Product',
+        on_delete=models.PROTECT,
+        related_name='loss_records',
+        help_text="Component product associated with this loss/variance record."
+    )
+    quantity_expected = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Planned / theoretical BOM quantity required."
+    )
+    quantity_actual = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Actual physical quantity consumed during production."
+    )
+    quantity_lost = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Quantity variance (quantity_actual - quantity_expected)."
+    )
+    unit_cost = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Unit cost of component at time of variance calculation."
+    )
+    financial_loss = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Financial cost impact (quantity_lost * unit_cost)."
+    )
+    variance_percentage = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Percentage usage variance relative to expected."
+    )
+    efficiency_rate = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('100.00'),
+        help_text="Material utilization efficiency rate percentage."
+    )
+    loss_type = models.CharField(
+        max_length=50, choices=LOSS_TYPE_CHOICES, default='EXACT'
+    )
+    loss_date = models.DateField(default=timezone.now)
+    loss_location = models.CharField(max_length=255, default='Main Warehouse')
+    reason = models.TextField(blank=True, help_text="Reason or notes for loss/variance.")
+    notes = models.TextField(blank=True, help_text="Audit notes or breakdown for this variance record.")
+    recorded_at = models.DateTimeField(auto_now=True)
+
+    @classmethod
+    def sync_from_material_line(cls, line):
+        if not line or not line.pk:
+            return None
+
+        expected = line.quantity_expected or Decimal('0.00')
+        actual = line.quantity_actual or Decimal('0.00')
+        qty_var = (actual - expected).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        unit_cost = Decimal('0.00')
+        if line.component:
+            inv = line.component.stock.first()
+            if inv and inv.unit_cost:
+                unit_cost = inv.unit_cost
+
+        cost_impact = (qty_var * unit_cost).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        if expected > Decimal('0.00'):
+            pct = ((qty_var) / expected) * Decimal('100.00')
+            pct = pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            pct = Decimal('0.00')
+
+        if actual > Decimal('0.00'):
+            eff = (expected / actual) * Decimal('100.00')
+            eff = eff.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            eff = Decimal('100.00')
+
+        if qty_var > Decimal('0.00'):
+            l_type = 'OVER_CONSUMPTION'
+        elif qty_var < Decimal('0.00'):
+            l_type = 'EFFICIENT_SAVINGS'
+        else:
+            l_type = 'EXACT'
+
+        loss_rec, created = cls.objects.get_or_create(
+            work_order_material_line=line,
+            defaults={
+                'work_order': line.work_order,
+                'product': line.component,
+                'quantity_expected': expected,
+                'quantity_actual': actual,
+                'quantity_lost': qty_var,
+                'unit_cost': unit_cost,
+                'financial_loss': cost_impact,
+                'variance_percentage': pct,
+                'efficiency_rate': eff,
+                'loss_type': l_type,
+                'notes': f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
+            }
+        )
+
+        if not created:
+            loss_rec.work_order = line.work_order
+            loss_rec.product = line.component
+            loss_rec.quantity_expected = expected
+            loss_rec.quantity_actual = actual
+            loss_rec.quantity_lost = qty_var
+            loss_rec.unit_cost = unit_cost
+            loss_rec.financial_loss = cost_impact
+            loss_rec.variance_percentage = pct
+            loss_rec.efficiency_rate = eff
+            loss_rec.loss_type = l_type
+            loss_rec.notes = f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
+            loss_rec.save()
+
+        return loss_rec
+
+    def __str__(self):
+        sign = "+" if self.quantity_lost > 0 else ""
+        return f"Loss Record #{self.loss_id} — {self.product.name} ({sign}{self.quantity_lost:.2f} units, ${self.financial_loss:.2f})"
 
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
@@ -1090,7 +1273,7 @@ class Customer(models.Model):
 
     def __str__(self):
         return self.customer_name
-    
+
 class SalesOrder(models.Model):
     STATUS_CHOICES = [
         ('draft', 'Draft'),
@@ -1105,67 +1288,114 @@ class SalesOrder(models.Model):
     status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def update_status(self, save=True):
+        """
+        Recalculates and updates Sales Order status automatically based on items and dispatch progress:
+        - If status is 'cancelled': preserve 'cancelled'.
+        - If no items or total_ordered == 0: 'draft'
+        - If items exist and total_dispatched == 0: 'approved'
+        - If 0 < total_dispatched < total_ordered: 'partially_dispatched'
+        - If total_dispatched >= total_ordered (> 0): 'completed'
+        """
+        if self.status == 'cancelled':
+            return self.status
+
+        if not self.pk:
+            return self.status
+
+        items = list(self.items.all())
+        if not items:
+            new_status = 'draft'
+        else:
+            total_ordered = sum(Decimal(str(item.quantity_ordered or 0)) for item in items)
+            total_dispatched = sum(Decimal(str(item.quantity_dispatched or 0)) for item in items)
+
+            if total_ordered <= Decimal('0.00'):
+                new_status = 'draft'
+            elif total_dispatched <= Decimal('0.00'):
+                new_status = 'approved'
+            elif total_dispatched < total_ordered:
+                new_status = 'partially_dispatched'
+            else:
+                new_status = 'completed'
+
+        if self.status != new_status:
+            self.status = new_status
+            if save:
+                SalesOrder.objects.filter(pk=self.pk).update(status=new_status)
+        return new_status
+
     def save(self, *args, **kwargs):
         # Auto-generate order number 
         if not self.order_number:
-            year_month = timezone.now().strftime('%Y%m') # e.g. "202607"
-            prefix = f"SO-{year_month}"
+            year_month = timezone.now().strftime('%Y%m')
+            prefix = f"SO-{year_month}-"
 
-            # Looks up the last created order for the current year & month
-            last_order = SalesOrder.objects.filter(
+            latest_order = SalesOrder.objects.filter(
                 order_number__startswith=prefix
             ).order_by('id').last()
 
-            if last_order and last_order.order_number:
-                # Extracts trailing digits and increments by 1
+            if latest_order and latest_order.order_number:
                 try:
-                    last_sequence = int(last_order.order_number.split('-')[-1])
-                    new_sequence = last_sequence + 1
-                except ValueError:
-                    new_sequence = 1
+                    last_sequence = int(latest_order.order_number.split('-')[-1])
+                    next_sequence = last_sequence + 1
+                except (ValueError, IndexError):
+                    next_sequence = 1
             else:
-                new_sequence = 1
+                next_sequence = 1
 
-            # Formats like: SO-202607-0001, SO-202607-0002, etc.
-            self.order_number = f"{prefix}-{new_sequence:04d}"
+            self.order_number = f"{prefix}{next_sequence:04d}"
 
         super().save(*args, **kwargs)
 
+        if self.pk and self.status != 'cancelled':
+            self.update_status(save=True)
+
     def __str__(self):
-        return f"SO-{self.order_number}"
+        return f"{self.order_number} - {self.customer.customer_name} ({self.get_status_display()})"
 
 class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})  
     quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2)
-    quantity_dispatched = models.PositiveIntegerField(default=0)  # Crucial for tracking partial shipments
-    unit_price = models.DecimalField(max_digits=10, decimal_places=2, blank=True)
-    # Use Sum Aggregation instead of `+=` to handle additions, updates, and deletes
-    def update_dispatched_quantity(self):
-        """Recalculates the exact sum of all related dispatches from the ground truth."""
-        # 'dispatch_records' is the related_name from the ForeignKey on DispatchRecord
-        total = self.dispatch_records.aggregate(
-            total_dispatched=Sum('quantity_dispatched')
-        )['total_dispatched'] or Decimal('0.00')
-        
-        # Only save if the data actually drifted
-        if self.quantity_dispatched != total:
-            self.quantity_dispatched = total
-            # update_fields is a win and avoids overwriting other fields
-            self.save(update_fields=['quantity_dispatched'])
+    quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
 
-    def save(self, *args, **kwargs):
-        # Auto-populate line item price from the finished good's catalog selling price
-        if not self.unit_price and self.product and self.product.selling_price:
-            self.unit_price = self.product.selling_price
-        super().save(*args, **kwargs)        
+    @property
+    def unit_price(self):
+        if self.product and self.product.selling_price is not None:
+            return self.product.selling_price
+        return Decimal('0.00')
 
     @property
     def total_price(self):
-        return (self.quantity_ordered or 0) * (self.unit_price or 0)    
+        qty = Decimal(str(self.quantity_ordered or '0.00'))
+        return qty * self.unit_price
+
+    def update_dispatched_quantity(self):
+        """Recalculates the exact sum of all related delivered dispatches from the ground truth."""
+        total = self.dispatch_records.filter(status='delivered').aggregate(
+            total_dispatched=Sum('quantity_dispatched')
+        )['total_dispatched'] or Decimal('0.00')
+        
+        if self.quantity_dispatched != total:
+            self.quantity_dispatched = total
+            self.save(update_fields=['quantity_dispatched'])
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.sales_order_id:
+            self.sales_order.update_status(save=True)
+
+    def delete(self, *args, **kwargs):
+        so = self.sales_order
+        super().delete(*args, **kwargs)
+        if so and so.pk:
+            so.update_status(save=True)
 
     def __str__(self):
         return f"Item: {self.product.name} ({self.quantity_dispatched}/{self.quantity_ordered} Dispatched)"
+
 class DispatchRecord(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending / Preparing'),
@@ -1174,15 +1404,15 @@ class DispatchRecord(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     dispatch_id = models.AutoField(primary_key=True)  
+    dispatch_code = models.CharField(max_length=30, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique dispatch code (e.g. DISP-0001).")
     sales_order_item = models.ForeignKey('SalesOrderItem', on_delete=models.PROTECT, related_name='dispatch_records')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
-    dispatch_date = models.DateField()
+    dispatch_date = models.DateField(default=timezone.now)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     delivery_date = models.DateField(blank=True, null=True, editable=False)
     is_stock_deducted = models.BooleanField(default=False, editable=False)
 
-        # Store original database values to track net differences on edit
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._orig_quantity = self.quantity_dispatched if self.pk else Decimal('0.00')
@@ -1194,81 +1424,64 @@ class DispatchRecord(models.Model):
         if not self.product or not self.quantity_dispatched or not self.sales_order_item:
             return
 
-        # 1. Calculate the net extra stock required for this save operation
-        if self.is_stock_deducted and self.status == 'delivered':
-            # Record was already deducted; check if quantity increased
-            additional_stock_needed = self.quantity_dispatched - self._orig_quantity
-        elif self.status == 'delivered':
-            # Moving to delivered for the first time
-            additional_stock_needed = self.quantity_dispatched
-        else:
-            additional_stock_needed = Decimal('0.00')
-
-        # 2. Check LIVE warehouse inventory if more stock is needed
-        if additional_stock_needed > 0:
-            total_available = self.product.stock.aggregate(
-                total=Sum('quantity_available')
-            )['total'] or Decimal('0.00')
-
-            if additional_stock_needed > total_available:
+        diff = self.quantity_dispatched - self._orig_quantity
+        
+        if diff > 0 and self.product:
+            inventory = Inventory.objects.filter(product=self.product).first()
+            current_available = inventory.quantity_available if inventory else Decimal('0.00')
+            
+            if diff > current_available:
                 raise ValidationError({
-                    'quantity_dispatched': f"Cannot process request. Additional {additional_stock_needed} units required, "
-                                          f"but only {total_available} units are currently available in inventory."
+                    'quantity_dispatched': f"Insufficient stock available! You requested {self.quantity_dispatched} "
+                                           f"(Net addition of +{diff}), but only {current_available} units of "
+                                           f"'{self.product.name}' are currently available in inventory."
                 })
 
-        # 3. Order line validation based on current DB state
-        order_item = self.sales_order_item
-        if order_item and order_item.product != self.product:
-            raise ValidationError({
-                'product': f"Selected product '{self.product.name}' does not match Sales Order line item product '{order_item.product.name}'."
-            })
-
-        other_dispatches = DispatchRecord.objects.filter(
-            sales_order_item=self.sales_order_item
-        )
-        if self.pk:
-            other_dispatches = other_dispatches.exclude(pk=self.pk)
-
-        already_shipped = other_dispatches.aggregate(
-            total=Sum('quantity_dispatched')
-        )['total'] or Decimal('0.00')
-
-        remaining_order_qty = order_item.quantity_ordered - already_shipped
-
-        if self.quantity_dispatched > remaining_order_qty:
-            raise ValidationError({
-                'quantity_dispatched': f"Cannot dispatch {self.quantity_dispatched} units. "
-                                      f"Only {remaining_order_qty} units remain on this order line."
-            })
-
     def save(self, *args, **kwargs):
-        self.full_clean()  
-        
-        # Executes once when status is marked 'delivered'
-        with transaction.atomic():
-            # Handle stock deductions or dynamic adjustments
-            if self.status == 'delivered':
+        # Auto-generate unique dispatch code if missing
+        if not self.dispatch_code:
+            prefix = "DISP"
+            latest = DispatchRecord.objects.filter(
+                dispatch_code__startswith=prefix
+            ).order_by('-dispatch_code').first()
+
+            if latest and latest.dispatch_code:
+                try:
+                    last_seq = int(latest.dispatch_code.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+
+            self.dispatch_code = f"{prefix}-{new_seq:04d}"
+
+        # Status Automation & Stock Deductions
+        becoming_delivered = (self.status == 'delivered' and self._orig_status != 'delivered')
+        leaving_delivered = (self.status != 'delivered' and self._orig_status == 'delivered')
+        quantity_changed = (self.quantity_dispatched != self._orig_quantity and self.status == 'delivered')
+
+        if becoming_delivered:
+            self.is_stock_deducted = True
+            if not self.delivery_date:
                 self.delivery_date = timezone.now().date()
-                
-                # Compute net stock change
-                if not self.is_stock_deducted:
-                    qty_to_deduct = self.quantity_dispatched
-                else:
-                    qty_to_deduct = self.quantity_dispatched - self._orig_quantity
+        elif leaving_delivered:
+            self.is_stock_deducted = False
+            self.delivery_date = None
 
-                if qty_to_deduct != 0:
-                    self._apply_stock_change(qty_to_deduct)
-                    self.is_stock_deducted = True
+        self.full_clean()
 
-            elif self._orig_status == 'delivered' and self.status != 'delivered':
-                # Status changed away from delivered -> restore stock back to warehouse
-                self._apply_stock_change(-self.quantity_dispatched)
-                self.is_stock_deducted = False
-                self.delivery_date = None
-
+        with transaction.atomic():
             super().save(*args, **kwargs)
-            
-            # Recalculate parent order item state dynamically from database
+
+            if becoming_delivered:
+                self._apply_stock_change(self.quantity_dispatched)
+            elif leaving_delivered:
+                self._apply_stock_change(-self._orig_quantity)
+            elif quantity_changed:
+                diff = self.quantity_dispatched - self._orig_quantity
+                self._apply_stock_change(diff)
+
             self._sync_parent_order_status()
 
     def _apply_stock_change(self, qty_to_deduct):
@@ -1293,11 +1506,10 @@ class DispatchRecord(models.Model):
             dispatch_record=self,
             quantity=-qty,
             transaction_type='SHIPMENT',
-            notes=f"Stock adjustment of {-qty} units via Dispatch #{self.dispatch_id or 'New'}"
+            notes=f"Stock adjustment of {-qty} units via Dispatch #{self.dispatch_code or self.dispatch_id}"
         )
 
     def _sync_parent_order_status(self):
-        # Calculate total shipped for this order item
         total_shipped = DispatchRecord.objects.filter(
             sales_order_item=self.sales_order_item,
             status='delivered'
@@ -1307,24 +1519,9 @@ class DispatchRecord(models.Model):
         sales_order_item.quantity_dispatched = total_shipped
         sales_order_item.save(update_fields=['quantity_dispatched'])
 
-        # Local reference for parent SalesOrder
-        sales_order = sales_order_item.sales_order
-        order_items = sales_order.items.all()
+        if sales_order_item.sales_order:
+            sales_order_item.sales_order.update_status(save=True)
 
-        if order_items.exists():
-            all_completed = all(item.quantity_dispatched >= item.quantity_ordered for item in order_items)
-            any_shipped = any(item.quantity_dispatched > 0 for item in order_items)
-
-            if all_completed:
-                sales_order.status = 'completed'
-            elif any_shipped:
-                sales_order.status = 'partially_dispatched'
-            else:
-                # Only revert to 'approved' if it was previously dispatched/completed
-                if sales_order.status in ['completed', 'partially_dispatched']:
-                    sales_order.status = 'approved'
-
-            sales_order.save(update_fields=['status'])
     def delete(self, *args, **kwargs):
         # Capture the item reference before deleting the row
         with transaction.atomic():
@@ -1336,73 +1533,48 @@ class DispatchRecord(models.Model):
             # Re-sync parent order item and order status after deletion
             if parent_item:
                 parent_item.update_dispatched_quantity()
-                sales_order = parent_item.sales_order
-                order_items = sales_order.items.all()
-                if order_items.exists():
-                    all_completed = all(item.quantity_dispatched >= item.quantity_ordered for item in order_items)
-                    any_shipped = any(item.quantity_dispatched > 0 for item in order_items)
-                    if all_completed:
-                        sales_order.status = 'completed'
-                    elif any_shipped:
-                        sales_order.status = 'partially_dispatched'
-                    else:
-                        if sales_order.status in ['completed', 'partially_dispatched']:
-                            sales_order.status = 'approved'
-                    sales_order.save(update_fields=['status'])            
+                if parent_item.sales_order:
+                    parent_item.sales_order.update_status(save=True)
         
     def __str__(self):
+        code = self.dispatch_code or f"DISP-{self.dispatch_id:04d}"
         status_str = f" [{self.get_status_display()}]"
         date_str = f" delivered {self.delivery_date}" if self.delivery_date else ""
-        return f"Dispatch {self.dispatch_id}{status_str} — {self.quantity_dispatched}x {self.product.name}{date_str}"
-class Invoice(models.Model):
+        return f"{code}{status_str} — {self.quantity_dispatched}x {self.product.name}{date_str}"
+class SalesInvoice(models.Model):
     ENTRY_TYPE_CHOICES = [
         ('Paid', 'Paid'),
         ('Partial', 'Partial Payment'),
         ('Unpaid', 'Unpaid'),
     ]
     invoice_id = models.AutoField(primary_key=True)
-    invoice_number = models.CharField(max_length=255, unique=True, blank=True, help_text="Unique identifier for the invoice. Auto-generated if left blank.")
-    customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    invoice_date = models.DateField()
+    invoice_number = models.CharField(max_length=255, unique=True, editable=False, blank=True, help_text="Unique identifier for the invoice. Auto-generated.")
+    customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
+    dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
+    invoice_date = models.DateField(default=timezone.now)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
     status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
 
-    def clean_fields(self, exclude=None):
-        # Round right as Django starts validating individual fields
+    def clean(self):  
+        super().clean()     
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
                 rounding=ROUND_HALF_UP
             )
-        super().clean_fields(exclude=exclude)
-
-    def clean(self):  
-        super().clean()     
-        if self.total_amount is not None:
-                self.total_amount = Decimal(str(self.total_amount)).quantize(
-                    Decimal('0.01'), 
-                    rounding=ROUND_HALF_UP
-                )
-        if self.dispatch and self.invoice_date < self.dispatch.dispatch_date:
+        if self.dispatch and self.dispatch.dispatch_date and self.invoice_date and self.invoice_date < self.dispatch.dispatch_date:
             raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the physical dispatch date.'}) 
-                   
-    # validation to ensure that invoice date is not before dispatch date and total amount is calculated based on quantity dispatched and cost per unit of the material in the production order
-            
-        
+
     def save(self, *args, **kwargs):
-        # Auto-calculates total amount based on dispatch volume and true inventory cost
-        if self.dispatch and hasattr(self.dispatch, 'production_order') and self.dispatch.production_order.product:
-            target_product = self.dispatch.production_order.product
-            
-            # Look up the warehouse bucket for this item to grab its live average asset cost
-            inventory_record = Inventory.objects.filter(
-                product=target_product, 
-                location='Main Warehouse' # Adjust to the primary location string if different
-            ).first()
-            # Fall back to 0.00 if no inventory record exists yet
-            current_unit_cost = inventory_record.unit_cost if inventory_record else Decimal('0.00')
-            self.total_amount = self.dispatch.quantity_dispatched * current_unit_cost
+        # Auto-calculate total amount based on dispatch volume and selling price
+        if self.dispatch and self.dispatch.product:
+            price = self.dispatch.product.selling_price or Decimal('0.00')
+            if price == Decimal('0.00') and hasattr(self.dispatch.product, 'stock'):
+                inv = self.dispatch.product.stock.first()
+                if inv and inv.unit_cost:
+                    price = inv.unit_cost
+            self.total_amount = (self.dispatch.quantity_dispatched or Decimal('0.00')) * price
+
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
@@ -1410,43 +1582,62 @@ class Invoice(models.Model):
             )
        
         if not self.invoice_number:
-            # Generate a clean corporate format: INV-YEAR-MONTH-ID (e.g., INV-2026-07-0001)
-            from datetime import datetime
-            year_month = datetime.today().strftime("%Y-%m")
-            
-            # Find the last invoice ID to make it sequential
-            last_invoice = Invoice.objects.all().order_by('invoice_id').last()
-            next_id = (last_invoice.invoice_id + 1) if last_invoice else 1
-            
-            # Format with leading zeros so it stays neat (zfill padding)
-            self.invoice_number = f"INV-{year_month}-{str(next_id).zfill(4)}"
+            year_month = timezone.now().strftime('%Y%m')
+            prefix = f"SINV-{year_month}-"
+            latest = SalesInvoice.objects.filter(
+                invoice_number__startswith=prefix
+            ).order_by('-invoice_number').first()
+
+            if latest and latest.invoice_number:
+                try:
+                    last_seq = int(latest.invoice_number.split('-')[-1])
+                    next_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    next_seq = 1
+            else:
+                next_seq = 1
+
+            self.invoice_number = f"{prefix}{next_seq:04d}"
+
         self.full_clean()    
         super().save(*args, **kwargs)
 
     @property
+    def total_paid(self):
+        """Calculates exact total payments collected for this sales invoice."""
+        total = self.sales_payments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        return Decimal(str(total)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @property
     def remaining_balance(self):
-        """Calculates the live remaining balance on the invoice."""
-        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.01')
-        return self.total_amount - total_paid
+        """Calculates accurate live remaining balance on the sales invoice."""
+        total = self.total_amount or Decimal('0.00')
+        rem = total - self.total_paid
+        return max(Decimal('0.00'), rem.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
-    def update_payment_status(self):
-        """Auto-updates customer bill status based on incoming payments."""
-        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.01')
+    def update_payment_status(self, save=True):
+        """Auto-updates customer invoice status based on incoming payments."""
+        paid = self.total_paid
+        total = self.total_amount or Decimal('0.00')
         
-        if total_paid >= self.total_amount:
-            self.status = 'Paid'
-        elif total_paid > 0:
-            self.status = 'Partial'
+        if paid >= total and total > Decimal('0.00'):
+            new_status = 'Paid'
+        elif paid > Decimal('0.00'):
+            new_status = 'Partial'
         else:
-            self.status = 'Unpaid'
-        self.save(update_fields=['status']) 
+            new_status = 'Unpaid'
 
+        if self.status != new_status:
+            self.status = new_status
+            if save and self.pk:
+                SalesInvoice.objects.filter(pk=self.pk).update(status=new_status)
+        return new_status
 
     def __str__(self):
-        return f"[Customer Invoice] #{self.invoice_number} — ${self.total_amount} ({self.customer.customer_name})"
+        return f"Sales Invoice #{self.invoice_number} — ${self.total_amount:.2f} ({self.customer.customer_name if self.customer else 'N/A'})"
 
 class SalesInvoicePayments(models.Model):
-    invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE, related_name='sales_payments')
+    invoice = models.ForeignKey('SalesInvoice', on_delete=models.CASCADE, related_name='sales_payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
     payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card Transfer'), ('TRANSFER', 'Bank Transfer')])
     reference_number = models.CharField(max_length=100, blank=True)
@@ -1454,58 +1645,27 @@ class SalesInvoicePayments(models.Model):
 
     def clean(self):
         super().clean()
-        
-        # Normalizing the payment method to uppercase to handle any casing variations
         method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
         ref_num = (self.reference_number or '').strip()
-        method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
-        ref_num = (self.reference_number or '').strip()
-
         requires_reference = ['CARD', 'BANK']
 
         if method in requires_reference and not ref_num:
             raise ValidationError({
                 'reference_number': "A reference number (transaction ID or deposit confirmation) is required for payments made by card or bank transfer."
             })
-        # Skip validation if invoice or amount missing during form typing
-        if not hasattr(self, 'invoice') or self.amount is None:
-            return
-
-        # Gather all OTHER historical payments for this specific invoice
-        other_payments = self.invoice.sales_payments.all()
-        
-        # Edge Case Safeguard: If EDITING an existing payment row, 
-        # exclude its own old value from the history so we don't double-count it.
-        if self.pk:
-            other_payments = other_payments.exclude(pk=self.pk)
-
-        # Summing up what has already been collected
-        total_already_paid = other_payments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        
-        # Calculating remaining threshold limit
-        remaining_balance = self.invoice.total_amount - total_already_paid
-
-    @property
-    def remaining_balance(self):
-        """
-        Calculates live outstanding balance. 
-        """
-        total_paid = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
-        return self.total_amount - total_paid    
-        
-        
 
     def save(self, *args, **kwargs):
-        # Force the full validation routine to run before saving
         self.full_clean()
-        
         with transaction.atomic():
             super().save(*args, **kwargs)
-            self.invoice.update_payment_status()
+            if self.invoice:
+                self.invoice.update_payment_status(save=True)
+
+    def delete(self, *args, **kwargs):
+        inv = self.invoice
+        super().delete(*args, **kwargs)
+        if inv and inv.pk:
+            inv.update_payment_status(save=True)
 class PurchaseInvoice(models.Model):
     STATUS_CHOICES = [
         ('PAID', 'Paid'),
@@ -1513,89 +1673,102 @@ class PurchaseInvoice(models.Model):
         ('PARTIAL', 'Partially Paid'),
     ]   
     invoice_id = models.AutoField(primary_key=True)
-    invoice_number = models.CharField(max_length=50, unique=True, help_text="Unique identifier for the purchase invoice from the supplier.")
+    invoice_number = models.CharField(max_length=50, unique=True, editable=False, blank=True, null=True, help_text="Unique identifier for the purchase invoice. Auto-generated if left blank.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
-    invoice_date = models.DateField()
-    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
+    invoice_date = models.DateField(default=timezone.now)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
-    paid_date = models.DateField(null=True, blank=True, help_text="Date when this invoice was fully settled.")
+    paid_date = models.DateField(null=True, blank=True, editable=False, help_text="Date when this invoice was fully settled.")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def clean(self):
         super().clean()
         
         if self.procurement_order:
-            # Used getattr to safely fetch 'order_date'. 
-            # If it doesn't exist on ProcurementOrder, it returns None instead of crashing.
             po_date = getattr(self.procurement_order, 'order_date', None)
             
-            if po_date and self.invoice_date < po_date:
+            if po_date and self.invoice_date and self.invoice_date < po_date:
                 raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the procurement order date.'})
             
-            # Ensure supplier match
             if self.procurement_order.supplier != self.supplier:
                 raise ValidationError({'supplier': 'The supplier on the invoice must match the supplier on the procurement order.'})
             
     def save(self, *args, **kwargs):
         if self.procurement_order:
-            # Pulls the final calculated cost straight from the delivery record
             self.total_amount = self.procurement_order.total_cost
         else:
             if not self.total_amount:
                 self.total_amount = Decimal('0.00')
 
-        self.total_amount = Decimal(str(self.total_amount)).quantize(Decimal('0.01'))
+        self.total_amount = Decimal(str(self.total_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        if not self.invoice_date:
+            self.invoice_date = timezone.now().date()
+
+        if not self.invoice_number:
+            year_month = timezone.now().strftime('%Y%m')
+            prefix = f"PINV-{year_month}-"
+            latest = PurchaseInvoice.objects.filter(
+                invoice_number__startswith=prefix
+            ).order_by('-invoice_number').first()
+
+            if latest and latest.invoice_number:
+                try:
+                    last_seq = int(latest.invoice_number.split('-')[-1])
+                    next_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    next_seq = 1
+            else:
+                next_seq = 1
+
+            self.invoice_number = f"{prefix}{next_seq:04d}"
         
         self.full_clean()    
         super().save(*args, **kwargs)
     
     @property
+    def total_paid(self):
+        """Calculates total payments made for this purchase invoice."""
+        if not self.pk:
+            return Decimal('0.00')
+        total = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        return Decimal(str(total)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @property
     def remaining_balance(self):
         """Calculates live outstanding balance owed to the supplier."""
-        # Forced the invoice total to be a Decimal, even if Django/DB thinks it is None
-        invoice_total = self.total_amount
-        if invoice_total is None:
-            invoice_total = Decimal('0.00')
-            
-        # If the invoice has not been saved to the database yet (it has no primary key),
-        # there cannot possibly be any payments yet. Return the total immediately.
-        if not self.pk:
-            return invoice_total.quantize(Decimal('0.01'))
-            
-        # Safely calculate payments if the invoice exists in the database
-        try:
-            total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total']
-            if total_paid is None:
-                total_paid = Decimal('0.00')
-        except Exception:
-            total_paid = Decimal('0.00')
-            
-        # Run the math safely with guaranteed Decimal types on both sides
-        balance = invoice_total - total_paid
-        return balance.quantize(Decimal('0.01'))
+        invoice_total = self.total_amount or Decimal('0.00')
+        balance = invoice_total - self.total_paid
+        return max(Decimal('0.00'), balance.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
-    def update_payment_status(self):
-        """Auto-updates supplier bill status and date stamps based on outgoing payments."""
-        total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+    def update_payment_status(self, save=True):
+        """Auto-updates supplier bill status and paid_date stamp based on outgoing payments."""
+        total_paid = self.total_paid
+        invoice_total = self.total_amount or Decimal('0.00')
         
-        if total_paid >= self.total_amount:
+        if total_paid >= invoice_total and invoice_total > Decimal('0.00'):
             self.status = 'PAID'
-            
-                
-        elif total_paid > 0:
+            if not self.paid_date:
+                latest = self.purchase_payments.order_by('-paid_at').first()
+                if latest and latest.paid_at:
+                    self.paid_date = latest.paid_at.date()
+                else:
+                    self.paid_date = timezone.now().date()
+        elif total_paid > Decimal('0.00'):
             self.status = 'PARTIAL'
-            # Clear the date stamp if a payment is deleted and it drops back to partial
             self.paid_date = None
-            
         else:
             self.status = 'UNPAID'
-            # Clear the date stamp if all payments are deleted
             self.paid_date = None
-            
-        # Add 'paid_date' to the update_fields list so Django saves it
-        self.save(update_fields=['status', 'paid_date'])
+
+        if save and self.pk:
+            PurchaseInvoice.objects.filter(pk=self.pk).update(
+                status=self.status,
+                paid_date=self.paid_date
+            )
+        return self.status
 
 
     def __str__(self):
@@ -1701,45 +1874,21 @@ class Return(models.Model):
                     inventory_item.quantity_available += self.quantity_returned
                     inventory_item.save()
 
-                # Step B: Safely deduct returned items cost from the associated Invoice row
-                invoice_record = Invoice.objects.filter(dispatch=self.dispatch).first()
+                # Step B: Safely deduct returned items cost from the associated SalesInvoice row
+                invoice_record = SalesInvoice.objects.filter(dispatch=self.dispatch).first()
                 if invoice_record and invoice_record.total_amount and prod_order:
                     raw_return_value = self.quantity_returned * prod_order.product.cost_per_unit
                     
-                    # FIXED: We clip the return value to exactly 2 decimal places BEFORE modifying the invoice!
                     return_value = raw_return_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                     
                     invoice_record.total_amount -= return_value
                     # Extra safety shield: ensure the final invoice total is cleanly quantized too
                     invoice_record.total_amount = invoice_record.total_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    
                     invoice_record.save()
 
     def __str__(self):
         return f"Return #{self.return_id} — {self.quantity_returned} units from Dispatch #{self.dispatch.dispatch_id} ({self.quality_control_status})"        
-            
-class LossRecord(models.Model):
-    loss_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.CASCADE)
-    quantity_lost = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity lost must be a positive amount greater than zero.")
-    loss_date = models.DateField()
-    reason = models.TextField()
-    loss_location = models.CharField(max_length=255, default='Main Warehouse')
 
-    def save(self, *args, **kwargs):
-        self.full_clean()
-        with transaction.atomic():
-            super().save(*args, **kwargs)
-            
-            # CRITICAL ADDITION: Automatically deduct lost material amounts from physical inventory stock lines
-            inventory_item = Inventory.objects.filter(product=self.product, location=self.loss_location).first()
-            if inventory_item:
-                inventory_item.quantity_available -= self.quantity_lost
-                # Triggers clean validation checks if loss plunges stock into negative boundaries
-                inventory_item.save()
-
-    def __str__(self):
-        return f"Loss #{self.loss_id} — {self.quantity_lost} of {self.product.name} written off"
 class FinanceEntry(models.Model):
     finance_entry_id = models.AutoField(primary_key=True)
     ENTRY_TYPE_CHOICES = [
@@ -1754,10 +1903,11 @@ class FinanceEntry(models.Model):
         ('CUSTOMER_REFUND', 'Customer refund'),
         ('LOSS', 'Inventory Loss'),
     ]
-    entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE')  # e.g., 'Revenue', 'Expense'
-    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')  # e.g., 'Raw Material', 'Labor', 'Overhead'        
+    entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE')
+    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
-    Invoice = models.ForeignKey('Invoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
+    sales_invoice = models.ForeignKey('SalesInvoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
+    loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
     entry_date = models.DateField()

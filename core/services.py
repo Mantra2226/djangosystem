@@ -125,7 +125,7 @@ def evaluate_mrp_shortages(production_order):
 def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
     """
     OPTION 1: Auto-Draft PO
-    Looks up Product.supplier and appends shortfall to an open DRAFT PurchaseOrder (or creates a new draft).
+    Looks up Product.supplier and appends shortfall to an open PurchaseOrder (or creates a new draft).
     """
     component = Product.objects.get(pk=component_id)
     if not component.supplier:
@@ -133,13 +133,16 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
 
     shortfall = Decimal(str(shortfall_qty))
     with transaction.atomic():
-        po, created = PurchaseOrder.objects.get_or_create(
+        po = PurchaseOrder.objects.filter(
             supplier=component.supplier,
-            status='DRAFT',
-            defaults={
-                'notes': f"Auto-drafted by MRP Trigger Engine for Production Order #{production_order.pk}."
-            }
-        )
+            status__in=['DRAFT', 'SENT']
+        ).first()
+
+        if not po:
+            po = PurchaseOrder.objects.create(
+                supplier=component.supplier,
+                notes=f"Auto-drafted by MRP Trigger Engine for Production Order #{production_order.pk}."
+            )
 
         po_item, item_created = PurchaseOrderItem.objects.get_or_create(
             purchase_order=po,
@@ -152,13 +155,14 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
 
         if not item_created:
             po_item.quantity_ordered += shortfall
-            po_item.save(update_fields=['quantity_ordered'])
+            po_item.save()
 
         if production_order and production_order.pk:
-            note_msg = f"[MRP RESOLVED] Appended {shortfall} units of {component.name} to DRAFT PO #{po.po_number}."
+            note_msg = f"[MRP RESOLVED] Appended {shortfall} units of {component.name} to PO #{po.po_number}."
             production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
             production_order.save(update_fields=['notes'])
 
+    po.refresh_from_db()
     return po
 
 
