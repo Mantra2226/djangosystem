@@ -811,21 +811,90 @@ class WorkOrderMaterialLine(models.Model):
     @property
     def variance(self):
         """
-        Calculates material usage variance.
-        Positive = Over-consumption.
-        Negative = Under-consumption / Savings due to efficiency.
+        Calculates material usage quantity variance (actual - expected).
+        Positive = Over-consumption / Unfavorable.
+        Negative = Under-consumption / Savings / Favorable.
         """
         actual = self.quantity_actual or Decimal('0.00')
         expected = self.quantity_expected or Decimal('0.00')
-        return actual - expected
+        return (actual - expected).quantize(Decimal('0.01'))
+
+    @property
+    def variance_percentage(self):
+        """
+        Calculates percentage usage variance relative to expected usage.
+        """
+        expected = self.quantity_expected or Decimal('0.00')
+        if expected <= Decimal('0.00'):
+            return Decimal('0.00')
+        pct = (self.variance / expected) * Decimal('100.00')
+        return pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @property
+    def unit_cost(self):
+        """
+        Retrieves the component's unit cost from Inventory (moving average cost).
+        """
+        if self.component:
+            inv = self.component.stock.first()
+            if inv and inv.unit_cost:
+                return inv.unit_cost
+        return Decimal('0.00')
+
+    @property
+    def cost_variance(self):
+        """
+        Calculates the financial cost impact of the material usage variance.
+        """
+        cost = self.variance * self.unit_cost
+        return cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     @property
     def waste(self):
         """
-        Waste is only recorded when actual consumption exceeds expected usage.
-        If actual usage is <= expected, waste is 0.00.
+        Waste is recorded when actual consumption exceeds expected usage.
         """
         return max(Decimal('0.00'), self.variance)
+
+    @property
+    def efficiency_rate(self):
+        """
+        Calculates material utilization efficiency percentage (expected / actual * 100).
+        """
+        actual = self.quantity_actual or Decimal('0.00')
+        expected = self.quantity_expected or Decimal('0.00')
+        if actual <= Decimal('0.00'):
+            return Decimal('100.00')
+        rate = (expected / actual) * Decimal('100.00')
+        return rate.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @property
+    def variance_status(self):
+        """
+        Returns categorical status of usage variance.
+        """
+        var = self.variance
+        if var > Decimal('0.00'):
+            return 'OVER_CONSUMPTION'
+        elif var < Decimal('0.00'):
+            return 'SAVINGS'
+        return 'EXACT'
+
+    @property
+    def variance_summary(self):
+        """
+        Provides a detailed formatted summary string of the variance.
+        """
+        var = self.variance
+        pct = self.variance_percentage
+        cost = self.cost_variance
+        
+        sign = "+" if var > 0 else ""
+        if var > 0:
+            return f"{sign}{var:.2f} ({sign}{pct:.2f}%) — Over-consumption (+${cost:.2f} Cost Impact)"
+        elif var < 0:
+            return f"{var:.2f} ({pct:.2f}%) — Savings (${abs(cost):.2f} Saved)"
+        return "0.00 (0.00%) — Exact Match"
 
     def clean(self):
         super().clean()
@@ -839,6 +908,7 @@ class WorkOrderMaterialLine(models.Model):
 
     def __str__(self):
         return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
+
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
         ('IN_PROGRESS', 'In Progress'),
@@ -847,6 +917,7 @@ class ProductionOrder(models.Model):
         ('CANCELLED', 'Cancelled'),
     ]
     production_order_id = models.AutoField(primary_key=True)
+    production_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique production order code.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
@@ -963,6 +1034,25 @@ class ProductionOrder(models.Model):
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
+
+        # Auto-generate unique production order code if missing
+        if not self.production_order_code:
+            prefix = "POC"
+            last_po = ProductionOrder.objects.filter(
+                production_order_code__startswith=prefix
+            ).order_by('production_order_id').last()
+
+            if last_po and last_po.production_order_code:
+                try:
+                    last_seq = int(last_po.production_order_code.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+
+            self.production_order_code = f"{prefix}-{new_seq:04d}"
+
         old_status = None
         if not is_new:
             old_status = ProductionOrder.objects.filter(pk=self.pk).values_list('status', flat=True).first()
@@ -977,7 +1067,6 @@ class ProductionOrder(models.Model):
         elif self.status == 'CANCELLED':
             self.completed_at = None
 
-
         with transaction.atomic():
             super().save(*args, **kwargs)
 
@@ -990,7 +1079,9 @@ class ProductionOrder(models.Model):
                 self.complete_production()
                 
     def __str__(self):
-        return f"Prod Order {self.production_order_id} ({self.get_status_display()}) - Blueprint: WO-{self.work_order.work_order_id}"            
+        code = self.production_order_code or f"POC-{self.production_order_id:04d}"
+        wo_code = getattr(self.work_order, 'work_order_code', f"WO-{self.work_order_id}") if self.work_order else "N/A"
+        return f"{code} ({self.get_status_display()}) - Blueprint: {wo_code}"            
 class Customer(models.Model):
     customer_id = models.AutoField(primary_key=True)    
     customer_name = models.CharField(max_length=255)

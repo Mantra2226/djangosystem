@@ -165,3 +165,44 @@ class MRPEngineTestCase(TestCase):
         po.refresh_from_db()
         self.assertEqual(po.status, "IN_PROGRESS")
         self.assertIn("MRP AUTO-RESUMED", po.notes)
+
+    def test_work_order_material_line_enhanced_variance(self):
+        Inventory.objects.create(product=self.raw_mat, unit_cost=Decimal("15.00"), quantity_available=Decimal("100.00"))
+        wo = WorkOrder.objects.create(
+            product=self.inter_good,
+            bill_of_material=self.inter_bom,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date()
+        )
+        line = wo.material_lines.get(component=self.raw_mat)
+        line.quantity_expected = Decimal("50.00")
+        line.quantity_actual = Decimal("55.00")
+        line.save()
+
+        self.assertEqual(line.variance, Decimal("5.00"))
+        self.assertEqual(line.variance_percentage, Decimal("10.00"))
+        self.assertEqual(line.cost_variance, Decimal("75.00"))
+        self.assertEqual(line.variance_status, "OVER_CONSUMPTION")
+        self.assertIn("+5.00 (+10.00%)", line.variance_summary)
+
+    def test_production_order_code_auto_generation(self):
+        wo = WorkOrder.objects.create(
+            product=self.finished_good,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("5.00"),
+            production_start_date=timezone.now().date()
+        )
+        po1 = ProductionOrder.objects.create(
+            product=self.finished_good,
+            work_order=wo,
+            quantity=Decimal("5.00")
+        )
+        po2 = ProductionOrder.objects.create(
+            product=self.finished_good,
+            work_order=wo,
+            quantity=Decimal("5.00")
+        )
+
+        self.assertEqual(po1.production_order_code, "POC-0001")
+        self.assertEqual(po2.production_order_code, "POC-0002")
+        self.assertIn("POC-0001", str(po1))

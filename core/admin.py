@@ -51,19 +51,38 @@ class BOMItemInline(admin.TabularInline):
 
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
-    readonly_fields = ('quantity_expected', 'quantity_issued', 'get_variance')
+    readonly_fields = ('quantity_expected', 'quantity_issued', 'get_variance', 'get_cost_variance')
     extra = 0  # Don't show empty lines by default
-    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued', 'get_variance')  
+    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued', 'get_variance', 'get_cost_variance')  
 
-    @admin.display(description='Variance (Over/Under)')
+    @admin.display(description='Material Usage Variance')
     def get_variance(self, instance):
         if instance.pk:
             var = instance.variance
+            pct = instance.variance_percentage
+            sign = "+" if var > 0 else ""
             if var > 0:
-                return format_html('<span style="color: red; font-weight: bold;">+{} (Waste)</span>', var)
+                return format_html(
+                    '<span style="color: #c53030; font-weight: bold; background: #fff5f5; padding: 2px 6px; border-radius: 4px;">{}{} ({}{}%) — Over-consumption</span>',
+                    sign, var, sign, pct
+                )
             elif var < 0:
-                return format_html('<span style="color: green; font-weight: bold;">{} (Saved)</span>', var)
-            return "0.00"
+                return format_html(
+                    '<span style="color: #27ae60; font-weight: bold; background: #e8f8f5; padding: 2px 6px; border-radius: 4px;">{} ({}%) — Efficient Savings</span>',
+                    var, pct
+                )
+            return format_html('<span style="color: #4a5568; font-weight: bold;">0.00 (0.00%) — Exact Match</span>')
+        return "-"  
+
+    @admin.display(description='Financial Cost Impact')
+    def get_cost_variance(self, instance):
+        if instance.pk:
+            cost = instance.cost_variance
+            if cost > 0:
+                return format_html('<span style="color: #c53030; font-weight: bold;">+${:,.2f}</span>', cost)
+            elif cost < 0:
+                return format_html('<span style="color: #27ae60; font-weight: bold;">-${:,.2f}</span>', abs(cost))
+            return "$0.00"
         return "-"  
 
 class SalesInvoicePaymentsInline(admin.TabularInline):
@@ -195,11 +214,11 @@ class ProductionOrderAdminForm(forms.ModelForm):
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
     form = ProductionOrderAdminForm
-    list_display = ('product', 'work_order', 'quantity', 'status', 'get_unit_cost', 'created_at')
+    list_display = ('production_order_code', 'product', 'work_order', 'quantity', 'status', 'get_unit_cost', 'created_at')
     list_filter = ['status', 'created_at']
-    search_fields = ('work_order__work_order_id', 'employee__employee_name', 'product__name')  
+    search_fields = ('production_order_code', 'work_order__work_order_code', 'work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
-    readonly_fields = ['status', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
+    readonly_fields = ['production_order_code', 'status', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
     actions = ['trigger_mrp_auto_resume']
 
     @admin.action(description="Check Stock & Auto-Resume On-Hold Orders")
@@ -214,7 +233,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     
     fieldsets = (
        ('Order Information', {
-            'fields': ('product', 'work_order', 'quantity', 'status')
+            'fields': ('production_order_code', 'product', 'work_order', 'quantity', 'status')
         }),
         ('MRP Shortage Resolution Pathways', {
             'fields': ('mrp_resolution_pathways_viewer',),
