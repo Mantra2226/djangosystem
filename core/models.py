@@ -1673,7 +1673,7 @@ class PurchaseInvoice(models.Model):
         ('PARTIAL', 'Partially Paid'),
     ]   
     invoice_id = models.AutoField(primary_key=True)
-    invoice_number = models.CharField(max_length=50, unique=True, editable=False, blank=True, null=True, help_text="Unique identifier for the purchase invoice. Auto-generated if left blank.")
+    invoice_number = models.CharField(max_length=50, unique=True, null=True, blank=True, help_text="Unique identifier for the purchase invoice from the supplier.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
     invoice_date = models.DateField(default=timezone.now)
@@ -1706,24 +1706,6 @@ class PurchaseInvoice(models.Model):
 
         if not self.invoice_date:
             self.invoice_date = timezone.now().date()
-
-        if not self.invoice_number:
-            year_month = timezone.now().strftime('%Y%m')
-            prefix = f"PINV-{year_month}-"
-            latest = PurchaseInvoice.objects.filter(
-                invoice_number__startswith=prefix
-            ).order_by('-invoice_number').first()
-
-            if latest and latest.invoice_number:
-                try:
-                    last_seq = int(latest.invoice_number.split('-')[-1])
-                    next_seq = last_seq + 1
-                except (ValueError, IndexError):
-                    next_seq = 1
-            else:
-                next_seq = 1
-
-            self.invoice_number = f"{prefix}{next_seq:04d}"
         
         self.full_clean()    
         super().save(*args, **kwargs)

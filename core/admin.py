@@ -601,7 +601,7 @@ class ProcurementOrderAdmin(admin.ModelAdmin):
     list_display = ('procurement_order_id', 'purchase_order', 'product', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
     list_filter = ['status', 'delivery_date', 'delivery_location']
     search_fields = ('product__name', 'product__sku', 'purchase_order__po_number')
-    readonly_fields = ['total_cost', 'delivery_date', 'status']  # Computed field, should not be editable
+    readonly_fields = ['total_cost', 'delivery_date']  # Computed field, should not be editable
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):

@@ -342,6 +342,7 @@ class MRPEngineTestCase(TestCase):
 
     def test_purchase_invoice_paid_date_automation(self):
         pi = PurchaseInvoice.objects.create(
+            invoice_number="PINV-TEST-001",
             supplier=self.supplier,
             total_amount=Decimal("500.00")
         )
