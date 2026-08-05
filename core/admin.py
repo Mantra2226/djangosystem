@@ -604,7 +604,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'quantity_produced', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
+    list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
     readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
     list_filter = ['status', 'is_inventory_updated', 'production_start_date']
@@ -673,6 +673,10 @@ class WorkOrderAdmin(admin.ModelAdmin):
         if employees.exists():
             return ", ".join([str(emp) for emp in employees])
         return "-"
+
+    @admin.display(description='Target Quantity')
+    def display_target_quantity(self, obj):
+        return f"{obj.target_quantity:.2f}"
 
     @admin.display(description='Status')
     def status_badge(self, obj):

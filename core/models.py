@@ -581,10 +581,10 @@ class WorkOrder(models.Model):
                 raise ValidationError({
                     'status': f"Cannot complete Work Order. There are still {incomplete_steps} incomplete instruction step(s)."
                 })
-        # Prevents completion without a valid quantity
+        # Prevents completion without a valid quantity on linked ProductionOrder
         if self.status == 'COMPLETED' and not self.is_inventory_updated:
-            if not self.quantity_produced or self.quantity_produced <= 0:
-                raise ValidationError({'quantity_produced': "Quantity produced must be greater than 0 to complete."})
+            if not self.target_quantity or self.target_quantity <= 0:
+                raise ValidationError({'status': "Cannot complete Work Order without a valid target quantity on a linked Production Order."})
             # VALIDATES RAW MATERIAL STOCK USING ACTUAL CONSUMPTION (quantity_actual)
             for line in self.material_lines.all():
                 from .models import Inventory
@@ -664,7 +664,7 @@ class WorkOrder(models.Model):
                     raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
                     print(f"   ✓ [RESERVED ALLOCATION] Component: '{item.component.name}'", flush=True)
-                    print(f"      Formula: {per_unit_req} (BOM Req/unit) x {target_qty} (Target Batch Qty) = {expected_allocated_qty} units allocated", flush=True)
+                    print(f"      Allocated Quantity for Line: {expected_allocated_qty} units (Formula: {per_unit_req} BOM Req/unit x {target_qty} Target Batch Qty)", flush=True)
                     print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
                 self.is_inventory_allocated = True
@@ -681,9 +681,10 @@ class WorkOrder(models.Model):
                 for line in self.material_lines.all():
                     actual_qty = line.quantity_actual or Decimal('0.00')
                     already_deducted = line.deducted_quantity or Decimal('0.00')
+                    allocated_qty = line.quantity_allocated
                     delta = actual_qty - already_deducted
 
-                    print(f"   Line '{line.component.name}': Actual Consumed={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
+                    print(f"   Line '{line.component.name}': Allocated Qty={allocated_qty} | Actual Consumed={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
 
                     if delta != Decimal('0.00'):
                         raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
@@ -752,11 +753,11 @@ class WorkOrder(models.Model):
                             raw_inv.quantity_available += released
                             raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                            print(f"   ✓ [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Unused={released}", flush=True)
+                            print(f"   ✓ [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Allocated={expected_allocated_qty} | Actual Consumed={actual_consumed} | Unused Released={released}", flush=True)
                             print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
                 # Record Finished Goods Output
-                finished_qty = self.quantity_produced or target_qty or Decimal('0.00')
+                finished_qty = target_qty
                 if finished_qty > Decimal('0.00'):
                     finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=self.product,
@@ -924,6 +925,22 @@ class WorkOrderMaterialLine(models.Model):
     quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="The actual physical quantity consumed during this run.")   
     deducted_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), editable=False, help_text="Tracks quantity already deducted from inventory.")
     
+    @property
+    def quantity_allocated(self):
+        """
+        Calculates planned quantity allocated for this material line based on BOM requirement
+        multiplied by ProductionOrder target quantity.
+        """
+        if not self.work_order or not self.work_order.bill_of_material:
+            return Decimal('0.00')
+
+        bom_item = self.work_order.bill_of_material.items.filter(component=self.component).first()
+        if not bom_item:
+            return Decimal('0.00')
+
+        target_qty = self.work_order.target_quantity
+        return (bom_item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
     class Meta:
         # Prevents adding the same raw material/component to the same work order twice
         unique_together = ('work_order', 'component')
@@ -1267,6 +1284,10 @@ class ProductionOrder(models.Model):
             # Assign M2M Employees (Requires self.pk to exist)
             if is_new and self.work_order_id and hasattr(self.work_order, 'employee'):
                 self.employee.set(self.work_order.employee.all())
+
+            # Sync WorkOrder inventory processing from ProductionOrder target quantity
+            if self.work_order:
+                self.work_order.process_inventory()
 
             # Non-inventory completion logic (ensure this method does NOT update stock!)
             if is_transitioning_to_completed:
