@@ -600,133 +600,58 @@ class WorkOrder(models.Model):
 
     def process_inventory(self):
         """
-        HYBRID INVENTORY ENGINE:
-        Phase 1: Reserve stock (Allocations) when status moves to IN_PROGRESS.
-        Phase 2: Deduct incremental actuals (Deltas) during intermediate saves.
-        Phase 3: Add finished goods & clear remaining allocations on COMPLETED.
+        Incremental stock consumption engine:
+        1. Reads quantity_actual from each WorkOrderMaterialLine.
+        2. Deducts delta (quantity_actual - deducted_quantity) from Inventory.
+        3. Creates StockTransaction records.
+        4. Adds finished goods output upon COMPLETED status.
         """
         current_status = (self.status or '').upper().strip()
 
-        print("\n==================================================")
-        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} | Status: '{current_status}'")
-        print(f"[LOG] Flags -> Allocated: {self.is_inventory_allocated} | Fully Updated: {self.is_inventory_updated}")
+        print("\n==================================================", flush=True)
+        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} | Status: '{current_status}'", flush=True)
+        print(f"[LOG] Fully Updated Flag: {self.is_inventory_updated}", flush=True)
 
         with transaction.atomic():
             from .models import Inventory, StockTransaction
 
-            # =========================================================================
-            # PHASE 1: STOCK ALLOCATION (Runs once when status moves to IN_PROGRESS)
-            # =========================================================================
-            if current_status == 'IN_PROGRESS' and not self.is_inventory_allocated:
-                print("--------------------------------------------------")
-                print("[PHASE 1: STOCK ALLOCATION START]")
-                
-                for line in self.material_lines.all():
-                    expected_qty = line.quantity_expected or Decimal('0.00')
-                    if expected_qty <= Decimal('0.00'):
-                        continue
+            # Step 1: Incremental Consumption per Material Line
+            for line in self.material_lines.all():
+                actual_qty = line.quantity_actual or Decimal('0.00')
+                already_deducted = line.deducted_quantity or Decimal('0.00')
+                delta = actual_qty - already_deducted
 
+                print(f"    Line '{line.component.name}': Actual={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
+
+                if delta != Decimal('0.00'):
                     raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=line.component,
                         defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
                     )
 
-                    # Reserve expected stock: Shift from quantity_available to quantity_allocated
-                    old_avail = raw_inv.quantity_available
-                    old_alloc = raw_inv.quantity_allocated
-                    
-                    raw_inv.quantity_available -= expected_qty
-                    raw_inv.quantity_allocated += expected_qty
-                    raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
-
-                    print(f"    RESERVED ({line.component.name}): Expected={expected_qty}")
-                    print(f"    Available: {old_avail} -> {raw_inv.quantity_available} | Allocated: {old_alloc} -> {raw_inv.quantity_allocated}")
-
-                # Flip allocation lock
-                self.is_inventory_allocated = True
-                super().save(update_fields=['is_inventory_allocated'])
-                print("[SAFETY GATE] Flipped self.is_inventory_allocated = True")
-
-            # =========================================================================
-            # PHASE 2: INCREMENTAL DELTA ISSUING (Runs during IN_PROGRESS or COMPLETED)
-            # =========================================================================
-            if current_status in ['IN_PROGRESS', 'COMPLETED'] and not self.is_inventory_updated:
-                print("--------------------------------------------------")
-                print("[PHASE 2: INCREMENTAL DELTA ISSUING START]")
-
-                for line in self.material_lines.all():
-                    actual_qty = line.quantity_actual or Decimal('0.00')
-                    issued_qty = line.quantity_issued or Decimal('0.00')
-                    
-                    # Compute Line Delta (New consumption since last save)
-                    delta = actual_qty - issued_qty
-
-                    print(f"    Line '{line.component.name}': Actual={actual_qty} | Already Issued={issued_qty} | Delta={delta}")
-
                     if delta > Decimal('0.00'):
-                        raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                            product=line.component,
-                            defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
-                        )
+                        raw_inv.quantity_available -= delta
+                        trans_type = 'PRODUCTION_CONSUMPTION'
+                    else:
+                        raw_inv.quantity_available += (-delta)
+                        trans_type = 'ADJUSTMENT'
 
-                        old_alloc = raw_inv.quantity_allocated
-                        
-                        # Reduce allocation pool if available, otherwise deduct directly
-                        if raw_inv.quantity_allocated >= delta:
-                            raw_inv.quantity_allocated -= delta
-                        else:
-                            # Used more than originally allocated
-                            excess = delta - raw_inv.quantity_allocated
-                            raw_inv.quantity_allocated = Decimal('0.00')
-                            raw_inv.quantity_available -= excess
+                    raw_inv.save(update_fields=['quantity_available'])
 
-                        raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+                    StockTransaction.objects.create(
+                        product=line.component,
+                        quantity=-delta,
+                        transaction_type=trans_type,
+                        work_order=self,
+                        notes=f"Stock change of {-delta} units for Work Order #{self.pk} ({line.component.name})"
+                    )
 
-                        # Record transaction history for delta
-                        StockTransaction.objects.create(
-                            product=line.component,
-                            quantity=-delta,
-                            transaction_type='PRODUCTION_CONSUMPTION',
-                            work_order=self
-                        )
+                    line.deducted_quantity = actual_qty
+                    line.save(update_fields=['deducted_quantity'])
+                    print(f"      ✓ DEDUCTED DELTA ({delta}) for {line.component.name}: New Available Stock={raw_inv.quantity_available}", flush=True)
 
-                        # Update background issued counter
-                        line.quantity_issued = actual_qty
-                        line.save(update_fields=['quantity_issued'])
-
-                        print(f"      ✓ DEDUCTED DELTA ({delta}): Allocated: {old_alloc} -> {raw_inv.quantity_allocated} | Issued Counter set to {line.quantity_issued}")
-
-            # =========================================================================
-            # PHASE 3: FINAL RECONCILIATION & OUTPUT (Runs when COMPLETED)
-            # =========================================================================
+            # Step 2: Final Finished Goods Output on COMPLETED
             if current_status == 'COMPLETED' and not self.is_inventory_updated:
-                print("--------------------------------------------------")
-                print("[PHASE 3: FINAL RECONCILIATION & FINISHED GOODS START]")
-
-                # --- A. Release any unconsumed allocated stock back to available pool ---
-                if self.is_inventory_allocated:
-                    for line in self.material_lines.all():
-                        expected = line.quantity_expected or Decimal('0.00')
-                        issued = line.quantity_issued or Decimal('0.00')
-                        
-                        unconsumed_alloc = expected - issued
-                        if unconsumed_alloc > Decimal('0.00'):
-                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                                product=line.component,
-                                defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
-                            )
-                            old_alloc = raw_inv.quantity_allocated
-                            old_avail = raw_inv.quantity_available
-
-                            # Release unused allocation back to available stock
-                            raw_inv.quantity_allocated = max(Decimal('0.00'), raw_inv.quantity_allocated - unconsumed_alloc)
-                            raw_inv.quantity_available += unconsumed_alloc
-                            raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
-
-                            print(f"   ✓ RELEASED UNUSED ALLOCATION ({line.component.name}): Released={unconsumed_alloc}")
-                            print(f"      Allocated: {old_alloc} -> {raw_inv.quantity_allocated} | Available: {old_avail} -> {raw_inv.quantity_available}")
-
-                # --- B. Record Finished Goods Output ---
                 finished_qty = self.quantity_produced or Decimal('0.00')
                 if finished_qty > Decimal('0.00'):
                     finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
@@ -743,66 +668,36 @@ class WorkOrder(models.Model):
                         transaction_type='PRODUCTION_OUTPUT',
                         work_order=self
                     )
-                    print(f"   ✓ ADDED FINISHED GOODS ({self.product.name}): +{finished_qty} | Stock: {old_qty} -> {finished_inv.quantity_available}")
+                    print(f"   ✓ ADDED FINISHED GOODS ({self.product.name}): +{finished_qty} | Stock: {old_qty} -> {finished_inv.quantity_available}", flush=True)
 
-                # --- C. Final Safety Gate ---
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
-                print("[SAFETY GATE] Flipped self.is_inventory_updated = True")
+                print("[SAFETY GATE] Flipped self.is_inventory_updated = True", flush=True)
 
-        print("[HYBRID INVENTORY ENGINE END]")
-        print("==================================================\n")
+        print("[HYBRID INVENTORY ENGINE END]", flush=True)
+        print("==================================================\n", flush=True)
 
     def sync_material_lines(self):
         """
-        Recalculates quantity_expected for all material lines based on the target batch quantity:
-        1. Linked ProductionOrder quantity
-        2. OR self.quantity_produced
-        3. Default fallback: 1.00 if unassigned draft
+        Ensures a WorkOrderMaterialLine exists for every BOM item in the selected BillOfMaterial.
+        Does NOT alter existing lines' quantity_actual or auto-fill other lines!
         """
         if not self.bill_of_material:
             return
 
-        from .models import ProductionOrder
-        po = ProductionOrder.objects.filter(work_order=self).first()
-
-        if po and po.quantity and po.quantity > Decimal('0.00'):
-            target_qty = po.quantity
-        elif self.quantity_produced and self.quantity_produced > Decimal('0.00'):
-            target_qty = self.quantity_produced
-        else:
-            target_qty = Decimal('1.00')
-
         for item in self.bill_of_material.items.all():
-            per_unit_req = item.quantity_required or Decimal('0.00')
-            total_expected = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-            line = self.material_lines.filter(component=item.component).first()
-            if not line:
-                WorkOrderMaterialLine.objects.create(
-                    work_order=self,
-                    component=item.component,
-                    quantity_expected=total_expected,
-                    quantity_actual=total_expected,
-                    quantity_issued=Decimal('0.00')
-                )
-            else:
-                need_save = False
-                if line.quantity_expected != total_expected:
-                    line.quantity_expected = total_expected
-                    need_save = True
-
-                if line.quantity_actual == Decimal('0.00'):
-                    line.quantity_actual = total_expected
-                    need_save = True
-
-                if need_save:
-                    line.save()
+            WorkOrderMaterialLine.objects.get_or_create(
+                work_order=self,
+                component=item.component,
+                defaults={
+                    'quantity_actual': Decimal('0.00'),
+                }
+            )
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
-        print("\n==================================================")
-        print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}")
+        print("\n==================================================", flush=True)
+        print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}", flush=True)
 
         # AUTO-GENERATE CODE & ASSIGN BOM
         if not self.work_order_code:
@@ -810,26 +705,26 @@ class WorkOrder(models.Model):
             last_wo = WorkOrder.objects.filter(work_order_code__startswith=prefix).order_by('work_order_id').last()
             new_seq = (int(last_wo.work_order_code.split('-')[-1]) + 1) if (last_wo and last_wo.work_order_code) else 1
             self.work_order_code = f"{prefix}-{new_seq:04d}"
-            print(f"[LOG] Generated new Work Order Code: {self.work_order_code}")
+            print(f"[LOG] Generated new Work Order Code: {self.work_order_code}", flush=True)
 
         if not self.bill_of_material and self.product:
             active_bom = self.product.boms.filter(is_active=True).first()
             if active_bom:
                 self.bill_of_material = active_bom
-                print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}")
+                print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}", flush=True)
 
         current_status = (self.status or '').upper().strip()
         is_completed = (current_status == 'COMPLETED')
 
-        print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}")
-        print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}")
+        print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}", flush=True)
+        print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}", flush=True)
 
         if is_completed and not self.production_end_date:
             self.production_end_date = timezone.now()
 
         # SAVE MAIN RECORD
         super().save(*args, **kwargs)
-        print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})")
+        print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})", flush=True)
 
         # INITIALIZE / SYNC MATERIAL LINES FROM BOM
         if self.bill_of_material:
@@ -839,17 +734,17 @@ class WorkOrder(models.Model):
         if self.pk:
             from .models import ProductionOrder
             linked_pos = ProductionOrder.objects.filter(work_order=self)
-            print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).")
+            print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).", flush=True)
             for po in linked_pos:
                 po_status = (po.status or '').upper().strip()
                 if is_completed and po_status != 'COMPLETED':
                     po.status = 'COMPLETED'
                     po.completed_at = timezone.now()
                     po.save(update_fields=['status', 'completed_at'])
-                    print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.")
+                    print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.", flush=True)
 
-        print("[WORK ORDER SAVE END]")
-        print("==================================================\n")
+        print("[WORK ORDER SAVE END]", flush=True)
+        print("==================================================\n", flush=True)
                 
         
     def __str__(self):
@@ -894,7 +789,7 @@ class BillOfMaterial(models.Model):
         super().save(*args, **kwargs)        
 
     def __str__(self):
-        return f"BOM: {self.product.name} ({self.name}) - Active: {self.is_active}"
+        return self.name or f"BOM #{self.bom_id} ({self.product.name})"
 
 # The ingredient going into the recipe
 class BOMItem(models.Model):
@@ -922,12 +817,8 @@ class BOMItem(models.Model):
 class WorkOrderMaterialLine(models.Model):
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='material_lines')
     component = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order_usages', limit_choices_to={'product_type__in': ['RAW', 'INTERMEDIATE']})
-    # What the recipe (BOM) says we should use for the PLANNED quantity
-    quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="Theoretical quantity calculated from BOM.") 
-    # What the team ACTUALLY consumed (default matches expected, but can be edited)
-    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="The actual physical quantity consumed during this run.")   
-    # Automated counter tracking stock already deducted for this line in prior saves.
-    quantity_issued = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0.00'),help_text="Automated counter tracking stock already deducted for this line in prior saves.")
+    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="The actual physical quantity consumed during this run.")   
+    deducted_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), editable=False, help_text="Tracks quantity already deducted from inventory.")
     
     class Meta:
         # Prevents adding the same raw material/component to the same work order twice
@@ -935,22 +826,12 @@ class WorkOrderMaterialLine(models.Model):
         verbose_name = "Work Order Material Line"
         verbose_name_plural = "Work Order Material Lines"
 
-    def clean(self):
-        super().clean()
-        # Fallback: Auto-calculate quantity_expected if blank but BOM/WorkOrder exists
-        if (not self.quantity_expected or self.quantity_expected == Decimal('0.00')) and self.work_order_id:
-            # Look up BOM item requirement for this component
-            if self.work_order.bill_of_material:
-                bom_item = self.work_order.bill_of_material.items.filter(component=self.component).first()
-                if bom_item and self.work_order.quantity_produced:
-                    self.quantity_expected = bom_item.quantity_required * self.work_order.quantity_produced
-
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         MaterialVarianceRecord.sync_from_material_line(self)
 
     def __str__(self):
-        return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
+        return f"{self.component.name} ({self.quantity_actual} consumed) for Work Order #{self.work_order.work_order_id}"
 
 class MaterialVarianceRecord(models.Model):
     VARIANCE_CLASSIFICATION_CHOICES = [
@@ -1042,8 +923,23 @@ class MaterialVarianceRecord(models.Model):
         if not line or not line.pk:
             return None
 
-        expected = line.quantity_expected or Decimal('0.00')
         actual = line.quantity_actual or Decimal('0.00')
+
+        expected = Decimal('0.00')
+        if line.work_order and line.work_order.bill_of_material:
+            bom_item = line.work_order.bill_of_material.items.filter(component=line.component).first()
+            if bom_item:
+                from .models import ProductionOrder
+                po = ProductionOrder.objects.filter(work_order=line.work_order).first()
+                if po and po.quantity and po.quantity > Decimal('0.00'):
+                    target_qty = po.quantity
+                elif line.work_order.quantity_produced and line.work_order.quantity_produced > Decimal('0.00'):
+                    target_qty = line.work_order.quantity_produced
+                else:
+                    target_qty = Decimal('1.00')
+
+                expected = (bom_item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
         qty_var = (actual - expected).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         unit_cost = Decimal('0.00')

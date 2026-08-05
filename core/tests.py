@@ -176,8 +176,7 @@ class MRPEngineTestCase(TestCase):
             production_start_date=timezone.now().date()
         )
         line = wo.material_lines.get(component=self.raw_mat)
-        self.assertEqual(line.quantity_expected, Decimal("50.00"))
-        self.assertEqual(line.quantity_actual, Decimal("50.00"))
+        self.assertEqual(line.quantity_actual, Decimal("0.00"))
 
         # 1. Update actual to 55.00 (+5.00 unfavourable scrap)
         line.quantity_actual = Decimal("55.00")

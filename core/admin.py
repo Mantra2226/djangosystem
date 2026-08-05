@@ -50,9 +50,8 @@ class BOMItemInline(admin.TabularInline):
 
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
-    readonly_fields = ('quantity_expected', 'quantity_issued')
     extra = 0  # Don't show empty lines by default
-    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued')  
+    fields = ('component', 'quantity_actual')  
 
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
@@ -648,7 +647,6 @@ class WorkOrderAdmin(admin.ModelAdmin):
                     work_order=form.instance,
                     component=instance.component,
                     defaults={
-                        'quantity_expected': instance.quantity_expected,
                         'quantity_actual': instance.quantity_actual,
                     }
                 )
@@ -662,10 +660,10 @@ class WorkOrderAdmin(admin.ModelAdmin):
             obj.delete()
 
     def save_related(self, request, form, formsets, change):
-        print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...")
+        print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...", flush=True)
         super().save_related(request, form, formsets, change)
         
-        print("[ADMIN SAVE_RELATED] Inline material lines saved. Calling process_inventory()...")
+        print("[ADMIN SAVE_RELATED] Inline material lines saved. Calling process_inventory()...", flush=True)
         work_order = form.instance
         work_order.process_inventory()
 
