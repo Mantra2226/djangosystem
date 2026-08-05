@@ -172,8 +172,13 @@ class MRPEngineTestCase(TestCase):
         wo = WorkOrder.objects.create(
             product=self.inter_good,
             bill_of_material=self.inter_bom,
-            quantity_produced=Decimal("10.00"),
             production_start_date=timezone.now().date()
+        )
+        po = ProductionOrder.objects.create(
+            product=self.inter_good,
+            work_order=wo,
+            quantity=Decimal("10.00"),
+            status="IN_PROGRESS"
         )
         line = wo.material_lines.get(component=self.raw_mat)
         self.assertEqual(line.quantity_actual, Decimal("0.00"))

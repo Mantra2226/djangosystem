@@ -9,7 +9,6 @@ from django.utils.text import slugify
 from django.core.validators import MinValueValidator
 from django.db.models import Sum
 from django.utils import timezone
-# models.
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
     name = models.CharField(max_length=255)
@@ -537,6 +536,19 @@ class WorkOrder(models.Model):
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
     is_inventory_allocated = models.BooleanField(default=False, help_text="Flag indicating BOM expected stock has been reserved on IN_PROGRESS.")
     status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, help_text="Automatically managed based on step completion statuses.")
+
+    @property
+    def target_quantity(self):
+        """
+        Resolves planned production batch target quantity STRICTLY AND ONLY from the linked ProductionOrder.
+        Returns Decimal('0.00') if no ProductionOrder is linked.
+        """
+        if not self.pk:
+            return Decimal('0.00')
+        po = self.production_runs.first()
+        if po and po.quantity and po.quantity > Decimal('0.00'):
+            return po.quantity
+        return Decimal('0.00')
     # automated state evaluation machine logic
     def recalculate_status(self):
         """Scans all child instructions to dynamically compute macro status."""
@@ -600,59 +612,151 @@ class WorkOrder(models.Model):
 
     def process_inventory(self):
         """
-        Incremental stock consumption engine:
-        1. Reads quantity_actual from each WorkOrderMaterialLine.
-        2. Deducts delta (quantity_actual - deducted_quantity) from Inventory.
-        3. Creates StockTransaction records.
-        4. Adds finished goods output upon COMPLETED status.
+        HYBRID INVENTORY ENGINE:
+        Phase 1: Reserve stock (Allocations) when status moves to IN_PROGRESS.
+                 Calculates allocated_qty = bom_item.quantity_required * target_qty
+                 where target_qty comes STRICTLY AND ONLY from ProductionOrder.quantity.
+                 Deducts allocated_qty from Inventory.quantity_available into Inventory.quantity_allocated.
+        Phase 2: Deduct incremental actuals (Deltas) during production.
+        Phase 3: Add finished goods & release remaining unconsumed allocations on COMPLETED.
         """
         current_status = (self.status or '').upper().strip()
 
+        from .models import Inventory, StockTransaction
+        target_qty = self.target_quantity
+        linked_po = self.production_runs.first() if self.pk else None
+        if target_qty > Decimal('0.00') and linked_po:
+            target_source = f"Production Order #{linked_po.pk} ({linked_po.production_order_code or 'POC'})"
+        else:
+            target_source = "No linked Production Order (0.00 units)"
+
         print("\n==================================================", flush=True)
-        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} | Status: '{current_status}'", flush=True)
-        print(f"[LOG] Fully Updated Flag: {self.is_inventory_updated}", flush=True)
+        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} ({self.work_order_code}) | Status: '{current_status}'", flush=True)
+        print(f"[LOG] Target Production Batch Quantity (STRICTLY FROM ProductionOrder.quantity): {target_qty} units (Source: {target_source})", flush=True)
+        print(f"[LOG] Flags -> Allocated: {self.is_inventory_allocated} | Fully Updated: {self.is_inventory_updated}", flush=True)
 
         with transaction.atomic():
-            from .models import Inventory, StockTransaction
+            # =========================================================================
+            # PHASE 1: STOCK ALLOCATION (Runs once when status moves to IN_PROGRESS)
+            # =========================================================================
+            if current_status == 'IN_PROGRESS' and not self.is_inventory_allocated and self.bill_of_material:
+                print("--------------------------------------------------", flush=True)
+                print("[PHASE 1: STOCK ALLOCATION RESERVATION START]", flush=True)
 
-            # Step 1: Incremental Consumption per Material Line
-            for line in self.material_lines.all():
-                actual_qty = line.quantity_actual or Decimal('0.00')
-                already_deducted = line.deducted_quantity or Decimal('0.00')
-                delta = actual_qty - already_deducted
+                for item in self.bill_of_material.items.all():
+                    per_unit_req = item.quantity_required or Decimal('0.00')
+                    expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
-                print(f"    Line '{line.component.name}': Actual={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
+                    if expected_allocated_qty <= Decimal('0.00'):
+                        continue
 
-                if delta != Decimal('0.00'):
                     raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                        product=line.component,
+                        product=item.component,
                         defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
                     )
 
-                    if delta > Decimal('0.00'):
-                        raw_inv.quantity_available -= delta
-                        trans_type = 'PRODUCTION_CONSUMPTION'
-                    else:
-                        raw_inv.quantity_available += (-delta)
-                        trans_type = 'ADJUSTMENT'
+                    old_avail = raw_inv.quantity_available
+                    old_alloc = raw_inv.quantity_allocated
 
-                    raw_inv.save(update_fields=['quantity_available'])
+                    # Shift expected_allocated_qty from quantity_available to quantity_allocated
+                    raw_inv.quantity_available -= expected_allocated_qty
+                    raw_inv.quantity_allocated += expected_allocated_qty
+                    raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                    StockTransaction.objects.create(
-                        product=line.component,
-                        quantity=-delta,
-                        transaction_type=trans_type,
-                        work_order=self,
-                        notes=f"Stock change of {-delta} units for Work Order #{self.pk} ({line.component.name})"
-                    )
+                    print(f"   ✓ [RESERVED ALLOCATION] Component: '{item.component.name}'", flush=True)
+                    print(f"      Formula: {per_unit_req} (BOM Req/unit) x {target_qty} (Target Batch Qty) = {expected_allocated_qty} units allocated", flush=True)
+                    print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
-                    line.deducted_quantity = actual_qty
-                    line.save(update_fields=['deducted_quantity'])
-                    print(f"      ✓ DEDUCTED DELTA ({delta}) for {line.component.name}: New Available Stock={raw_inv.quantity_available}", flush=True)
+                self.is_inventory_allocated = True
+                super().save(update_fields=['is_inventory_allocated'])
+                print("[SAFETY GATE] Flipped self.is_inventory_allocated = True", flush=True)
 
-            # Step 2: Final Finished Goods Output on COMPLETED
+            # =========================================================================
+            # PHASE 2: INCREMENTAL ACTUAL CONSUMPTION DEDUCTION
+            # =========================================================================
+            if current_status in ['IN_PROGRESS', 'COMPLETED'] and not self.is_inventory_updated:
+                print("--------------------------------------------------", flush=True)
+                print("[PHASE 2: INCREMENTAL ACTUAL CONSUMPTION DEDUCTION START]", flush=True)
+
+                for line in self.material_lines.all():
+                    actual_qty = line.quantity_actual or Decimal('0.00')
+                    already_deducted = line.deducted_quantity or Decimal('0.00')
+                    delta = actual_qty - already_deducted
+
+                    print(f"   Line '{line.component.name}': Actual Consumed={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
+
+                    if delta != Decimal('0.00'):
+                        raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                            product=line.component,
+                            defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                        )
+
+                        old_alloc = raw_inv.quantity_allocated
+                        old_avail = raw_inv.quantity_available
+
+                        if delta > Decimal('0.00'):
+                            # Deduct from allocation pool first if available, otherwise from available pool
+                            if raw_inv.quantity_allocated >= delta:
+                                raw_inv.quantity_allocated -= delta
+                            else:
+                                excess = delta - raw_inv.quantity_allocated
+                                raw_inv.quantity_allocated = Decimal('0.00')
+                                raw_inv.quantity_available -= excess
+                            trans_type = 'PRODUCTION_CONSUMPTION'
+                        else:
+                            # Return stock back if actual consumption was reduced
+                            raw_inv.quantity_available += (-delta)
+                            trans_type = 'ADJUSTMENT'
+
+                        raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                        StockTransaction.objects.create(
+                            product=line.component,
+                            quantity=-delta,
+                            transaction_type=trans_type,
+                            work_order=self,
+                            notes=f"Stock change of {-delta} units for Work Order #{self.pk} ({line.component.name})"
+                        )
+
+                        line.deducted_quantity = actual_qty
+                        line.save(update_fields=['deducted_quantity'])
+                        print(f"      ✓ [DEDUCTED CONSUMPTION DELTA] Delta={delta} for '{line.component.name}'", flush=True)
+                        print(f"         Inventory Updated -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
+
+            # =========================================================================
+            # PHASE 3: FINAL RECONCILIATION & FINISHED GOODS OUTPUT (Runs on COMPLETED)
+            # =========================================================================
             if current_status == 'COMPLETED' and not self.is_inventory_updated:
-                finished_qty = self.quantity_produced or Decimal('0.00')
+                print("--------------------------------------------------", flush=True)
+                print("[PHASE 3: RECONCILIATION & FINISHED GOODS OUTPUT START]", flush=True)
+
+                # Release any unconsumed allocated stock back to available pool
+                if self.is_inventory_allocated and self.bill_of_material:
+                    for item in self.bill_of_material.items.all():
+                        line = self.material_lines.filter(component=item.component).first()
+                        actual_consumed = line.quantity_actual if line else Decimal('0.00')
+                        per_unit_req = item.quantity_required or Decimal('0.00')
+                        expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+                        unconsumed_alloc = expected_allocated_qty - actual_consumed
+                        if unconsumed_alloc > Decimal('0.00'):
+                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                                product=item.component,
+                                defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                            )
+                            old_alloc = raw_inv.quantity_allocated
+                            old_avail = raw_inv.quantity_available
+
+                            released = min(unconsumed_alloc, raw_inv.quantity_allocated)
+                            raw_inv.quantity_allocated -= released
+                            raw_inv.quantity_available += released
+                            raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                            print(f"   ✓ [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Unused={released}", flush=True)
+                            print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
+
+                # Record Finished Goods Output
+                finished_qty = self.quantity_produced or target_qty or Decimal('0.00')
                 if finished_qty > Decimal('0.00'):
                     finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=self.product,
@@ -668,7 +772,7 @@ class WorkOrder(models.Model):
                         transaction_type='PRODUCTION_OUTPUT',
                         work_order=self
                     )
-                    print(f"   ✓ ADDED FINISHED GOODS ({self.product.name}): +{finished_qty} | Stock: {old_qty} -> {finished_inv.quantity_available}", flush=True)
+                    print(f"   ✓ [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
 
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
@@ -929,15 +1033,7 @@ class MaterialVarianceRecord(models.Model):
         if line.work_order and line.work_order.bill_of_material:
             bom_item = line.work_order.bill_of_material.items.filter(component=line.component).first()
             if bom_item:
-                from .models import ProductionOrder
-                po = ProductionOrder.objects.filter(work_order=line.work_order).first()
-                if po and po.quantity and po.quantity > Decimal('0.00'):
-                    target_qty = po.quantity
-                elif line.work_order.quantity_produced and line.work_order.quantity_produced > Decimal('0.00'):
-                    target_qty = line.work_order.quantity_produced
-                else:
-                    target_qty = Decimal('1.00')
-
+                target_qty = line.work_order.target_quantity
                 expected = (bom_item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         qty_var = (actual - expected).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
