@@ -4,7 +4,7 @@ from django.http import JsonResponse
 from django.contrib.admin.views.decorators import staff_member_required
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
-    ProductionOrder, SalesInvoice, Return, LossRecord, FinanceEntry, 
+    ProductionOrder, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, 
     Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder,
     PurchaseOrder
 )
@@ -74,12 +74,15 @@ def finance_entry_form(request):
 def loss_record_form(request):
     if request.method == 'POST':
         product_id = request.POST.get('product_id')
-        quantity_lost = request.POST.get('quantity_lost')
-        loss_date = request.POST.get('loss_date')
+        quantity_variance = request.POST.get('quantity_lost') or request.POST.get('quantity_variance')
         reason = request.POST.get('reason')
-        LossRecord.objects.create(product_id=product_id, quantity_lost=quantity_lost, loss_date=loss_date, reason=reason)
-        messages.success(request, 'Loss record added successfully!')
-    loss_records = LossRecord.objects.all()
+        MaterialVarianceRecord.objects.create(
+            product_id=product_id,
+            quantity_variance=quantity_variance,
+            notes=reason
+        )
+        messages.success(request, 'Material variance record added successfully!')
+    loss_records = MaterialVarianceRecord.objects.all()
     return render(request, 'core/loss_record_form.html', {'loss_records': loss_records})
 
 def procurement_form(request):

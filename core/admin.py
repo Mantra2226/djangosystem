@@ -4,8 +4,9 @@ from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
 from django import forms
-from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, Return, LossRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
+from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
 )
+from decimal import Decimal
 
 admin.register(Supplier)
 admin.register(Product)
@@ -49,39 +50,9 @@ class BOMItemInline(admin.TabularInline):
 
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
-    readonly_fields = ('quantity_expected', 'quantity_issued', 'get_variance', 'get_cost_variance')
+    readonly_fields = ('quantity_expected', 'quantity_issued')
     extra = 0  # Don't show empty lines by default
-    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued', 'get_variance', 'get_cost_variance')  
-
-    @admin.display(description='Material Usage Variance')
-    def get_variance(self, instance):
-        if instance.pk:
-            var = instance.variance
-            pct = instance.variance_percentage
-            sign = "+" if var > 0 else ""
-            if var > 0:
-                return format_html(
-                    '<span style="color: #c53030; font-weight: bold; background: #fff5f5; padding: 2px 6px; border-radius: 4px;">{}{} ({}{}%) — Over-consumption</span>',
-                    sign, var, sign, pct
-                )
-            elif var < 0:
-                return format_html(
-                    '<span style="color: #27ae60; font-weight: bold; background: #e8f8f5; padding: 2px 6px; border-radius: 4px;">{} ({}%) — Efficient Savings</span>',
-                    var, pct
-                )
-            return format_html('<span style="color: #4a5568; font-weight: bold;">0.00 (0.00%) — Exact Match</span>')
-        return "-"  
-
-    @admin.display(description='Financial Cost Impact')
-    def get_cost_variance(self, instance):
-        if instance.pk:
-            cost = instance.cost_variance
-            if cost > 0:
-                return format_html('<span style="color: #c53030; font-weight: bold;">+${:,.2f}</span>', cost)
-            elif cost < 0:
-                return format_html('<span style="color: #27ae60; font-weight: bold;">-${:,.2f}</span>', abs(cost))
-            return "$0.00"
-        return "-"  
+    fields = ('component', 'quantity_expected', 'quantity_actual', 'quantity_issued')  
 
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
@@ -455,7 +426,8 @@ class SalesInvoiceAdmin(admin.ModelAdmin):
     def get_remaining_balance(self, obj):
         bal = obj.remaining_balance
         if bal > 0:
-            return format_html('<span style="color: #c53030; font-weight: bold;">${:,.2f}</span>', bal)
+            formatted_bal = f"{bal:,.2f}"
+            return format_html('<span style="color: #c53030; font-weight: bold;">${}</span>', formatted_bal)
         return "$0.00"
 
 @admin.register(PurchaseInvoice)
@@ -718,28 +690,30 @@ class WorkOrderAdmin(admin.ModelAdmin):
             obj.get_status_display()
         )
 
-@admin.register(LossRecord)
-class LossRecordAdmin(admin.ModelAdmin):
-    list_display = ('loss_id', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_lost', 'get_cost_impact', 'get_status_badge', 'recorded_at')
-    list_filter = ['loss_type', 'recorded_at']
-    search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
-    readonly_fields = ('work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_lost', 'unit_cost', 'financial_loss', 'variance_percentage', 'efficiency_rate', 'loss_type', 'notes', 'recorded_at')
+@admin.register(MaterialVarianceRecord)
+class MaterialVarianceRecordAdmin(admin.ModelAdmin):
+    list_display = ('variance_code', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'get_classification_badge', 'recorded_at')
+    list_filter = ['variance_classification', 'recorded_at']
+    search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
+    readonly_fields = ('variance_code', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
 
     @admin.display(description='Financial Impact')
-    def get_cost_impact(self, obj):
-        cost = obj.financial_loss
+    def get_financial_impact(self, obj):
+        cost = obj.financial_impact or Decimal('0.00')
         if cost > 0:
-            return format_html('<span style="color: #c53030; font-weight: bold;">+${:,.2f}</span>', cost)
+            formatted_cost = f"{cost:,.2f}"
+            return format_html('<span style="color: #c53030; font-weight: bold;">+${}</span>', formatted_cost)
         elif cost < 0:
-            return format_html('<span style="color: #27ae60; font-weight: bold;">-${:,.2f}</span>', abs(cost))
+            formatted_cost = f"{abs(cost):,.2f}"
+            return format_html('<span style="color: #27ae60; font-weight: bold;">-${}</span>', formatted_cost)
         return "$0.00"
 
-    @admin.display(description='Variance Category')
-    def get_status_badge(self, obj):
-        if obj.loss_type == 'OVER_CONSUMPTION':
-            return format_html('<span style="color: #c53030; font-weight: bold; background: #fff5f5; padding: 2px 6px; border-radius: 4px;">Over-consumption</span>')
-        elif obj.loss_type == 'EFFICIENT_SAVINGS':
-            return format_html('<span style="color: #27ae60; font-weight: bold; background: #e8f8f5; padding: 2px 6px; border-radius: 4px;">Efficient Savings</span>')
+    @admin.display(description='Variance Classification')
+    def get_classification_badge(self, obj):
+        if obj.variance_classification == 'UNFAVOURABLE':
+            return format_html('<span style="color: #c53030; font-weight: bold; background: #fff5f5; padding: 2px 6px; border-radius: 4px;">Unfavourable (Scrap/Waste)</span>')
+        elif obj.variance_classification == 'FAVOURABLE':
+            return format_html('<span style="color: #27ae60; font-weight: bold; background: #e8f8f5; padding: 2px 6px; border-radius: 4px;">Favourable (Efficiency/Saved)</span>')
         return format_html('<span style="color: #4a5568; font-weight: bold;">Exact Match</span>')
 
 

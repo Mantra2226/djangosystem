@@ -176,24 +176,30 @@ class MRPEngineTestCase(TestCase):
             production_start_date=timezone.now().date()
         )
         line = wo.material_lines.get(component=self.raw_mat)
-        line.quantity_expected = Decimal("50.00")
+        self.assertEqual(line.quantity_expected, Decimal("50.00"))
+        self.assertEqual(line.quantity_actual, Decimal("50.00"))
+
+        # 1. Update actual to 55.00 (+5.00 unfavourable scrap)
         line.quantity_actual = Decimal("55.00")
         line.save()
 
-        self.assertEqual(line.variance, Decimal("5.00"))
-        self.assertEqual(line.variance_percentage, Decimal("10.00"))
-        self.assertEqual(line.cost_variance, Decimal("75.00"))
-        self.assertEqual(line.variance_status, "OVER_CONSUMPTION")
-        self.assertIn("+5.00 (+10.00%)", line.variance_summary)
+        from .models import MaterialVarianceRecord
+        var_rec = MaterialVarianceRecord.objects.get(work_order_material_line=line)
+        self.assertTrue(var_rec.variance_code.startswith("MVR-"))
+        self.assertEqual(var_rec.quantity_expected, Decimal("50.00"))
+        self.assertEqual(var_rec.quantity_actual, Decimal("55.00"))
+        self.assertEqual(var_rec.quantity_variance, Decimal("5.00"))
+        self.assertEqual(var_rec.financial_impact, Decimal("75.00"))
+        self.assertEqual(var_rec.variance_classification, "UNFAVOURABLE")
 
-        # Verify automated LossRecord creation & accuracy
-        from .models import LossRecord
-        loss_rec = LossRecord.objects.get(work_order_material_line=line)
-        self.assertEqual(loss_rec.quantity_lost, Decimal("5.00"))
-        self.assertEqual(loss_rec.financial_loss, Decimal("75.00"))
-        self.assertEqual(loss_rec.variance_percentage, Decimal("10.00"))
-        self.assertEqual(loss_rec.efficiency_rate, Decimal("90.91"))
-        self.assertEqual(loss_rec.loss_type, "OVER_CONSUMPTION")
+        # 2. Update actual to 48.00 (-2.00 favourable efficiency)
+        line.quantity_actual = Decimal("48.00")
+        line.save()
+
+        var_rec.refresh_from_db()
+        self.assertEqual(var_rec.quantity_variance, Decimal("-2.00"))
+        self.assertEqual(var_rec.financial_impact, Decimal("-30.00"))
+        self.assertEqual(var_rec.variance_classification, "FAVOURABLE")
 
     def test_production_order_code_auto_generation(self):
         wo = WorkOrder.objects.create(

@@ -753,6 +753,52 @@ class WorkOrder(models.Model):
         print("[HYBRID INVENTORY ENGINE END]")
         print("==================================================\n")
 
+    def sync_material_lines(self):
+        """
+        Recalculates quantity_expected for all material lines based on the target batch quantity:
+        1. Linked ProductionOrder quantity
+        2. OR self.quantity_produced
+        3. Default fallback: 1.00 if unassigned draft
+        """
+        if not self.bill_of_material:
+            return
+
+        from .models import ProductionOrder
+        po = ProductionOrder.objects.filter(work_order=self).first()
+
+        if po and po.quantity and po.quantity > Decimal('0.00'):
+            target_qty = po.quantity
+        elif self.quantity_produced and self.quantity_produced > Decimal('0.00'):
+            target_qty = self.quantity_produced
+        else:
+            target_qty = Decimal('1.00')
+
+        for item in self.bill_of_material.items.all():
+            per_unit_req = item.quantity_required or Decimal('0.00')
+            total_expected = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+            line = self.material_lines.filter(component=item.component).first()
+            if not line:
+                WorkOrderMaterialLine.objects.create(
+                    work_order=self,
+                    component=item.component,
+                    quantity_expected=total_expected,
+                    quantity_actual=total_expected,
+                    quantity_issued=Decimal('0.00')
+                )
+            else:
+                need_save = False
+                if line.quantity_expected != total_expected:
+                    line.quantity_expected = total_expected
+                    need_save = True
+
+                if line.quantity_actual == Decimal('0.00'):
+                    line.quantity_actual = total_expected
+                    need_save = True
+
+                if need_save:
+                    line.save()
+
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         print("\n==================================================")
@@ -785,37 +831,9 @@ class WorkOrder(models.Model):
         super().save(*args, **kwargs)
         print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})")
 
-        # INITIALIZE MATERIAL LINES ON CREATION ONLY
-        if is_new and self.bill_of_material:
-            print("[LOG] Creating initial material lines from BOM...")
-            
-            # Direct Query to find linked ProductionOrder quantity
-            from .models import ProductionOrder
-            po = ProductionOrder.objects.filter(work_order=self).first()
-            
-            if po and po.quantity:
-                target_qty = po.quantity
-            elif self.quantity_produced and self.quantity_produced > Decimal('0.00'):
-                target_qty = self.quantity_produced
-            else:
-                target_qty = Decimal('1.00')
-
-            print(f"[LOG] Calculated Target Batch Quantity: {target_qty}")
-
-            for item in self.bill_of_material.items.all():
-                per_unit_req = item.quantity_required or Decimal('0.00')
-                total_expected = per_unit_req * target_qty
-                
-                line, created = WorkOrderMaterialLine.objects.get_or_create(
-                    work_order=self,
-                    component=item.component,
-                    defaults={
-                        'quantity_expected': total_expected, 
-                        'quantity_actual': Decimal('0.00'),
-                        'quantity_issued': Decimal('0.00')
-                    }
-                )
-                print(f"      Created material line for {item.component.name}: Expected={total_expected}")
+        # INITIALIZE / SYNC MATERIAL LINES FROM BOM
+        if self.bill_of_material:
+            self.sync_material_lines()
 
         # AUTOMATED PRODUCTION ORDER STATUS SYNC
         if self.pk:
@@ -837,11 +855,10 @@ class WorkOrder(models.Model):
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
-   
 
 class BillOfMaterial(models.Model):
     bom_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']}, help_text="The finished or intermediate good this recipe creates.")
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']}, help_text="Finished or Intermediate product this build recipe belongs to.")
     name = models.CharField(max_length=255, blank=True, help_text="name is auto-generated after the selected product if left blank.")
     is_active = models.BooleanField(default=True, help_text="Designates whether this is the active recipe used for live manufacturing runs.")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -918,80 +935,6 @@ class WorkOrderMaterialLine(models.Model):
         verbose_name = "Work Order Material Line"
         verbose_name_plural = "Work Order Material Lines"
 
-    @property
-    def variance(self):
-        if hasattr(self, 'loss_record') and self.loss_record:
-            return self.loss_record.quantity_lost
-        actual = self.quantity_actual or Decimal('0.00')
-        expected = self.quantity_expected or Decimal('0.00')
-        return (actual - expected).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-    @property
-    def variance_percentage(self):
-        if hasattr(self, 'loss_record') and self.loss_record:
-            return self.loss_record.variance_percentage
-        expected = self.quantity_expected or Decimal('0.00')
-        if expected <= Decimal('0.00'):
-            return Decimal('0.00')
-        pct = (self.variance / expected) * Decimal('100.00')
-        return pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-    @property
-    def unit_cost(self):
-        if hasattr(self, 'loss_record') and self.loss_record:
-            return self.loss_record.unit_cost
-        if self.component:
-            inv = self.component.stock.first()
-            if inv and inv.unit_cost:
-                return inv.unit_cost
-        return Decimal('0.00')
-
-    @property
-    def cost_variance(self):
-        if hasattr(self, 'loss_record') and self.loss_record:
-            return self.loss_record.financial_loss
-        cost = self.variance * self.unit_cost
-        return cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-    @property
-    def waste(self):
-        return max(Decimal('0.00'), self.variance)
-
-    @property
-    def efficiency_rate(self):
-        if hasattr(self, 'loss_record') and self.loss_record:
-            return self.loss_record.efficiency_rate
-        actual = self.quantity_actual or Decimal('0.00')
-        expected = self.quantity_expected or Decimal('0.00')
-        if actual <= Decimal('0.00'):
-            return Decimal('100.00')
-        rate = (expected / actual) * Decimal('100.00')
-        return rate.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-    @property
-    def variance_status(self):
-        if hasattr(self, 'loss_record') and self.loss_record:
-            return self.loss_record.loss_type
-        var = self.variance
-        if var > Decimal('0.00'):
-            return 'OVER_CONSUMPTION'
-        elif var < Decimal('0.00'):
-            return 'SAVINGS'
-        return 'EXACT'
-
-    @property
-    def variance_summary(self):
-        var = self.variance
-        pct = self.variance_percentage
-        cost = self.cost_variance
-        
-        sign = "+" if var > 0 else ""
-        if var > 0:
-            return f"{sign}{var:.2f} ({sign}{pct:.2f}%) — Over-consumption (+${cost:.2f} Cost Impact)"
-        elif var < 0:
-            return f"{var:.2f} ({pct:.2f}%) — Savings (${abs(cost):.2f} Saved)"
-        return "0.00 (0.00%) — Exact Match"
-
     def clean(self):
         super().clean()
         # Fallback: Auto-calculate quantity_expected if blank but BOM/WorkOrder exists
@@ -1004,33 +947,32 @@ class WorkOrderMaterialLine(models.Model):
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
-        LossRecord.sync_from_material_line(self)
+        MaterialVarianceRecord.sync_from_material_line(self)
 
     def __str__(self):
         return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
 
-class LossRecord(models.Model):
-    LOSS_TYPE_CHOICES = [
-        ('OVER_CONSUMPTION', 'Material Over-consumption / Scrap'),
-        ('EFFICIENT_SAVINGS', 'Material Savings / Efficiency'),
+class MaterialVarianceRecord(models.Model):
+    VARIANCE_CLASSIFICATION_CHOICES = [
+        ('FAVOURABLE', 'Favourable (Material Efficiency / Saved)'),
+        ('UNFAVOURABLE', 'Unfavourable (Waste / Over-consumption / Scrap)'),
         ('EXACT', 'Exact Match / Zero Variance'),
-        ('DAMAGE', 'Physical Damage / Spoilage'),
-        ('EXPIRATION', 'Expired Stock'),
     ]
 
-    loss_id = models.AutoField(primary_key=True)
+    variance_id = models.AutoField(primary_key=True)
+    variance_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique material variance code.")
     work_order_material_line = models.OneToOneField(
         'WorkOrderMaterialLine',
         on_delete=models.CASCADE,
-        related_name='loss_record',
+        related_name='variance_record',
         null=True,
         blank=True,
-        help_text="The work order material line this usage variance originates from."
+        help_text="The work order material line this material variance originates from."
     )
     work_order = models.ForeignKey(
         'WorkOrder',
         on_delete=models.CASCADE,
-        related_name='loss_records',
+        related_name='variance_records',
         null=True,
         blank=True,
         help_text="Parent Work Order."
@@ -1038,18 +980,18 @@ class LossRecord(models.Model):
     product = models.ForeignKey(
         'Product',
         on_delete=models.PROTECT,
-        related_name='loss_records',
-        help_text="Component product associated with this loss/variance record."
+        related_name='variance_records',
+        help_text="Component product associated with this variance record."
     )
     quantity_expected = models.DecimalField(
         max_digits=10, decimal_places=2, default=Decimal('0.00'),
-        help_text="Planned / theoretical BOM quantity required."
+        help_text="Planned / allocated BOM quantity required for this production run."
     )
     quantity_actual = models.DecimalField(
         max_digits=10, decimal_places=2, default=Decimal('0.00'),
         help_text="Actual physical quantity consumed during production."
     )
-    quantity_lost = models.DecimalField(
+    quantity_variance = models.DecimalField(
         max_digits=10, decimal_places=2, default=Decimal('0.00'),
         help_text="Quantity variance (quantity_actual - quantity_expected)."
     )
@@ -1057,9 +999,9 @@ class LossRecord(models.Model):
         max_digits=10, decimal_places=2, default=Decimal('0.00'),
         help_text="Unit cost of component at time of variance calculation."
     )
-    financial_loss = models.DecimalField(
+    financial_impact = models.DecimalField(
         max_digits=10, decimal_places=2, default=Decimal('0.00'),
-        help_text="Financial cost impact (quantity_lost * unit_cost)."
+        help_text="Calculated financial impact (quantity_variance * unit_cost)."
     )
     variance_percentage = models.DecimalField(
         max_digits=10, decimal_places=2, default=Decimal('0.00'),
@@ -1069,14 +1011,31 @@ class LossRecord(models.Model):
         max_digits=10, decimal_places=2, default=Decimal('100.00'),
         help_text="Material utilization efficiency rate percentage."
     )
-    loss_type = models.CharField(
-        max_length=50, choices=LOSS_TYPE_CHOICES, default='EXACT'
+    variance_classification = models.CharField(
+        max_length=20, choices=VARIANCE_CLASSIFICATION_CHOICES, default='EXACT'
     )
-    loss_date = models.DateField(default=timezone.now)
-    loss_location = models.CharField(max_length=255, default='Main Warehouse')
-    reason = models.TextField(blank=True, help_text="Reason or notes for loss/variance.")
-    notes = models.TextField(blank=True, help_text="Audit notes or breakdown for this variance record.")
     recorded_at = models.DateTimeField(auto_now=True)
+    notes = models.TextField(blank=True, help_text="Audit notes or breakdown for this variance record.")
+
+    def save(self, *args, **kwargs):
+        if not self.variance_code:
+            prefix = "MVR"
+            last_rec = MaterialVarianceRecord.objects.filter(
+                variance_code__startswith=prefix
+            ).order_by('variance_id').last()
+
+            if last_rec and last_rec.variance_code:
+                try:
+                    last_seq = int(last_rec.variance_code.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+
+            self.variance_code = f"{prefix}-{new_seq:04d}"
+
+        super().save(*args, **kwargs)
 
     @classmethod
     def sync_from_material_line(cls, line):
@@ -1096,7 +1055,7 @@ class LossRecord(models.Model):
         cost_impact = (qty_var * unit_cost).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         if expected > Decimal('0.00'):
-            pct = ((qty_var) / expected) * Decimal('100.00')
+            pct = (qty_var / expected) * Decimal('100.00')
             pct = pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         else:
             pct = Decimal('0.00')
@@ -1108,48 +1067,49 @@ class LossRecord(models.Model):
             eff = Decimal('100.00')
 
         if qty_var > Decimal('0.00'):
-            l_type = 'OVER_CONSUMPTION'
+            v_class = 'UNFAVOURABLE'
         elif qty_var < Decimal('0.00'):
-            l_type = 'EFFICIENT_SAVINGS'
+            v_class = 'FAVOURABLE'
         else:
-            l_type = 'EXACT'
+            v_class = 'EXACT'
 
-        loss_rec, created = cls.objects.get_or_create(
+        rec, created = cls.objects.get_or_create(
             work_order_material_line=line,
             defaults={
                 'work_order': line.work_order,
                 'product': line.component,
                 'quantity_expected': expected,
                 'quantity_actual': actual,
-                'quantity_lost': qty_var,
+                'quantity_variance': qty_var,
                 'unit_cost': unit_cost,
-                'financial_loss': cost_impact,
+                'financial_impact': cost_impact,
                 'variance_percentage': pct,
                 'efficiency_rate': eff,
-                'loss_type': l_type,
+                'variance_classification': v_class,
                 'notes': f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
             }
         )
 
         if not created:
-            loss_rec.work_order = line.work_order
-            loss_rec.product = line.component
-            loss_rec.quantity_expected = expected
-            loss_rec.quantity_actual = actual
-            loss_rec.quantity_lost = qty_var
-            loss_rec.unit_cost = unit_cost
-            loss_rec.financial_loss = cost_impact
-            loss_rec.variance_percentage = pct
-            loss_rec.efficiency_rate = eff
-            loss_rec.loss_type = l_type
-            loss_rec.notes = f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
-            loss_rec.save()
+            rec.work_order = line.work_order
+            rec.product = line.component
+            rec.quantity_expected = expected
+            rec.quantity_actual = actual
+            rec.quantity_variance = qty_var
+            rec.unit_cost = unit_cost
+            rec.financial_impact = cost_impact
+            rec.variance_percentage = pct
+            rec.efficiency_rate = eff
+            rec.variance_classification = v_class
+            rec.notes = f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
+            rec.save()
 
-        return loss_rec
+        return rec
 
     def __str__(self):
-        sign = "+" if self.quantity_lost > 0 else ""
-        return f"Loss Record #{self.loss_id} — {self.product.name} ({sign}{self.quantity_lost:.2f} units, ${self.financial_loss:.2f})"
+        code = self.variance_code or f"MVR-{self.variance_id:04d}"
+        sign = "+" if self.quantity_variance > 0 else ""
+        return f"{code} — {self.product.name} ({sign}{self.quantity_variance:.2f} units, ${self.financial_impact:.2f})"
 
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
@@ -1774,7 +1734,7 @@ class PurchaseInvoice(models.Model):
         """Calculates total payments made for this purchase invoice."""
         if not self.pk:
             return Decimal('0.00')
-        total = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        total = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
         return Decimal(str(total)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     @property
@@ -1792,7 +1752,7 @@ class PurchaseInvoice(models.Model):
         if total_paid >= invoice_total and invoice_total > Decimal('0.00'):
             self.status = 'PAID'
             if not self.paid_date:
-                latest = self.purchase_payments.order_by('-paid_at').first()
+                latest = self.payments.order_by('-paid_at').first()
                 if latest and latest.paid_at:
                     self.paid_date = latest.paid_at.date()
                 else:
@@ -1819,30 +1779,36 @@ class PurchaseInvoice(models.Model):
         inv_number = self.invoice_number or "New"
         return f"Purchase Invoice #{inv_number} — ${invoice_total} ({supplier_name})"
 class PurchasePayment(models.Model):
-    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='purchase_payments')
-    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))])
-    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card Transfer'), ('TRANSFER', 'Bank Transfer')])
-    reference_number = models.CharField(max_length=100, blank=True, null=True, help_text="Transaction reference/receipt ID for Bank and Mobile money transfers")
-    paid_at = models.DateTimeField(auto_now_add=True)
+    PAYMENT_METHOD_CHOICES = [
+        ('CASH', 'Cash'),
+        ('TRANSFER', 'Bank Transfer'),
+        ('CHEQUE', 'Cheque'),
+    ]
+
+    payment_id = models.AutoField(primary_key=True)
+    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='payments')
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default='TRANSFER')
+    paid_at = models.DateTimeField(default=timezone.now)
+    reference_number = models.CharField(max_length=100, blank=True, null=True, default='')
 
     def clean(self):
-        super().clean()        
-        # Normalizing the payment method to uppercase to handle any casing variations
-        method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
-        ref_num = (self.reference_number or '').strip()
-        method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
-        ref_num = (self.reference_number or '').strip()
+        super().clean()
+        if self.purchase_invoice_id and self.amount:
+            already_paid = self.purchase_invoice.payments.exclude(pk=self.pk).aggregate(
+                total=models.Sum('amount')
+            )['total'] or Decimal('0.00')
+            remaining = (self.purchase_invoice.total_amount or Decimal('0.00')) - already_paid
+            if self.amount > remaining:
+                raise ValidationError({
+                    'amount': f"Payment of ${self.amount} exceeds remaining bill balance of ${remaining:.2f}."
+                })
 
-        requires_reference = ['CARD', 'BANK']
-
-        if method in requires_reference and not ref_num:
+        if self.payment_method in ['TRANSFER', 'CHEQUE'] and not self.reference_number:
             raise ValidationError({
                 'reference_number': "A reference number (transaction ID or deposit confirmation) is required for payments made by card or bank transfer."
             })
+
     def save(self, *args, **kwargs):
         # Keeps native Django field validations active
         self.full_clean()
@@ -1854,8 +1820,8 @@ class PurchasePayment(models.Model):
         with transaction.atomic():
             invoice = self.purchase_invoice
             super().delete(*args, **kwargs)
-            invoice.update_payment_status()    
-     
+            invoice.update_payment_status()
+
 class Return(models.Model):
     STATUS_TYPE_CHOICES = [
          ('PENDING', 'Pending Inspection'),
@@ -1870,7 +1836,7 @@ class Return(models.Model):
     
     quality_control_status = models.CharField(max_length=255, choices=STATUS_TYPE_CHOICES, default='PENDING')
     return_warehouse_location = models.CharField(max_length=255, default='Main Warehouse')
-        # validation to ensure that quantity returned does not exceed quantity dispatched in the dispatch record
+
     def save(self, *args, **kwargs):
         # 1. Secure our references (handles whether production_order is a direct field or accessed via dispatch)
         prod_order = getattr(self, 'production_order', None) or (self.dispatch.production_order if self.dispatch else None)
@@ -1919,9 +1885,7 @@ class Return(models.Model):
                 invoice_record = SalesInvoice.objects.filter(dispatch=self.dispatch).first()
                 if invoice_record and invoice_record.total_amount and prod_order:
                     raw_return_value = self.quantity_returned * prod_order.product.cost_per_unit
-                    
                     return_value = raw_return_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    
                     invoice_record.total_amount -= return_value
                     # Extra safety shield: ensure the final invoice total is cleanly quantized too
                     invoice_record.total_amount = invoice_record.total_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -1948,24 +1912,22 @@ class FinanceEntry(models.Model):
     category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     sales_invoice = models.ForeignKey('SalesInvoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
-    loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
-    loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
+    material_variance = models.ForeignKey('MaterialVarianceRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
     entry_date = models.DateField()
 
-    # validation to ensure that if entry type is 'Revenue', category cannot be 'Procurement' or 'Loss', and if entry type is 'Expense', category cannot be 'Sales'
     def clean(self):
         # 1. Prevent negative entries from skewing totals
         if self.entry_type == 'REVENUE' and self.category in ['PROCUREMENT', 'LOSS', 'LABOR', 'OVERHEAD']:
             raise ValidationError(f"A Revenue entry cannot be categorized under {self.get_category_display()}.")
         if self.entry_type == 'EXPENSE' and self.category == 'SALES':
             raise ValidationError("An Expense entry cannot be categorized under Sales Revenue.")
-        if self.loss and (self.entry_type != 'EXPENSE' and self.category != 'LOSS'):
-            raise ValidationError("Entries tied to a Loss Record must be set as an Expense under the Loss category.")
+        if self.material_variance and (self.entry_type != 'EXPENSE' and self.category != 'LOSS'):
+            raise ValidationError("Entries tied to a Material Variance Record must be set as an Expense under the Loss category.")
     
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
+
     def __str__(self):
         return f"[{self.get_entry_type_display()}] ${self.amount} — {self.get_category_display()} ({self.entry_date})"
-    
