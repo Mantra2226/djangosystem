@@ -1405,8 +1405,8 @@ class SalesOrderItem(models.Model):
         return qty * self.unit_price
 
     def update_dispatched_quantity(self):
-        """Recalculates the exact sum of all related delivered dispatches from the ground truth."""
-        total = self.dispatch_records.filter(status='delivered').aggregate(
+        """Recalculates the exact sum of all related shipped/delivered dispatches from the ground truth."""
+        total = self.dispatch_records.filter(status__in=['shipped', 'delivered']).aggregate(
             total_dispatched=Sum('quantity_dispatched')
         )['total_dispatched'] or Decimal('0.00')
         
@@ -1456,18 +1456,25 @@ class DispatchRecord(models.Model):
         if not self.product or not self.quantity_dispatched or not self.sales_order_item:
             return
 
-        diff = self.quantity_dispatched - self._orig_quantity
+        was_deducted_before = self._orig_status in ['shipped', 'delivered']
+        is_deducting_now = self.status in ['shipped', 'delivered']
         
-        if diff > 0 and self.product:
-            inventory = Inventory.objects.filter(product=self.product).first()
-            current_available = inventory.quantity_available if inventory else Decimal('0.00')
+        if is_deducting_now:
+            if was_deducted_before:
+                diff = self.quantity_dispatched - self._orig_quantity
+            else:
+                diff = self.quantity_dispatched
             
-            if diff > current_available:
-                raise ValidationError({
-                    'quantity_dispatched': f"Insufficient stock available! You requested {self.quantity_dispatched} "
-                                           f"(Net addition of +{diff}), but only {current_available} units of "
-                                           f"'{self.product.name}' are currently available in inventory."
-                })
+            if diff > Decimal('0.00') and self.product:
+                inventory = Inventory.objects.filter(product=self.product).first()
+                current_available = inventory.quantity_available if inventory else Decimal('0.00')
+                
+                if diff > current_available:
+                    raise ValidationError({
+                        'quantity_dispatched': f"Insufficient stock available! You requested {self.quantity_dispatched} "
+                                               f"(Net addition of +{diff}), but only {current_available} units of "
+                                               f"'{self.product.name}' are currently available in inventory."
+                    })
 
     def save(self, *args, **kwargs):
         # Auto-generate unique dispatch code if missing
@@ -1489,15 +1496,20 @@ class DispatchRecord(models.Model):
             self.dispatch_code = f"{prefix}-{new_seq:04d}"
 
         # Status Automation & Stock Deductions
-        becoming_delivered = (self.status == 'delivered' and self._orig_status != 'delivered')
-        leaving_delivered = (self.status != 'delivered' and self._orig_status == 'delivered')
-        quantity_changed = (self.quantity_dispatched != self._orig_quantity and self.status == 'delivered')
+        was_deducted_before = self._orig_status in ['shipped', 'delivered']
+        is_deducting_now = self.status in ['shipped', 'delivered']
 
-        if becoming_delivered:
+        becoming_deducted = is_deducting_now and not was_deducted_before
+        leaving_deducted = not is_deducting_now and was_deducted_before
+        quantity_changed = is_deducting_now and was_deducted_before and (self.quantity_dispatched != self._orig_quantity)
+
+        if is_deducting_now:
             self.is_stock_deducted = True
-            if not self.delivery_date:
+            if self.status == 'delivered' and not self.delivery_date:
                 self.delivery_date = timezone.now().date()
-        elif leaving_delivered:
+            elif self.status != 'delivered':
+                self.delivery_date = None
+        else:
             self.is_stock_deducted = False
             self.delivery_date = None
 
@@ -1506,15 +1518,19 @@ class DispatchRecord(models.Model):
         with transaction.atomic():
             super().save(*args, **kwargs)
 
-            if becoming_delivered:
+            if becoming_deducted:
                 self._apply_stock_change(self.quantity_dispatched)
-            elif leaving_delivered:
+            elif leaving_deducted:
                 self._apply_stock_change(-self._orig_quantity)
             elif quantity_changed:
                 diff = self.quantity_dispatched - self._orig_quantity
                 self._apply_stock_change(diff)
 
             self._sync_parent_order_status()
+
+            # Refresh original tracked values for instance reuse
+            self._orig_quantity = self.quantity_dispatched
+            self._orig_status = self.status
 
     def _apply_stock_change(self, qty_to_deduct):
         """
@@ -1544,7 +1560,7 @@ class DispatchRecord(models.Model):
     def _sync_parent_order_status(self):
         total_shipped = DispatchRecord.objects.filter(
             sales_order_item=self.sales_order_item,
-            status='delivered'
+            status__in=['shipped', 'delivered']
         ).aggregate(total=Sum('quantity_dispatched'))['total'] or Decimal('0.00')
         
         sales_order_item = self.sales_order_item

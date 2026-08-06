@@ -287,7 +287,7 @@ class MRPEngineTestCase(TestCase):
         self.assertEqual(item.unit_price, Decimal("500.00"))
         self.assertEqual(item.total_price, Decimal("5000.00"))
 
-        # 3. Partial dispatch -> status transitions to partially_dispatched
+        # 3. Partial dispatch via 'shipped' status -> triggers stock deduction & status transitions to partially_dispatched
         inv, _ = Inventory.objects.get_or_create(product=self.finished_good)
         inv.quantity_available = Decimal("20.00")
         inv.save()
@@ -297,23 +297,32 @@ class MRPEngineTestCase(TestCase):
             product=self.finished_good,
             quantity_dispatched=Decimal("4.00"),
             dispatch_date=timezone.now().date(),
-            status="delivered"
+            status="shipped"
         )
         self.assertEqual(d1.dispatch_code, "DISP-0001")
         self.assertTrue(d1.is_stock_deducted)
-        self.assertIsNotNone(d1.delivery_date)
+        inv.refresh_from_db()
+        self.assertEqual(inv.quantity_available, Decimal("16.00"))  # 20 - 4 = 16
         so.refresh_from_db()
         self.assertEqual(so.status, "partially_dispatched")
 
-        # 4. Full dispatch -> status transitions to completed
+        # Move d1 to delivered -> sets delivery_date
+        d1.status = "delivered"
+        d1.save()
+        self.assertIsNotNone(d1.delivery_date)
+
+        # 4. Full dispatch via 'shipped' -> status transitions to completed
         d2 = DispatchRecord.objects.create(
             sales_order_item=item,
             product=self.finished_good,
             quantity_dispatched=Decimal("6.00"),
             dispatch_date=timezone.now().date(),
-            status="delivered"
+            status="shipped"
         )
         self.assertEqual(d2.dispatch_code, "DISP-0002")
+        self.assertTrue(d2.is_stock_deducted)
+        inv.refresh_from_db()
+        self.assertEqual(inv.quantity_available, Decimal("10.00"))  # 16 - 6 = 10
         so.refresh_from_db()
         self.assertEqual(so.status, "completed")
 
