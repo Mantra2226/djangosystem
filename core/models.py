@@ -1437,7 +1437,8 @@ class DispatchRecord(models.Model):
     ]
     dispatch_id = models.AutoField(primary_key=True)  
     dispatch_code = models.CharField(max_length=30, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique dispatch code (e.g. DISP-0001).")
-    sales_order_item = models.ForeignKey('SalesOrderItem', on_delete=models.PROTECT, related_name='dispatch_records')
+    customer = models.ForeignKey('Customer', on_delete=models.PROTECT, related_name='dispatch_records', null=True, blank=True, help_text="Customer receiving this dispatch (must match Sales Order customer).")
+    sales_order_item = models.ForeignKey('SalesOrderItem', on_delete=models.PROTECT, related_name='dispatch_records', limit_choices_to={'sales_order__status__in': ['draft', 'approved', 'partially_dispatched']}, help_text="Only active, non-completed sales order items can be selected for dispatch.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
     dispatch_date = models.DateField(default=timezone.now)
@@ -1452,6 +1453,31 @@ class DispatchRecord(models.Model):
     
     def clean(self):
         super().clean()
+
+        if self.sales_order_item:
+            so = self.sales_order_item.sales_order
+            expected_product = self.sales_order_item.product
+
+            if so:
+                # 1. Disallow dispatching to completed or cancelled sales orders for new dispatches
+                if not self.pk and so.status in ['completed', 'cancelled']:
+                    raise ValidationError({
+                        'sales_order_item': f"Cannot create dispatch for Sales Order #{so.order_number} because it has already been {so.get_status_display()}."
+                    })
+
+                # 2. Prevent adding a customer that does not match the sales order customer
+                if self.customer and self.customer != so.customer:
+                    raise ValidationError({
+                        'customer': f"Customer '{self.customer.customer_name}' does not match Customer '{so.customer.customer_name}' assigned to Sales Order #{so.order_number}."
+                    })
+
+            # 3. Prevent adding a product that does not match the sales order item product & suggest matching product
+            if self.product and expected_product and self.product != expected_product:
+                raise ValidationError({
+                    'product': f"Product Mismatch: The selected product '{self.product.name}' (SKU: {self.product.sku}) "
+                               f"does not match the product in Sales Order #{so.order_number if so else ''}. "
+                               f"Suggested matching product: '{expected_product.name}' (SKU: {expected_product.sku})."
+                })
         
         if not self.product or not self.quantity_dispatched or not self.sales_order_item:
             return
@@ -1477,6 +1503,13 @@ class DispatchRecord(models.Model):
                     })
 
     def save(self, *args, **kwargs):
+        # Auto-populate customer from Sales Order if missing
+        if self.sales_order_item and self.sales_order_item.sales_order and not self.customer:
+            self.customer = self.sales_order_item.sales_order.customer
+
+        # Auto-populate product from Sales Order Item if missing
+        if self.sales_order_item and self.sales_order_item.product and not self.product:
+            self.product = self.sales_order_item.product
         # Auto-generate unique dispatch code if missing
         if not self.dispatch_code:
             prefix = "DISP"

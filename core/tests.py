@@ -1,4 +1,5 @@
 from decimal import Decimal
+from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.utils import timezone
 from .models import (
@@ -325,6 +326,54 @@ class MRPEngineTestCase(TestCase):
         self.assertEqual(inv.quantity_available, Decimal("10.00"))  # 16 - 6 = 10
         so.refresh_from_db()
         self.assertEqual(so.status, "completed")
+        self.assertEqual(d2.customer, customer)
+
+        # 5. Customer mismatch guard validation
+        other_customer = Customer.objects.create(customer_name="Other Customer", contact_info="other@cust.com")
+        mismatched_dispatch = DispatchRecord(
+            sales_order_item=item,
+            customer=other_customer,
+            product=self.finished_good,
+            quantity_dispatched=Decimal("1.00"),
+            status="pending"
+        )
+        with self.assertRaises(ValidationError):
+            mismatched_dispatch.full_clean()
+
+        # 6. Completed Sales Order dispatch prevention validation
+        blocked_dispatch = DispatchRecord(
+            sales_order_item=item,
+            product=self.finished_good,
+            quantity_dispatched=Decimal("1.00"),
+            status="pending"
+        )
+        with self.assertRaises(ValidationError):
+            blocked_dispatch.full_clean()
+
+        # 7. Product mismatch validation & suggestion error on active Sales Order
+        so_active = SalesOrder.objects.create(customer=customer)
+        item_active = SalesOrderItem.objects.create(
+            sales_order=so_active,
+            product=self.finished_good,
+            quantity_ordered=Decimal("5.00")
+        )
+        other_product = Product.objects.create(
+            name="Other Product", 
+            sku="PROD-OTH-001", 
+            product_type="FINISHED",
+            category="General",
+            unit_of_measurement="PCS",
+            selling_price=Decimal("100.00")
+        )
+        mismatched_prod_dispatch = DispatchRecord(
+            sales_order_item=item_active,
+            product=other_product,
+            quantity_dispatched=Decimal("1.00"),
+            status="pending"
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            mismatched_prod_dispatch.full_clean()
+        self.assertIn("Suggested matching product", str(ctx.exception))
 
     def test_sales_invoice_remaining_balance_and_status_flow(self):
         customer = Customer.objects.create(customer_name="Test Customer", contact_info="test@cust.com")

@@ -581,9 +581,9 @@ class ProcurementOrderAdmin(admin.ModelAdmin):
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ['dispatch_code', 'dispatch_id', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
-    list_filter = ['dispatch_date', 'status', 'delivery_date']
-    search_fields = ['dispatch_code', 'sales_order_item__sales_order__order_number', 'product__sku', 'product__name']
+    list_display = ['dispatch_code', 'dispatch_id', 'customer', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
+    list_filter = ['dispatch_date', 'status', 'delivery_date', 'customer']
+    search_fields = ['dispatch_code', 'sales_order_item__sales_order__order_number', 'customer__customer_name', 'product__sku', 'product__name']
     readonly_fields = ('dispatch_code', 'delivery_date', 'is_stock_deducted')
 
     # DYNAMIC FIELD LOCKDOWN: Once delivered, lock the whole form!
@@ -599,7 +599,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
     # better UI presentation grouping
     fieldsets = (
         ('Order & Logistics Information', {
-            'fields': ('dispatch_code', 'sales_order_item', 'product', 'quantity_dispatched')
+            'fields': ('dispatch_code', 'customer', 'sales_order_item', 'product', 'quantity_dispatched')
         }),
         ('Status & Timestamps', {
             'fields': ('status', 'dispatch_date', 'delivery_date', 'is_stock_deducted')
