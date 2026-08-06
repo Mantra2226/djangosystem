@@ -139,7 +139,9 @@ class MRPEngineTestCase(TestCase):
         self.assertEqual(po.status, "ON_HOLD_SHORTAGE")
 
         # Option 3: Partial Batch Run with available stock
-        Inventory.objects.create(product=self.inter_good, quantity_available=Decimal("8.00"))
+        inv, _ = Inventory.objects.get_or_create(product=self.inter_good)
+        inv.quantity_available = Decimal("8.00")
+        inv.save()
         scaled_po = resolve_intermediate_partial_batch(po, Decimal("4.00"))
         self.assertEqual(scaled_po.quantity, Decimal("4.00"))
         self.assertEqual(scaled_po.status, "IN_PROGRESS")

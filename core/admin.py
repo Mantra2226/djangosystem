@@ -472,8 +472,13 @@ class CustomerAdmin(admin.ModelAdmin):
 class SalesOrderAdmin(admin.ModelAdmin):
     list_display = ('order_number', 'customer', 'status', 'created_at', 'updated_at', 'get_order_total')
     list_filter = ('status', 'created_at')
-    search_fields = ('order_number', 'customer__name')
+    search_fields = ('order_number', 'customer__customer_name')
+    readonly_fields = ('order_number', 'status', 'created_at', 'updated_at')
     inlines = [SalesOrderItemInline]
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        form.instance.update_status(save=True)
 
     @admin.display(description='Order Total')
     def get_order_total(self, obj):

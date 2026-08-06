@@ -663,7 +663,7 @@ class WorkOrder(models.Model):
                     raw_inv.quantity_allocated += expected_allocated_qty
                     raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                    print(f"   ✓ [RESERVED ALLOCATION] Component: '{item.component.name}'", flush=True)
+                    print(f"   [OK] [RESERVED ALLOCATION] Component: '{item.component.name}'", flush=True)
                     print(f"      Allocated Quantity for Line: {expected_allocated_qty} units (Formula: {per_unit_req} BOM Req/unit x {target_qty} Target Batch Qty)", flush=True)
                     print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
@@ -721,7 +721,7 @@ class WorkOrder(models.Model):
 
                         line.deducted_quantity = actual_qty
                         line.save(update_fields=['deducted_quantity'])
-                        print(f"      ✓ [DEDUCTED CONSUMPTION DELTA] Delta={delta} for '{line.component.name}'", flush=True)
+                        print(f"      [OK] [DEDUCTED CONSUMPTION DELTA] Delta={delta} for '{line.component.name}'", flush=True)
                         print(f"         Inventory Updated -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
             # =========================================================================
@@ -753,7 +753,7 @@ class WorkOrder(models.Model):
                             raw_inv.quantity_available += released
                             raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                            print(f"   ✓ [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Allocated={expected_allocated_qty} | Actual Consumed={actual_consumed} | Unused Released={released}", flush=True)
+                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Allocated={expected_allocated_qty} | Actual Consumed={actual_consumed} | Unused Released={released}", flush=True)
                             print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
                 # Record Finished Goods Output
@@ -773,7 +773,7 @@ class WorkOrder(models.Model):
                         transaction_type='PRODUCTION_OUTPUT',
                         work_order=self
                     )
-                    print(f"   ✓ [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
+                    print(f"   [OK] [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
 
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
@@ -1317,7 +1317,7 @@ class SalesOrder(models.Model):
     
     order_number = models.CharField(max_length=50, unique=True, editable=False, blank=True)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT)
-    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft')
+    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft', editable=False, help_text="Automated state machine based on items and dispatch progress.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
