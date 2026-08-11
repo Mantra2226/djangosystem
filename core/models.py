@@ -528,6 +528,7 @@ class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
     work_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True)
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
+    parent_work_order = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_packaging_orders', help_text="The Stage 1 Bulk Intermediate work order required prior to running packaging operations.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
@@ -540,14 +541,17 @@ class WorkOrder(models.Model):
     @property
     def target_quantity(self):
         """
-        Resolves planned production batch target quantity STRICTLY AND ONLY from the linked ProductionOrder.
-        Returns Decimal('0.00') if no ProductionOrder is linked.
+        Resolves planned production batch target quantity STRICTLY from the linked ProductionOrder.
+        If no ProductionOrder is linked, falls back to self.quantity_produced.
+        Returns Decimal('0.00') if neither is available.
         """
         if not self.pk:
             return Decimal('0.00')
         po = self.production_runs.first()
         if po and po.quantity and po.quantity > Decimal('0.00'):
             return po.quantity
+        if self.quantity_produced and self.quantity_produced > Decimal('0.00'):
+            return self.quantity_produced
         return Decimal('0.00')
     # automated state evaluation machine logic
     def recalculate_status(self):
@@ -571,9 +575,28 @@ class WorkOrder(models.Model):
         # Only issue a save request if an actual status boundary change occurs
         if self.status != new_status:
             self.status = new_status
-            self.save()    
+            self.save()
+            if new_status == 'COMPLETED':
+                self.sync_child_packaging_expectations()
+
     def clean(self):
         super().clean()
+
+        # SEQUENCE LOCK VALIDATION: Enforce Stage 1 (Bulk) completion before Stage 2 (Packaging) execution/completion.
+        # Why sequence locks exist:
+        # Stage 2 packaging operations depend directly on intermediate bulk materials produced in Stage 1 mixing.
+        # Allowing packaging operations to start or complete prior to Stage 1 completion creates high operational
+        # risk of stock record corruption, negative inventory allocations, and physical staging errors.
+        if self.parent_work_order:
+            parent_status = (self.parent_work_order.status or '').upper().strip()
+            current_status = (self.status or '').upper().strip()
+            if current_status in ['IN_PROGRESS', 'COMPLETED'] and parent_status != 'COMPLETED':
+                raise ValidationError({
+                    'status': f"Bulk mixing must be completed prior to running or completing packaging operations. "
+                              f"Parent bulk Work Order #{self.parent_work_order.pk} ({self.parent_work_order.work_order_code}) "
+                              f"is currently '{self.parent_work_order.status}'."
+                })
+
         # Validate that all instruction steps are complete before allowing status = COMPLETED
         if self.status == 'COMPLETED' and self.pk:
             incomplete_steps = self.instructions.exclude(status__iexact='COMPLETED').count()
@@ -777,10 +800,34 @@ class WorkOrder(models.Model):
 
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
-                print("[SAFETY GATE] Flipped self.is_inventory_updated = True", flush=True)
+                self.sync_child_packaging_expectations()
+                print("[SAFETY GATE] Flipped self.is_inventory_updated = True and synced child packaging expectations", flush=True)
 
         print("[HYBRID INVENTORY ENGINE END]", flush=True)
         print("==================================================\n", flush=True)
+
+    def sync_child_packaging_expectations(self):
+        """
+        DYNAMIC YIELD AUTO-SCALING:
+        When a Stage 1 Bulk WorkOrder reaches COMPLETED status, synchronizes the actual bulk yield
+        (self.quantity_produced) to all linked child Stage 2 packaging work order material lines 
+        where component == self.product. Updates quantity_expected on each matching WorkOrderMaterialLine.
+
+        Why yield auto-scaling prevents allocation crashes:
+        In continuous process manufacturing, actual intermediate bulk mixing yields vary from initial target quantities 
+        due to physical evaporation, vessel hold-up, or scrap. Automatically scaling child packaging material lines' 
+        quantity_expected to match actual bulk output ensures material variance calculations and stock deductions 
+        reflect exact physical reality without triggering negative stock allocations or system crashes.
+        """
+        bulk_yield = self.quantity_produced or Decimal('0.00')
+        with transaction.atomic():
+            for child_wo in self.child_packaging_orders.all():
+                mat_lines = child_wo.material_lines.filter(component=self.product)
+                for line in mat_lines:
+                    line.quantity_expected = bulk_yield
+                    line.save(update_fields=['quantity_expected'])
+                    # Synchronize corresponding MaterialVarianceRecord if exists
+                    MaterialVarianceRecord.sync_from_material_line(line)
 
     def sync_material_lines(self):
         """
@@ -791,62 +838,105 @@ class WorkOrder(models.Model):
             return
 
         for item in self.bill_of_material.items.all():
-            WorkOrderMaterialLine.objects.get_or_create(
+            target_qty = self.target_quantity
+            expected_qty = (item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if target_qty else Decimal('0.00')
+            line, created = WorkOrderMaterialLine.objects.get_or_create(
                 work_order=self,
                 component=item.component,
                 defaults={
                     'quantity_actual': Decimal('0.00'),
+                    'quantity_expected': expected_qty,
                 }
             )
+            if not created and (line.quantity_expected is None or line.quantity_expected == Decimal('0.00')):
+                if expected_qty > Decimal('0.00'):
+                    line.quantity_expected = expected_qty
+                    line.save(update_fields=['quantity_expected'])
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         print("\n==================================================", flush=True)
         print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}", flush=True)
 
-        # AUTO-GENERATE CODE & ASSIGN BOM
-        if not self.work_order_code:
-            prefix = "WOC"
-            last_wo = WorkOrder.objects.filter(work_order_code__startswith=prefix).order_by('work_order_id').last()
-            new_seq = (int(last_wo.work_order_code.split('-')[-1]) + 1) if (last_wo and last_wo.work_order_code) else 1
-            self.work_order_code = f"{prefix}-{new_seq:04d}"
-            print(f"[LOG] Generated new Work Order Code: {self.work_order_code}", flush=True)
+        with transaction.atomic():
+            # AUTO-GENERATE CODE & ASSIGN BOM
+            if not self.work_order_code:
+                prefix = "WOC"
+                last_wo = WorkOrder.objects.filter(work_order_code__startswith=prefix).order_by('work_order_id').last()
+                new_seq = (int(last_wo.work_order_code.split('-')[-1]) + 1) if (last_wo and last_wo.work_order_code) else 1
+                self.work_order_code = f"{prefix}-{new_seq:04d}"
+                print(f"[LOG] Generated new Work Order Code: {self.work_order_code}", flush=True)
 
-        if not self.bill_of_material and self.product:
-            active_bom = self.product.boms.filter(is_active=True).first()
-            if active_bom:
-                self.bill_of_material = active_bom
-                print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}", flush=True)
+            if not self.bill_of_material and self.product:
+                active_bom = self.product.boms.filter(is_active=True).first()
+                if active_bom:
+                    self.bill_of_material = active_bom
+                    print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}", flush=True)
 
-        current_status = (self.status or '').upper().strip()
-        is_completed = (current_status == 'COMPLETED')
+            current_status = (self.status or '').upper().strip()
+            is_completed = (current_status == 'COMPLETED')
 
-        print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}", flush=True)
-        print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}", flush=True)
+            print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}", flush=True)
+            print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}", flush=True)
 
-        if is_completed and not self.production_end_date:
-            self.production_end_date = timezone.now()
+            if is_completed and not self.production_end_date:
+                self.production_end_date = timezone.now()
 
-        # SAVE MAIN RECORD
-        super().save(*args, **kwargs)
-        print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})", flush=True)
+            # SAVE MAIN RECORD
+            super().save(*args, **kwargs)
+            print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})", flush=True)
 
-        # INITIALIZE / SYNC MATERIAL LINES FROM BOM
-        if self.bill_of_material:
-            self.sync_material_lines()
+            # AUTO-SPAWNING PARENT BULK ORDERS (Stage 1 Intermediate)
+            # How auto-bundling calculates target requirements:
+            # When creating a new packaging WorkOrder for a FINISHED product, we inspect its active BOM.
+            # If the BOM contains an INTERMEDIATE sub-assembly component, we multiply the child order's 
+            # target production quantity (target_quantity or quantity_produced) by the BOM item's 
+            # quantity_required (target_qty * bom_item.quantity_required) to calculate total intermediate 
+            # bulk required. We programmatically instantiate the Stage 1 bulk WorkOrder (and ProductionOrder) 
+            # with status='IN_PROGRESS' and link it as self.parent_work_order within an atomic transaction.
+            if is_new and self.product and self.product.product_type == 'FINISHED' and self.parent_work_order is None:
+                active_bom = self.bill_of_material or self.product.boms.filter(is_active=True).first()
+                if active_bom:
+                    intermediate_item = active_bom.items.filter(component__product_type='INTERMEDIATE').first()
+                    if intermediate_item:
+                        target_qty = self.target_quantity or Decimal('0.00')
+                        bulk_required = (target_qty * intermediate_item.quantity_required).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        
+                        bulk_product = intermediate_item.component
+                        bulk_bom = bulk_product.boms.filter(is_active=True).first()
+                        
+                        parent_wo = WorkOrder.objects.create(
+                            product=bulk_product,
+                            bill_of_material=bulk_bom,
+                            production_start_date=self.production_start_date or timezone.now().date(),
+                            status='IN_PROGRESS',
+                            quantity_produced=bulk_required if bulk_required > Decimal('0.00') else Decimal('0.00')
+                        )
+                        
+                        self.parent_work_order = parent_wo
+                        super().save(update_fields=['parent_work_order'])
+                        print(f"[AUTO-BUNDLING] Auto-spawned parent Stage 1 Bulk WorkOrder #{parent_wo.pk} ({parent_wo.work_order_code}) requiring {bulk_required} units of '{bulk_product.name}'.", flush=True)
 
-        # AUTOMATED PRODUCTION ORDER STATUS SYNC
-        if self.pk:
-            from .models import ProductionOrder
-            linked_pos = ProductionOrder.objects.filter(work_order=self)
-            print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).", flush=True)
-            for po in linked_pos:
-                po_status = (po.status or '').upper().strip()
-                if is_completed and po_status != 'COMPLETED':
-                    po.status = 'COMPLETED'
-                    po.completed_at = timezone.now()
-                    po.save(update_fields=['status', 'completed_at'])
-                    print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.", flush=True)
+            # INITIALIZE / SYNC MATERIAL LINES FROM BOM
+            if self.bill_of_material:
+                self.sync_material_lines()
+
+            # AUTOMATED PRODUCTION ORDER STATUS SYNC
+            if self.pk:
+                from .models import ProductionOrder
+                linked_pos = ProductionOrder.objects.filter(work_order=self)
+                print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).", flush=True)
+                for po in linked_pos:
+                    po_status = (po.status or '').upper().strip()
+                    if is_completed and po_status != 'COMPLETED':
+                        po.status = 'COMPLETED'
+                        po.completed_at = timezone.now()
+                        po.save(update_fields=['status', 'completed_at'])
+                        print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.", flush=True)
+
+            # DYNAMIC YIELD AUTO-SCALING TRIGGER FOR PARENT BULK RUNS
+            if is_completed and self.product and self.product.product_type == 'INTERMEDIATE':
+                self.sync_child_packaging_expectations()
 
         print("[WORK ORDER SAVE END]", flush=True)
         print("==================================================\n", flush=True)
@@ -922,6 +1012,7 @@ class BOMItem(models.Model):
 class WorkOrderMaterialLine(models.Model):
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='material_lines')
     component = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order_usages', limit_choices_to={'product_type__in': ['RAW', 'INTERMEDIATE']})
+    quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Planned / expected component requirement for this line.")
     quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="The actual physical quantity consumed during this run.")   
     deducted_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), editable=False, help_text="Tracks quantity already deducted from inventory.")
     

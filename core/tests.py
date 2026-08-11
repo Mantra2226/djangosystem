@@ -493,3 +493,121 @@ class MRPEngineTestCase(TestCase):
         po.refresh_from_db()
         self.assertEqual(po_item.quantity_received, Decimal("0.00"))
         self.assertEqual(po.status, "SENT")
+
+
+class TwoStageManufacturingTestCase(TestCase):
+    def setUp(self):
+        self.supplier = Supplier.objects.create(name="Ingredient Supplier", contact_info="supplier@test.com")
+        self.raw_spice = Product.objects.create(
+            name="Raw Spice Blend",
+            product_type="RAW",
+            category="Ingredients",
+            unit_of_measurement="Kg",
+            supplier=self.supplier
+        )
+        self.bulk_sauce = Product.objects.create(
+            name="Bulk Sauce Mix",
+            product_type="INTERMEDIATE",
+            category="Bulk Intermediate",
+            unit_of_measurement="Liters"
+        )
+        self.bottled_sauce = Product.objects.create(
+            name="500ml Bottled Sauce",
+            product_type="FINISHED",
+            category="Bottled Goods",
+            unit_of_measurement="Bottles",
+            selling_price=Decimal("5.00")
+        )
+
+        # Active BOM for Intermediate Bulk product (requires 0.20 kg Raw Spice per Liter)
+        self.bulk_bom = BillOfMaterial.objects.create(
+            product=self.bulk_sauce,
+            name="Bulk Sauce Recipe",
+            is_active=True
+        )
+        BOMItem.objects.create(
+            bom=self.bulk_bom,
+            component=self.raw_spice,
+            quantity_required=Decimal("0.2000")
+        )
+
+        # Active BOM for Finished Product (requires 0.50 Liters Bulk Sauce per Bottle)
+        self.finished_bom = BillOfMaterial.objects.create(
+            product=self.bottled_sauce,
+            name="Bottled Sauce Packaging Recipe",
+            is_active=True
+        )
+        BOMItem.objects.create(
+            bom=self.finished_bom,
+            component=self.bulk_sauce,
+            quantity_required=Decimal("0.5000")
+        )
+
+        # Stock for Raw Spice
+        Inventory.objects.create(
+            product=self.raw_spice,
+            quantity_available=Decimal("100.00"),
+            unit_cost=Decimal("2.00")
+        )
+
+    def test_auto_spawning_parent_bulk_order(self):
+        """Creating a FINISHED product packaging WorkOrder automatically spawns its Stage 1 parent bulk WorkOrder."""
+        packaging_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("100.00"),
+            production_start_date=timezone.now().date()
+        )
+
+        # Check parent bulk order was auto-spawned and linked
+        self.assertIsNotNone(packaging_wo.parent_work_order)
+        bulk_wo = packaging_wo.parent_work_order
+        self.assertEqual(bulk_wo.product, self.bulk_sauce)
+        self.assertEqual(bulk_wo.status, 'IN_PROGRESS')
+        # Target requirement: 100 bottles * 0.50 L = 50.00 Liters
+        self.assertEqual(bulk_wo.quantity_produced, Decimal("50.00"))
+
+    def test_sequence_lock_validation(self):
+        """Packaging WorkOrder cannot move to IN_PROGRESS or COMPLETED if parent bulk WorkOrder is not COMPLETED."""
+        packaging_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("100.00"),
+            production_start_date=timezone.now().date()
+        )
+        bulk_wo = packaging_wo.parent_work_order
+        self.assertEqual(bulk_wo.status, 'IN_PROGRESS')
+
+        # Attempting clean() on packaging order while status is IN_PROGRESS and parent is IN_PROGRESS must fail
+        with self.assertRaises(ValidationError) as ctx:
+            packaging_wo.clean()
+        
+        self.assertIn('status', ctx.exception.message_dict)
+        self.assertIn('Bulk mixing must be completed prior to running or completing packaging operations', ctx.exception.message_dict['status'][0])
+
+    def test_dynamic_yield_auto_scaling_on_completion(self):
+        """When parent bulk WorkOrder completes, child packaging material lines' quantity_expected scales to actual bulk yield."""
+        packaging_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("100.00"),
+            production_start_date=timezone.now().date()
+        )
+        bulk_wo = packaging_wo.parent_work_order
+
+        # Verify initial material line for packaging order
+        mat_line = packaging_wo.material_lines.get(component=self.bulk_sauce)
+        self.assertEqual(mat_line.quantity_expected, Decimal("50.00"))
+
+        # Complete bulk WorkOrder with an actual yield of 52.50 Liters
+        bulk_wo.quantity_produced = Decimal("52.50")
+        bulk_wo.status = "COMPLETED"
+        bulk_wo.save()
+
+        # Check that packaging order material line's quantity_expected was auto-scaled to 52.50
+        mat_line.refresh_from_db()
+        self.assertEqual(mat_line.quantity_expected, Decimal("52.50"))
+
+        # Sequence lock now passes since parent is COMPLETED
+        packaging_wo.clean()  # Should not raise ValidationError
+

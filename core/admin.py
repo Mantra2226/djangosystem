@@ -51,7 +51,23 @@ class BOMItemInline(admin.TabularInline):
 class WorkOrderMaterialLineInline(admin.TabularInline):
     model = WorkOrderMaterialLine
     extra = 0  # Don't show empty lines by default
-    fields = ('component', 'quantity_actual')  
+    fields = ('component', 'quantity_expected', 'quantity_actual')
+    readonly_fields = ('quantity_expected',)
+
+class ChildPackagingInline(admin.TabularInline):
+    """
+    Inline UI for auditing Stage 2 child packaging work orders linked to a Stage 1 parent bulk order.
+    Enables shop floor operators and managers to track downstream packaging runs without manually
+    altering system-calculated parent-child relationships.
+    """
+    model = WorkOrder
+    fk_name = 'parent_work_order'
+    verbose_name = "Child Packaging Run"
+    verbose_name_plural = "Child Packaging Runs"
+    extra = 0
+    can_delete = False
+    fields = ('work_order_code', 'product', 'status', 'quantity_produced', 'production_start_date')
+    readonly_fields = ('work_order_code', 'product', 'status', 'quantity_produced', 'production_start_date')  
 
 class SalesInvoicePaymentsInline(admin.TabularInline):
     model = SalesInvoicePayments
@@ -610,8 +626,8 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
     list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
-    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline]
+    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date', 'parent_work_order']
+    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
     list_filter = ['status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
@@ -626,6 +642,7 @@ class WorkOrderAdmin(admin.ModelAdmin):
         }),
         ('Execution & Timestamps', {
             'fields': (
+                'parent_work_order',
                 'status',
                 'production_start_date',
                 'production_end_date',
