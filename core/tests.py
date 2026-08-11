@@ -741,3 +741,101 @@ class ReportingAndOptimizationTestCase(TestCase):
         self.assertTrue(inv_admin.get_queryset(request).exists())
 
 
+class APISerializerAndMiddlewareTestCase(TestCase):
+    def setUp(self):
+        from .models import Supplier, Product, Inventory, Customer
+        self.supplier = Supplier.objects.create(name="Beta Supplier", contact_info="beta@test.com")
+        self.customer = Customer.objects.create(customer_name="Delta Corp", contact_info="delta@test.com")
+        self.raw_mat = Product.objects.create(
+            name="Raw Steel",
+            product_type="RAW",
+            category="Metals",
+            unit_of_measurement="kg",
+            supplier=self.supplier
+        )
+
+    def test_product_serializer_and_deserializer(self):
+        """Tests ProductSerializer serialization and payload validation."""
+        from .serializers import ProductSerializer
+        
+        serialized = ProductSerializer.serialize(self.raw_mat)
+        self.assertEqual(serialized['name'], "Raw Steel")
+        self.assertEqual(serialized['product_type'], "RAW")
+        self.assertEqual(serialized['supplier_name'], "Beta Supplier")
+
+        # Valid payload deserialization
+        valid_payload = {
+            "name": "Copper Wire",
+            "product_type": "RAW",
+            "category": "Metals",
+            "unit_of_measurement": "m",
+            "supplier_id": self.supplier.pk
+        }
+        validated_data = ProductSerializer.validate_and_deserialize(valid_payload)
+        self.assertEqual(validated_data['name'], "Copper Wire")
+
+        # Invalid payload (Finished good with external supplier)
+        invalid_payload = {
+            "name": "Finished Cabinet",
+            "product_type": "FINISHED",
+            "supplier_id": self.supplier.pk
+        }
+        with self.assertRaises(ValidationError):
+            ProductSerializer.validate_and_deserialize(invalid_payload)
+
+    def test_api_products_list_and_create_endpoints(self):
+        """Tests GET and POST API endpoints for products."""
+        import json
+        from django.test import Client
+        client = Client()
+
+        # GET /api/products/
+        response = client.get('/api/products/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data['status'], 'success')
+        self.assertTrue(len(data['data']) >= 1)
+
+        # POST /api/products/
+        new_prod_payload = {
+            "name": "Aluminum Alloy",
+            "product_type": "RAW",
+            "category": "Metals",
+            "unit_of_measurement": "kg",
+            "supplier_id": self.supplier.pk
+        }
+        post_response = client.post(
+            '/api/products/',
+            data=json.dumps(new_prod_payload),
+            content_type='application/json',
+            HTTP_X_REQUESTED_WITH='XMLHttpRequest'
+        )
+        self.assertEqual(post_response.status_code, 201)
+        post_data = post_response.json()
+        self.assertEqual(post_data['status'], 'success')
+        self.assertEqual(post_data['data']['name'], "Aluminum Alloy")
+
+    def test_api_exception_middleware(self):
+        """Tests that ApiExceptionMiddleware intercepts ValidationError and returns JSON 400."""
+        import json
+        from django.test import Client
+        client = Client()
+
+        # POST invalid product payload (blank name)
+        invalid_payload = {
+            "name": "",
+            "product_type": "RAW"
+        }
+        response = client.post(
+            '/api/products/',
+            data=json.dumps(invalid_payload),
+            content_type='application/json',
+            HTTP_X_REQUESTED_WITH='XMLHttpRequest'
+        )
+        self.assertEqual(response.status_code, 400)
+        data = response.json()
+        self.assertEqual(data['status'], 'error')
+        self.assertIn('name', data['errors'])
+
+
+

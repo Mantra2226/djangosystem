@@ -301,4 +301,80 @@ def reports_dashboard_view(request):
         'ap_aging': aging['ap_aging'],
     }
     return render(request, 'core/reports_dashboard.html', context)
+
+
+# =============================================================================
+# RESTFUL JSON API ENDPOINTS (Utilizing core/serializers.py)
+# =============================================================================
+
+import json
+from django.views.decorators.csrf import csrf_protect
+from .serializers import (
+    ProductSerializer, InventorySerializer, WorkOrderSerializer,
+    ProductionOrderSerializer, ProcurementOrderSerializer, SalesOrderSerializer
+)
+
+def api_products_list_create(request):
+    """
+    RESTful JSON API Endpoint for Product resources.
+    GET /api/products/ - Returns list of serialized products.
+    POST /api/products/ - Validates payload via ProductSerializer and creates product.
+    """
+    if request.method == 'GET':
+        product_type = request.GET.get('type')
+        qs = Product.objects.select_related('supplier').prefetch_related('stock').all()
+        if product_type:
+            qs = qs.filter(product_type=product_type.upper())
+        data = ProductSerializer.serialize_queryset(qs)
+        return JsonResponse({"status": "success", "data": data}, status=200)
+
+    elif request.method == 'POST':
+        try:
+            raw_body = request.body.decode('utf-8')
+            payload = json.loads(raw_body) if raw_body else request.POST.dict()
+        except Exception:
+            payload = request.POST.dict()
+
+        validated_data = ProductSerializer.validate_and_deserialize(payload)
+        product = Product.objects.create(**validated_data)
+        serialized = ProductSerializer.serialize(product)
+        return JsonResponse({"status": "success", "data": serialized}, status=201)
+
+    return JsonResponse({"status": "error", "message": "Method not allowed."}, status=405)
+
+
+def api_work_orders_list(request):
+    """GET /api/work-orders/ - Returns list of serialized Work Orders."""
+    qs = WorkOrder.objects.select_related('product', 'bill_of_material', 'parent_work_order').prefetch_related('employee', 'material_lines__component').all()
+    data = WorkOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_inventory_list(request):
+    """GET /api/inventory/ - Returns list of serialized Inventory stock levels."""
+    qs = Inventory.objects.select_related('product', 'product__supplier').all()
+    data = InventorySerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_production_orders_list(request):
+    """GET /api/production-orders/ - Returns list of serialized Production Orders."""
+    qs = ProductionOrder.objects.select_related('product', 'work_order').all()
+    data = ProductionOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_sales_orders_list(request):
+    """GET /api/sales-orders/ - Returns list of serialized Customer Sales Orders."""
+    qs = SalesOrder.objects.select_related('customer').prefetch_related('items__product').all()
+    data = SalesOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_procurement_orders_list(request):
+    """GET /api/procurements/ - Returns list of serialized Procurement Orders."""
+    qs = ProcurementOrder.objects.select_related('purchase_order', 'product', 'purchase_order__supplier').all()
+    data = ProcurementOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
 

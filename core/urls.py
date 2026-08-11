@@ -18,6 +18,14 @@ urlpatterns = [
     path('mrp_resolve_action/', views.mrp_resolve_action, name='mrp_resolve_action'),
     path('reports/', views.reports_dashboard_view, name='reports_dashboard'),
     path('admin/reports-dashboard/', views.reports_dashboard_view, name='admin_reports_dashboard'),
+
+    # RESTful JSON API Endpoints
+    path('api/products/', views.api_products_list_create, name='api_products_list_create'),
+    path('api/work-orders/', views.api_work_orders_list, name='api_work_orders_list'),
+    path('api/inventory/', views.api_inventory_list, name='api_inventory_list'),
+    path('api/production-orders/', views.api_production_orders_list, name='api_production_orders_list'),
+    path('api/sales-orders/', views.api_sales_orders_list, name='api_sales_orders_list'),
+    path('api/procurements/', views.api_procurement_orders_list, name='api_procurement_orders_list'),
 ]   
 
 
