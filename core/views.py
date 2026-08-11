@@ -4,7 +4,7 @@ from django.http import JsonResponse
 from django.contrib.admin.views.decorators import staff_member_required
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
-    ProductionOrder, Invoice, Return, LossRecord, FinanceEntry, 
+    ProductionOrder, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, 
     Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder,
     PurchaseOrder
 )
@@ -74,12 +74,15 @@ def finance_entry_form(request):
 def loss_record_form(request):
     if request.method == 'POST':
         product_id = request.POST.get('product_id')
-        quantity_lost = request.POST.get('quantity_lost')
-        loss_date = request.POST.get('loss_date')
+        quantity_variance = request.POST.get('quantity_lost') or request.POST.get('quantity_variance')
         reason = request.POST.get('reason')
-        LossRecord.objects.create(product_id=product_id, quantity_lost=quantity_lost, loss_date=loss_date, reason=reason)
-        messages.success(request, 'Loss record added successfully!')
-    loss_records = LossRecord.objects.all()
+        MaterialVarianceRecord.objects.create(
+            product_id=product_id,
+            quantity_variance=quantity_variance,
+            notes=reason
+        )
+        messages.success(request, 'Material variance record added successfully!')
+    loss_records = MaterialVarianceRecord.objects.all()
     return render(request, 'core/loss_record_form.html', {'loss_records': loss_records})
 
 def procurement_form(request):
@@ -177,7 +180,6 @@ def po_products_json(request):
         .values("product_id", "name", "sku")
     )
 
-    # Build a clean list for the JS to iterate over
     product_list = [
         {
             "id":   p["product_id"],
@@ -187,4 +189,192 @@ def po_products_json(request):
         for p in products
     ]
 
-    return JsonResponse({"products": product_list})
+    return JsonResponse({"products": product_list})
+
+
+def mrp_resolve_action(request):
+    """
+    HTTP POST Handler for executing tailored MRP resolution pathways from Admin/Dashboard.
+    """
+    if request.method == 'POST':
+        from django.contrib import messages
+        from django.shortcuts import redirect
+        from .models import ProductionOrder
+        from .services import (
+            resolve_raw_autodraft_po,
+            resolve_raw_direct_procurement,
+            resolve_raw_hold_inbound,
+            resolve_intermediate_build,
+            resolve_intermediate_hold_active,
+            resolve_intermediate_partial_batch
+        )
+
+        po_id = request.POST.get('production_order_id')
+        component_id = request.POST.get('component_id')
+        shortfall_qty = request.POST.get('shortfall_qty', '0.00')
+        action = request.POST.get('resolution_action')
+        max_producible = request.POST.get('max_producible', '0.00')
+
+        po = ProductionOrder.objects.filter(pk=po_id).first()
+        if not po:
+            messages.error(request, "Production order not found.")
+            return redirect(request.META.get('HTTP_REFERER', '/admin/'))
+
+        try:
+            if action == 'raw_autodraft_po':
+                new_po = resolve_raw_autodraft_po(po, component_id, shortfall_qty)
+                messages.success(request, f"Auto-drafted Purchase Order #{new_po.po_number}.")
+            elif action == 'raw_direct_procurement':
+                proc = resolve_raw_direct_procurement(po, component_id, shortfall_qty)
+                messages.success(request, f"Spawned direct Procurement Order #{proc.procurement_order_id}.")
+            elif action == 'raw_hold_inbound':
+                resolve_raw_hold_inbound(po, component_id)
+                messages.info(request, "Order status held for inbound PO stock.")
+            elif action == 'intermediate_build':
+                wo, child_po = resolve_intermediate_build(po, component_id, shortfall_qty)
+                messages.success(request, f"Spawned child Sub-Assembly Work Order #{wo.pk} (Production Run #{child_po.pk}).")
+            elif action == 'intermediate_hold_active':
+                resolve_intermediate_hold_active(po, component_id)
+                messages.info(request, "Linked order to active intermediate shop floor run.")
+            elif action == 'intermediate_partial_batch':
+                resolve_intermediate_partial_batch(po, max_producible)
+                messages.success(request, f"Down-scaled production batch to {max_producible} units.")
+            else:
+                messages.warning(request, "Unknown resolution action.")
+        except Exception as e:
+            messages.error(request, f"MRP Resolution Error: {str(e)}")
+
+        redirect_url = request.META.get('HTTP_REFERER') or f'/admin/core/productionorder/{po_id}/change/'
+        return redirect(redirect_url)
+
+    return redirect('/admin/')
+
+
+@staff_member_required
+def reports_dashboard_view(request):
+    """
+    Executive Reporting Analytics Dashboard.
+    Provides consolidated operational metrics across Financial P&L, COGM, Yield/Scrap, 
+    Inventory Health/OTIF, and Accounts Receivable/Payable Aging.
+    """
+    from datetime import datetime
+    from .reports import (
+        get_profit_and_loss_summary,
+        get_cogm_report,
+        get_production_yield_and_scrap_report,
+        get_inventory_health_and_otif_report,
+        get_ar_ap_aging_report
+    )
+
+    start_date_str = request.GET.get('start_date')
+    end_date_str = request.GET.get('end_date')
+
+    start_date = None
+    end_date = None
+
+    if start_date_str:
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    if end_date_str:
+        try:
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    pnl = get_profit_and_loss_summary(start_date, end_date)
+    cogm = get_cogm_report(start_date, end_date)
+    yield_scrap = get_production_yield_and_scrap_report(start_date, end_date)
+    inventory_otif = get_inventory_health_and_otif_report()
+    aging = get_ar_ap_aging_report()
+
+    context = {
+        'start_date': start_date_str or '',
+        'end_date': end_date_str or '',
+        'pnl': pnl,
+        'cogm': cogm,
+        'yield_scrap': yield_scrap,
+        'inventory_otif': inventory_otif,
+        'ar_aging': aging['ar_aging'],
+        'ap_aging': aging['ap_aging'],
+    }
+    return render(request, 'core/reports_dashboard.html', context)
+
+
+# =============================================================================
+# RESTFUL JSON API ENDPOINTS (Utilizing core/serializers.py)
+# =============================================================================
+
+import json
+from django.views.decorators.csrf import csrf_protect
+from .serializers import (
+    ProductSerializer, InventorySerializer, WorkOrderSerializer,
+    ProductionOrderSerializer, ProcurementOrderSerializer, SalesOrderSerializer
+)
+
+def api_products_list_create(request):
+    """
+    RESTful JSON API Endpoint for Product resources.
+    GET /api/products/ - Returns list of serialized products.
+    POST /api/products/ - Validates payload via ProductSerializer and creates product.
+    """
+    if request.method == 'GET':
+        product_type = request.GET.get('type')
+        qs = Product.objects.select_related('supplier').prefetch_related('stock').all()
+        if product_type:
+            qs = qs.filter(product_type=product_type.upper())
+        data = ProductSerializer.serialize_queryset(qs)
+        return JsonResponse({"status": "success", "data": data}, status=200)
+
+    elif request.method == 'POST':
+        try:
+            raw_body = request.body.decode('utf-8')
+            payload = json.loads(raw_body) if raw_body else request.POST.dict()
+        except Exception:
+            payload = request.POST.dict()
+
+        validated_data = ProductSerializer.validate_and_deserialize(payload)
+        product = Product.objects.create(**validated_data)
+        serialized = ProductSerializer.serialize(product)
+        return JsonResponse({"status": "success", "data": serialized}, status=201)
+
+    return JsonResponse({"status": "error", "message": "Method not allowed."}, status=405)
+
+
+def api_work_orders_list(request):
+    """GET /api/work-orders/ - Returns list of serialized Work Orders."""
+    qs = WorkOrder.objects.select_related('product', 'bill_of_material', 'parent_work_order').prefetch_related('employee', 'material_lines__component').all()
+    data = WorkOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_inventory_list(request):
+    """GET /api/inventory/ - Returns list of serialized Inventory stock levels."""
+    qs = Inventory.objects.select_related('product', 'product__supplier').all()
+    data = InventorySerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_production_orders_list(request):
+    """GET /api/production-orders/ - Returns list of serialized Production Orders."""
+    qs = ProductionOrder.objects.select_related('product', 'work_order').all()
+    data = ProductionOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_sales_orders_list(request):
+    """GET /api/sales-orders/ - Returns list of serialized Customer Sales Orders."""
+    qs = SalesOrder.objects.select_related('customer').prefetch_related('items__product').all()
+    data = SalesOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+def api_procurement_orders_list(request):
+    """GET /api/procurements/ - Returns list of serialized Procurement Orders."""
+    qs = ProcurementOrder.objects.select_related('purchase_order', 'product', 'purchase_order__supplier').all()
+    data = ProcurementOrderSerializer.serialize_queryset(qs)
+    return JsonResponse({"status": "success", "data": data}, status=200)
+
+

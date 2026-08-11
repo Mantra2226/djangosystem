@@ -9,7 +9,6 @@ from django.utils.text import slugify
 from django.core.validators import MinValueValidator
 from django.db.models import Sum
 from django.utils import timezone
-# models.
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
     name = models.CharField(max_length=255)
@@ -104,9 +103,67 @@ class PurchaseOrder(models.Model):
     po_id = models.AutoField(primary_key=True)
     po_number = models.CharField(max_length=100, unique=True, editable=False, help_text="System generated unique purchase order number.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_orders')
-    order_date = models.DateField(auto_now_add=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    order_date = models.DateField(auto_now_add=True, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True)
     notes = models.TextField(blank=True, help_text="Delivery instructions or terms")
+
+    def update_delivery_status(self, save=True):
+        """
+        Recalculates and updates PO status automatically:
+        - CANCELLED -> remains CANCELLED unless manually changed
+        - No items or total_ordered <= 0 -> DRAFT
+        - items exist and total_received == 0 -> SENT
+        - 0 < total_received < total_ordered -> PARTIAL
+        - total_received >= total_ordered (> 0) -> RECEIVED
+        """
+        if self.status == 'CANCELLED':
+            return self.status
+
+        if not self.pk:
+            return self.status
+
+        items = list(self.items.all())
+        if not items:
+            new_status = 'DRAFT'
+        else:
+            total_ordered = sum((item.quantity_ordered or Decimal('0.00')) for item in items)
+            total_received = sum((item.quantity_received or Decimal('0.00')) for item in items)
+
+            if total_ordered <= Decimal('0.00'):
+                new_status = 'DRAFT'
+            elif total_received <= Decimal('0.00'):
+                new_status = 'SENT'
+            elif total_received < total_ordered:
+                new_status = 'PARTIAL'
+            else:
+                new_status = 'RECEIVED'
+
+        if self.status != new_status:
+            self.status = new_status
+            if save:
+                PurchaseOrder.objects.filter(pk=self.pk).update(status=new_status)
+        return new_status
+
+    def sync_received_quantities(self):
+        """
+        Recalculates quantity_received for all items on this Purchase Order based on linked DELIVERED ProcurementOrders,
+        and updates the Purchase Order status automatically.
+        """
+        if not self.pk:
+            return
+
+        for item in self.items.all():
+            total_received = ProcurementOrder.objects.filter(
+                purchase_order=self,
+                product=item.product,
+                status='DELIVERED'
+            ).aggregate(total=Sum('quantity'))['total'] or Decimal('0.00')
+
+            if item.quantity_received != total_received:
+                item.quantity_received = total_received
+                item.save(update_fields=['quantity_received'])
+
+        self.update_delivery_status(save=True)
 
     def clean(self):
         super().clean()
@@ -114,9 +171,7 @@ class PurchaseOrder(models.Model):
         # If an operator sets the status to a received state, check the line items
         if self.status in ['PARTIAL', 'RECEIVED']:
             if self.pk:
-                # Sum up all the quantities received across this PO's line items
                 total_received = self.items.aggregate(total=Sum('quantity_received'))['total'] or Decimal('0.00')
-                
                 if total_received <= Decimal('0.00'):
                     raise ValidationError({
                         'status': f"Cannot set status to '{self.get_status_display()}' because "
@@ -124,24 +179,22 @@ class PurchaseOrder(models.Model):
                                   f"a Procurement Order for this PO first."
                     })
             else:
-                # Prevent creating a brand new PO directly into a received status
                 raise ValidationError({
                     'status': "A brand new Purchase Order cannot be created as Partially or Fully Received. "
                               "It must start as 'Draft' or 'Sent to Supplier'."
                 })
+
     def save(self, *args, **kwargs):
         # Only generate a PO number if it doesn't have one yet
         if not self.po_number:
             current_year = timezone.now().year
             prefix = f"PO-{current_year}-"
-            # Find the highest existing PO number for this year to determine the next sequence
             latest_po = PurchaseOrder.objects.filter(
                 po_number__startswith=prefix
             ).order_by('-po_number').first()
             
             if latest_po:
                 try:
-                    # Extract the serial suffix (e.g. '00005' from 'PO-2026-00005') and increment it
                     last_sequence = int(latest_po.po_number.split('-')[-1])
                     next_sequence = last_sequence + 1
                 except (ValueError, IndexError):
@@ -149,10 +202,12 @@ class PurchaseOrder(models.Model):
             else:
                 next_sequence = 1
             
-            # Format to 5 padded digits (e.g., PO-2026-00001)
             self.po_number = f"{prefix}{next_sequence:05d}"
             
         super().save(*args, **kwargs)
+
+        if self.pk and self.status != 'CANCELLED':
+            self.update_delivery_status(save=True)
 
     def __str__(self):
         return f"{self.po_number} - {self.supplier.name} ({self.get_status_display()})"    
@@ -165,9 +220,10 @@ class PurchaseOrderItem(models.Model):
     # Track physical units received when delivery arrives
     quantity_received = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))])
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Negotiated cost per unit for this order.")
+
     @property
     def total_price(self):
-        return self.quantity_ordered * self.unit_price
+        return self.quantity_ordered * self.price_per_unit
 
     def clean(self):
         # Validation Rule: You cannot buy a product from Supplier A if it's assigned to Supplier B
@@ -177,11 +233,21 @@ class PurchaseOrderItem(models.Model):
                            f"You cannot order it under a PO to '{self.purchase_order.supplier.name}'."
             })
             
-        # Validation Rule: Ensure quantity_received does not exceed quantity_ordered
         if self.quantity_received > self.quantity_ordered:
             raise ValidationError({
                 'quantity_received': "Quantity received cannot exceed quantity ordered."
             })
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.purchase_order_id:
+            self.purchase_order.update_delivery_status(save=True)
+
+    def delete(self, *args, **kwargs):
+        po = self.purchase_order
+        super().delete(*args, **kwargs)
+        if po and po.pk:
+            po.update_delivery_status(save=True)
 
     def __str__(self):
         return f"{self.product.sku} ({self.quantity_ordered} {self.product.unit_of_measurement}) on {self.purchase_order.po_number}"       
@@ -198,22 +264,30 @@ class ProcurementOrder(models.Model):
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Price per unit must be a positive amount greater than zero.")
     total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True, default=Decimal('0.00'), help_text="Total cost is automatically calculated based on quantity ordered and price per unit.")
-    order_date = models.DateField()
+    order_date = models.DateField(default=timezone.now, db_index=True)
     delivery_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captures when status changes to Delivered.")
-    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING')   
+    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING', db_index=True)   
     delivery_location = models.CharField(max_length=255, default='Main Warehouse')
+
+    # Tracking changes for calculations
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._orig_quantity = self.quantity if self.pk else Decimal('0.00')
+        self._orig_status = self.status if self.pk else None
+        self._orig_po_id = self.purchase_order_id if self.pk else None
+        self._orig_product_id = self.product_id if self.pk else None
+        self._orig_location = self.delivery_location if self.pk else None
     
     @property
     def supplier(self):
         return self.purchase_order.supplier if self.purchase_order else None
-    # when status is updated to 'Delivered', the quantity should be added to inventory and total cost should be calculated based on quantity ordered and price per unit
+
     def clean(self):
         super().clean()
         if self.product and self.product.product_type == 'FINISHED':
-            raise ValidationError({'product': 'finished products are manufactured internally. Use a production order instead of a procurement order for finished products.'})
+            raise ValidationError({'product': 'Finished products are manufactured internally. Use a production order instead of a procurement order for finished products.'})
         
         if self.purchase_order and self.product:
-            # Gets the list of product IDs present on this Purchase Order's items
             valid_product_ids = self.purchase_order.items.values_list('product_id', flat=True)
 
             if self.product.pk not in valid_product_ids:
@@ -229,64 +303,98 @@ class ProcurementOrder(models.Model):
             self.total_cost = raw_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         else:
             self.total_cost = Decimal('0.00')
-            
+
+        if self.status != 'CANCELLED':
+            if self.delivery_date and self.status != 'DELIVERED':
+                self.status = 'DELIVERED'
+            elif self.status == 'DELIVERED' and not self.delivery_date:
+                self.delivery_date = timezone.now()
+
         self.full_clean()
 
-        previously_delivered = False
-        if self.pk:
-            previously_delivered = ProcurementOrder.objects.filter(pk=self.pk, status='DELIVERED').exists()
-        # Captures timestamp when status changes to DELIVERED
-        if self.status == 'DELIVERED' and not previously_delivered:
-            self.delivery_date = timezone.now()
-        # Wrapped inventory modifications in an atomic transaction to avoid data corruption if a crash happens mid-save
+        orig_delivered_qty = self._orig_quantity if (self._orig_status == 'DELIVERED') else Decimal('0.00')
+        new_delivered_qty = self.quantity if (self.status == 'DELIVERED') else Decimal('0.00')
+        qty_delta = new_delivered_qty - orig_delivered_qty
+
         with transaction.atomic():
             super().save(*args, **kwargs)
 
-            if self.status == 'DELIVERED' and not previously_delivered:
-                # Fetches or initializes the specific location inventory record bucket
-                inventory_item, created = Inventory.objects.get_or_create(
+            # Adjust inventory stock and log transaction if delivered quantity changed
+            if qty_delta != Decimal('0.00') and self.product:
+                target_location = self.delivery_location or 'Main Warehouse'
+                inventory_item, _ = Inventory.objects.select_for_update().get_or_create(
                     product=self.product,
-                    location=self.delivery_location,
+                    location=target_location,
                     defaults={
                         'quantity_available': Decimal('0.00'),
-                        'unit_cost': self.price_per_unit  # Initial cost matches first delivery
+                        'unit_cost': self.price_per_unit
                     }
                 )
                 # Pulls figures directly from the target inventory row for AVCO calculation
                 current_total_qty = inventory_item.quantity_available
                 current_cost = inventory_item.unit_cost
-                incoming_qty = self.quantity
-                incoming_price = self.price_per_unit
-                
-                total_qty_after = current_total_qty + incoming_qty
-                
+                total_qty_after = current_total_qty + qty_delta
+
                 if total_qty_after > 0:
                     # AVCO calculation
                     new_weighted_cost = (
-                        (current_total_qty * current_cost) + (incoming_qty * incoming_price)
+                        (current_total_qty * current_cost) + (qty_delta * self.price_per_unit)
                     ) / total_qty_after
-                    # Increment stock levels and trigger inventory save processing mechanics
                     inventory_item.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    # Increment stock & save inventory once
-                inventory_item.quantity_available += incoming_qty
+
+                inventory_item.quantity_available += qty_delta
                 inventory_item.save()
                 # Safe supplier reference for stock transaction
                 supplier_name = self.supplier.name if self.supplier else "Unassigned Supplier"
-                # Write to StockTransaction Ledger for audit trailing
+                sign = "+" if qty_delta > 0 else ""
                 StockTransaction.objects.create(
                     product=self.product,
-                    quantity=self.quantity,
+                    quantity=qty_delta,
                     transaction_type='RECEIPT',
-                    notes=f"Receipt via Procurement Order #{self.procurement_order_id} from {supplier_name}."
+                    notes=f"Stock adjustment of {sign}{qty_delta} units via Procurement Order #{self.procurement_order_id} from {supplier_name}."
                 )
 
-                # Update the matching PurchaseOrderItem if linked to a PO
-                if self.purchase_order:
-                    po_item = self.purchase_order.items.filter(product=self.product).first()
-                    if po_item:
-                        po_item.quantity_received += self.quantity
-                        po_item.save()
-                    
+            # Sync linked PurchaseOrder(s) received quantities & status
+            if self.purchase_order:
+                self.purchase_order.sync_received_quantities()
+
+            # If PO link was changed, re-sync the old PO as well
+            if self._orig_po_id and self._orig_po_id != self.purchase_order_id:
+                old_po = PurchaseOrder.objects.filter(pk=self._orig_po_id).first()
+                if old_po:
+                    old_po.sync_received_quantities()
+
+            # Refresh tracked properties for instance reuse
+            self._orig_quantity = self.quantity
+            self._orig_status = self.status
+            self._orig_po_id = self.purchase_order_id
+            self._orig_product_id = self.product_id
+            self._orig_location = self.delivery_location
+
+    def delete(self, *args, **kwargs):
+        with transaction.atomic():
+            po = self.purchase_order
+            if self.status == 'DELIVERED' and self.product:
+                inventory_item = Inventory.objects.select_for_update().filter(
+                    product=self.product,
+                    location=self.delivery_location or 'Main Warehouse'
+                ).first()
+                if inventory_item:
+                    inventory_item.quantity_available -= self.quantity
+                    inventory_item.save()
+
+                StockTransaction.objects.create(
+                    product=self.product,
+                    quantity=-self.quantity,
+                    transaction_type='ADJUSTMENT',
+                    notes=f"Rollback of -{self.quantity} units due to deletion of Procurement Order #{self.procurement_order_id}."
+                )
+
+            super().delete(*args, **kwargs)
+
+            if po and po.pk:
+                po.sync_received_quantities()
+
     def __str__(self):
         return f"PO #{self.procurement_order_id} - {self.product.name} ({self.status})"           
                
@@ -294,7 +402,7 @@ class Inventory(models.Model):
     Inventory_id = models.AutoField(primary_key=True) 
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='stock')   
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Moving weighted average cost calculated from delivered procurements.")
-    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Unreserved stock physically available for new production orders. Cannot drop below zero.")
+    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), db_index=True, validators=[MinValueValidator(Decimal('0.00'))], help_text="Unreserved stock physically available for new production orders. Cannot drop below zero.")
     quantity_allocated = models.DecimalField(max_digits=12, decimal_places=4, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Stock reserved for active Work Orders currently IN_PROGRESS.")
     location = models.CharField(max_length=255, default='Main Warehouse') 
     last_updated = models.DateTimeField(auto_now=True)
@@ -420,14 +528,31 @@ class WorkOrder(models.Model):
     work_order_id = models.AutoField(primary_key=True)
     work_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True)
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
+    parent_work_order = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_packaging_orders', help_text="The Stage 1 Bulk Intermediate work order required prior to running packaging operations.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
-    production_start_date = models.DateField()
+    production_start_date = models.DateField(db_index=True)
     production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
     is_inventory_allocated = models.BooleanField(default=False, help_text="Flag indicating BOM expected stock has been reserved on IN_PROGRESS.")
-    status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, help_text="Automatically managed based on step completion statuses.")
+    status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, db_index=True, help_text="Automatically managed based on step completion statuses.")
+
+    @property
+    def target_quantity(self):
+        """
+        Resolves planned production batch target quantity STRICTLY from the linked ProductionOrder.
+        If no ProductionOrder is linked, falls back to self.quantity_produced.
+        Returns Decimal('0.00') if neither is available.
+        """
+        if not self.pk:
+            return Decimal('0.00')
+        po = self.production_runs.first()
+        if po and po.quantity and po.quantity > Decimal('0.00'):
+            return po.quantity
+        if self.quantity_produced and self.quantity_produced > Decimal('0.00'):
+            return self.quantity_produced
+        return Decimal('0.00')
     # automated state evaluation machine logic
     def recalculate_status(self):
         """Scans all child instructions to dynamically compute macro status."""
@@ -450,9 +575,28 @@ class WorkOrder(models.Model):
         # Only issue a save request if an actual status boundary change occurs
         if self.status != new_status:
             self.status = new_status
-            self.save()    
+            self.save()
+            if new_status == 'COMPLETED':
+                self.sync_child_packaging_expectations()
+
     def clean(self):
         super().clean()
+
+        # SEQUENCE LOCK VALIDATION: Enforce Stage 1 (Bulk) completion before Stage 2 (Packaging) execution/completion.
+        # Why sequence locks exist:
+        # Stage 2 packaging operations depend directly on intermediate bulk materials produced in Stage 1 mixing.
+        # Allowing packaging operations to start or complete prior to Stage 1 completion creates high operational
+        # risk of stock record corruption, negative inventory allocations, and physical staging errors.
+        if self.parent_work_order:
+            parent_status = (self.parent_work_order.status or '').upper().strip()
+            current_status = (self.status or '').upper().strip()
+            if current_status in ['IN_PROGRESS', 'COMPLETED'] and parent_status != 'COMPLETED':
+                raise ValidationError({
+                    'status': f"Bulk mixing must be completed prior to running or completing packaging operations. "
+                              f"Parent bulk Work Order #{self.parent_work_order.pk} ({self.parent_work_order.work_order_code}) "
+                              f"is currently '{self.parent_work_order.status}'."
+                })
+
         # Validate that all instruction steps are complete before allowing status = COMPLETED
         if self.status == 'COMPLETED' and self.pk:
             incomplete_steps = self.instructions.exclude(status__iexact='COMPLETED').count()
@@ -460,10 +604,10 @@ class WorkOrder(models.Model):
                 raise ValidationError({
                     'status': f"Cannot complete Work Order. There are still {incomplete_steps} incomplete instruction step(s)."
                 })
-        # Prevents completion without a valid quantity
+        # Prevents completion without a valid quantity on linked ProductionOrder
         if self.status == 'COMPLETED' and not self.is_inventory_updated:
-            if not self.quantity_produced or self.quantity_produced <= 0:
-                raise ValidationError({'quantity_produced': "Quantity produced must be greater than 0 to complete."})
+            if not self.target_quantity or self.target_quantity <= 0:
+                raise ValidationError({'status': "Cannot complete Work Order without a valid target quantity on a linked Production Order."})
             # VALIDATES RAW MATERIAL STOCK USING ACTUAL CONSUMPTION (quantity_actual)
             for line in self.material_lines.all():
                 from .models import Inventory
@@ -493,132 +637,150 @@ class WorkOrder(models.Model):
         """
         HYBRID INVENTORY ENGINE:
         Phase 1: Reserve stock (Allocations) when status moves to IN_PROGRESS.
-        Phase 2: Deduct incremental actuals (Deltas) during intermediate saves.
-        Phase 3: Add finished goods & clear remaining allocations on COMPLETED.
+                 Calculates allocated_qty = bom_item.quantity_required * target_qty
+                 where target_qty comes STRICTLY AND ONLY from ProductionOrder.quantity.
+                 Deducts allocated_qty from Inventory.quantity_available into Inventory.quantity_allocated.
+        Phase 2: Deduct incremental actuals (Deltas) during production.
+        Phase 3: Add finished goods & release remaining unconsumed allocations on COMPLETED.
         """
         current_status = (self.status or '').upper().strip()
 
-        print("\n==================================================")
-        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} | Status: '{current_status}'")
-        print(f"[LOG] Flags -> Allocated: {self.is_inventory_allocated} | Fully Updated: {self.is_inventory_updated}")
+        from .models import Inventory, StockTransaction
+        target_qty = self.target_quantity
+        linked_po = self.production_runs.first() if self.pk else None
+        if target_qty > Decimal('0.00') and linked_po:
+            target_source = f"Production Order #{linked_po.pk} ({linked_po.production_order_code or 'POC'})"
+        else:
+            target_source = "No linked Production Order (0.00 units)"
+
+        print("\n==================================================", flush=True)
+        print(f"[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} ({self.work_order_code}) | Status: '{current_status}'", flush=True)
+        print(f"[LOG] Target Production Batch Quantity (STRICTLY FROM ProductionOrder.quantity): {target_qty} units (Source: {target_source})", flush=True)
+        print(f"[LOG] Flags -> Allocated: {self.is_inventory_allocated} | Fully Updated: {self.is_inventory_updated}", flush=True)
 
         with transaction.atomic():
-            from .models import Inventory, StockTransaction
-
             # =========================================================================
             # PHASE 1: STOCK ALLOCATION (Runs once when status moves to IN_PROGRESS)
             # =========================================================================
-            if current_status == 'IN_PROGRESS' and not self.is_inventory_allocated:
-                print("--------------------------------------------------")
-                print("[PHASE 1: STOCK ALLOCATION START]")
-                
-                for line in self.material_lines.all():
-                    expected_qty = line.quantity_expected or Decimal('0.00')
-                    if expected_qty <= Decimal('0.00'):
+            if current_status == 'IN_PROGRESS' and not self.is_inventory_allocated and self.bill_of_material:
+                print("--------------------------------------------------", flush=True)
+                print("[PHASE 1: STOCK ALLOCATION RESERVATION START]", flush=True)
+
+                for item in self.bill_of_material.items.all():
+                    per_unit_req = item.quantity_required or Decimal('0.00')
+                    expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+                    if expected_allocated_qty <= Decimal('0.00'):
                         continue
 
                     raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                        product=line.component,
+                        product=item.component,
                         defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
                     )
 
-                    # Reserve expected stock: Shift from quantity_available to quantity_allocated
                     old_avail = raw_inv.quantity_available
                     old_alloc = raw_inv.quantity_allocated
-                    
-                    raw_inv.quantity_available -= expected_qty
-                    raw_inv.quantity_allocated += expected_qty
+
+                    # Shift expected_allocated_qty from quantity_available to quantity_allocated
+                    raw_inv.quantity_available -= expected_allocated_qty
+                    raw_inv.quantity_allocated += expected_allocated_qty
                     raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                    print(f"    RESERVED ({line.component.name}): Expected={expected_qty}")
-                    print(f"    Available: {old_avail} -> {raw_inv.quantity_available} | Allocated: {old_alloc} -> {raw_inv.quantity_allocated}")
+                    print(f"   [OK] [RESERVED ALLOCATION] Component: '{item.component.name}'", flush=True)
+                    print(f"      Allocated Quantity for Line: {expected_allocated_qty} units (Formula: {per_unit_req} BOM Req/unit x {target_qty} Target Batch Qty)", flush=True)
+                    print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
-                # Flip allocation lock
                 self.is_inventory_allocated = True
                 super().save(update_fields=['is_inventory_allocated'])
-                print("[SAFETY GATE] Flipped self.is_inventory_allocated = True")
+                print("[SAFETY GATE] Flipped self.is_inventory_allocated = True", flush=True)
 
             # =========================================================================
-            # PHASE 2: INCREMENTAL DELTA ISSUING (Runs during IN_PROGRESS or COMPLETED)
+            # PHASE 2: INCREMENTAL ACTUAL CONSUMPTION DEDUCTION
             # =========================================================================
             if current_status in ['IN_PROGRESS', 'COMPLETED'] and not self.is_inventory_updated:
-                print("--------------------------------------------------")
-                print("[PHASE 2: INCREMENTAL DELTA ISSUING START]")
+                print("--------------------------------------------------", flush=True)
+                print("[PHASE 2: INCREMENTAL ACTUAL CONSUMPTION DEDUCTION START]", flush=True)
 
                 for line in self.material_lines.all():
                     actual_qty = line.quantity_actual or Decimal('0.00')
-                    issued_qty = line.quantity_issued or Decimal('0.00')
-                    
-                    # Compute Line Delta (New consumption since last save)
-                    delta = actual_qty - issued_qty
+                    already_deducted = line.deducted_quantity or Decimal('0.00')
+                    allocated_qty = line.quantity_allocated
+                    delta = actual_qty - already_deducted
 
-                    print(f"    Line '{line.component.name}': Actual={actual_qty} | Already Issued={issued_qty} | Delta={delta}")
+                    print(f"   Line '{line.component.name}': Allocated Qty={allocated_qty} | Actual Consumed={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
 
-                    if delta > Decimal('0.00'):
+                    if delta != Decimal('0.00'):
                         raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
                             product=line.component,
                             defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
                         )
 
                         old_alloc = raw_inv.quantity_allocated
-                        
-                        # Reduce allocation pool if available, otherwise deduct directly
-                        if raw_inv.quantity_allocated >= delta:
-                            raw_inv.quantity_allocated -= delta
+                        old_avail = raw_inv.quantity_available
+
+                        if delta > Decimal('0.00'):
+                            # Deduct from allocation pool first if available, otherwise from available pool
+                            if raw_inv.quantity_allocated >= delta:
+                                raw_inv.quantity_allocated -= delta
+                            else:
+                                excess = delta - raw_inv.quantity_allocated
+                                raw_inv.quantity_allocated = Decimal('0.00')
+                                raw_inv.quantity_available -= excess
+                            trans_type = 'PRODUCTION_CONSUMPTION'
                         else:
-                            # Used more than originally allocated
-                            excess = delta - raw_inv.quantity_allocated
-                            raw_inv.quantity_allocated = Decimal('0.00')
-                            raw_inv.quantity_available -= excess
+                            # Return stock back if actual consumption was reduced
+                            raw_inv.quantity_available += (-delta)
+                            trans_type = 'ADJUSTMENT'
 
                         raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                        # Record transaction history for delta
                         StockTransaction.objects.create(
                             product=line.component,
                             quantity=-delta,
-                            transaction_type='PRODUCTION_CONSUMPTION',
-                            work_order=self
+                            transaction_type=trans_type,
+                            work_order=self,
+                            notes=f"Stock change of {-delta} units for Work Order #{self.pk} ({line.component.name})"
                         )
 
-                        # Update background issued counter
-                        line.quantity_issued = actual_qty
-                        line.save(update_fields=['quantity_issued'])
-
-                        print(f"      ✓ DEDUCTED DELTA ({delta}): Allocated: {old_alloc} -> {raw_inv.quantity_allocated} | Issued Counter set to {line.quantity_issued}")
+                        line.deducted_quantity = actual_qty
+                        line.save(update_fields=['deducted_quantity'])
+                        print(f"      [OK] [DEDUCTED CONSUMPTION DELTA] Delta={delta} for '{line.component.name}'", flush=True)
+                        print(f"         Inventory Updated -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
             # =========================================================================
-            # PHASE 3: FINAL RECONCILIATION & OUTPUT (Runs when COMPLETED)
+            # PHASE 3: FINAL RECONCILIATION & FINISHED GOODS OUTPUT (Runs on COMPLETED)
             # =========================================================================
             if current_status == 'COMPLETED' and not self.is_inventory_updated:
-                print("--------------------------------------------------")
-                print("[PHASE 3: FINAL RECONCILIATION & FINISHED GOODS START]")
+                print("--------------------------------------------------", flush=True)
+                print("[PHASE 3: RECONCILIATION & FINISHED GOODS OUTPUT START]", flush=True)
 
-                # --- A. Release any unconsumed allocated stock back to available pool ---
-                if self.is_inventory_allocated:
-                    for line in self.material_lines.all():
-                        expected = line.quantity_expected or Decimal('0.00')
-                        issued = line.quantity_issued or Decimal('0.00')
-                        
-                        unconsumed_alloc = expected - issued
+                # Release any unconsumed allocated stock back to available pool
+                if self.is_inventory_allocated and self.bill_of_material:
+                    for item in self.bill_of_material.items.all():
+                        line = self.material_lines.filter(component=item.component).first()
+                        actual_consumed = line.quantity_actual if line else Decimal('0.00')
+                        per_unit_req = item.quantity_required or Decimal('0.00')
+                        expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+                        unconsumed_alloc = expected_allocated_qty - actual_consumed
                         if unconsumed_alloc > Decimal('0.00'):
                             raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                                product=line.component,
+                                product=item.component,
                                 defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
                             )
                             old_alloc = raw_inv.quantity_allocated
                             old_avail = raw_inv.quantity_available
 
-                            # Release unused allocation back to available stock
-                            raw_inv.quantity_allocated = max(Decimal('0.00'), raw_inv.quantity_allocated - unconsumed_alloc)
-                            raw_inv.quantity_available += unconsumed_alloc
+                            released = min(unconsumed_alloc, raw_inv.quantity_allocated)
+                            raw_inv.quantity_allocated -= released
+                            raw_inv.quantity_available += released
                             raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                            print(f"   ✓ RELEASED UNUSED ALLOCATION ({line.component.name}): Released={unconsumed_alloc}")
-                            print(f"      Allocated: {old_alloc} -> {raw_inv.quantity_allocated} | Available: {old_avail} -> {raw_inv.quantity_available}")
+                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Allocated={expected_allocated_qty} | Actual Consumed={actual_consumed} | Unused Released={released}", flush=True)
+                            print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
-                # --- B. Record Finished Goods Output ---
-                finished_qty = self.quantity_produced or Decimal('0.00')
+                # Record Finished Goods Output
+                finished_qty = target_qty
                 if finished_qty > Decimal('0.00'):
                     finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=self.product,
@@ -634,105 +796,159 @@ class WorkOrder(models.Model):
                         transaction_type='PRODUCTION_OUTPUT',
                         work_order=self
                     )
-                    print(f"   ✓ ADDED FINISHED GOODS ({self.product.name}): +{finished_qty} | Stock: {old_qty} -> {finished_inv.quantity_available}")
+                    print(f"   [OK] [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
 
-                # --- C. Final Safety Gate ---
                 self.is_inventory_updated = True
                 super().save(update_fields=['is_inventory_updated', 'production_end_date'])
-                print("[SAFETY GATE] Flipped self.is_inventory_updated = True")
+                self.sync_child_packaging_expectations()
+                print("[SAFETY GATE] Flipped self.is_inventory_updated = True and synced child packaging expectations", flush=True)
 
-        print("[HYBRID INVENTORY ENGINE END]")
-        print("==================================================\n")
+        print("[HYBRID INVENTORY ENGINE END]", flush=True)
+        print("==================================================\n", flush=True)
+
+    def sync_child_packaging_expectations(self):
+        """
+        DYNAMIC YIELD AUTO-SCALING:
+        When a Stage 1 Bulk WorkOrder reaches COMPLETED status, synchronizes the actual bulk yield
+        (self.quantity_produced) to all linked child Stage 2 packaging work order material lines 
+        where component == self.product. Updates quantity_expected on each matching WorkOrderMaterialLine.
+
+        Why yield auto-scaling prevents allocation crashes:
+        In continuous process manufacturing, actual intermediate bulk mixing yields vary from initial target quantities 
+        due to physical evaporation, vessel hold-up, or scrap. Automatically scaling child packaging material lines' 
+        quantity_expected to match actual bulk output ensures material variance calculations and stock deductions 
+        reflect exact physical reality without triggering negative stock allocations or system crashes.
+        """
+        bulk_yield = self.quantity_produced or Decimal('0.00')
+        with transaction.atomic():
+            for child_wo in self.child_packaging_orders.all():
+                mat_lines = child_wo.material_lines.filter(component=self.product)
+                for line in mat_lines:
+                    line.quantity_expected = bulk_yield
+                    line.save(update_fields=['quantity_expected'])
+                    # Synchronize corresponding MaterialVarianceRecord if exists
+                    MaterialVarianceRecord.sync_from_material_line(line)
+
+    def sync_material_lines(self):
+        """
+        Ensures a WorkOrderMaterialLine exists for every BOM item in the selected BillOfMaterial.
+        Does NOT alter existing lines' quantity_actual or auto-fill other lines!
+        """
+        if not self.bill_of_material:
+            return
+
+        for item in self.bill_of_material.items.all():
+            target_qty = self.target_quantity
+            expected_qty = (item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if target_qty else Decimal('0.00')
+            line, created = WorkOrderMaterialLine.objects.get_or_create(
+                work_order=self,
+                component=item.component,
+                defaults={
+                    'quantity_actual': Decimal('0.00'),
+                    'quantity_expected': expected_qty,
+                }
+            )
+            if not created and (line.quantity_expected is None or line.quantity_expected == Decimal('0.00')):
+                if expected_qty > Decimal('0.00'):
+                    line.quantity_expected = expected_qty
+                    line.save(update_fields=['quantity_expected'])
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
-        print("\n==================================================")
-        print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}")
+        print("\n==================================================", flush=True)
+        print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}", flush=True)
 
-        # AUTO-GENERATE CODE & ASSIGN BOM
-        if not self.work_order_code:
-            prefix = "WOC"
-            last_wo = WorkOrder.objects.filter(work_order_code__startswith=prefix).order_by('work_order_id').last()
-            new_seq = (int(last_wo.work_order_code.split('-')[-1]) + 1) if (last_wo and last_wo.work_order_code) else 1
-            self.work_order_code = f"{prefix}-{new_seq:04d}"
-            print(f"[LOG] Generated new Work Order Code: {self.work_order_code}")
+        with transaction.atomic():
+            # AUTO-GENERATE CODE & ASSIGN BOM
+            if not self.work_order_code:
+                prefix = "WOC"
+                last_wo = WorkOrder.objects.filter(work_order_code__startswith=prefix).order_by('work_order_id').last()
+                new_seq = (int(last_wo.work_order_code.split('-')[-1]) + 1) if (last_wo and last_wo.work_order_code) else 1
+                self.work_order_code = f"{prefix}-{new_seq:04d}"
+                print(f"[LOG] Generated new Work Order Code: {self.work_order_code}", flush=True)
 
-        if not self.bill_of_material and self.product:
-            active_bom = self.product.boms.filter(is_active=True).first()
-            if active_bom:
-                self.bill_of_material = active_bom
-                print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}")
+            if not self.bill_of_material and self.product:
+                active_bom = self.product.boms.filter(is_active=True).first()
+                if active_bom:
+                    self.bill_of_material = active_bom
+                    print(f"[LOG] Auto-assigned Active BOM: {self.bill_of_material}", flush=True)
 
-        current_status = (self.status or '').upper().strip()
-        is_completed = (current_status == 'COMPLETED')
+            current_status = (self.status or '').upper().strip()
+            is_completed = (current_status == 'COMPLETED')
 
-        print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}")
-        print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}")
+            print(f"[LOG] Raw Status: '{self.status}' | Normalized: '{current_status}' | Is Completed: {is_completed}", flush=True)
+            print(f"[LOG] Inventory Already Updated Flag: {self.is_inventory_updated}", flush=True)
 
-        if is_completed and not self.production_end_date:
-            self.production_end_date = timezone.now()
+            if is_completed and not self.production_end_date:
+                self.production_end_date = timezone.now()
 
-        # SAVE MAIN RECORD
-        super().save(*args, **kwargs)
-        print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})")
+            # SAVE MAIN RECORD
+            super().save(*args, **kwargs)
+            print(f"[LOG] Main Work Order record saved to DB (PK: {self.pk})", flush=True)
 
-        # INITIALIZE MATERIAL LINES ON CREATION ONLY
-        if is_new and self.bill_of_material:
-            print("[LOG] Creating initial material lines from BOM...")
-            
-            # Direct Query to find linked ProductionOrder quantity
-            from .models import ProductionOrder
-            po = ProductionOrder.objects.filter(work_order=self).first()
-            
-            if po and po.quantity:
-                target_qty = po.quantity
-            elif self.quantity_produced and self.quantity_produced > Decimal('0.00'):
-                target_qty = self.quantity_produced
-            else:
-                target_qty = Decimal('1.00')
+            # AUTO-SPAWNING PARENT BULK ORDERS (Stage 1 Intermediate)
+            # How auto-bundling calculates target requirements:
+            # When creating a new packaging WorkOrder for a FINISHED product, we inspect its active BOM.
+            # If the BOM contains an INTERMEDIATE sub-assembly component, we multiply the child order's 
+            # target production quantity (target_quantity or quantity_produced) by the BOM item's 
+            # quantity_required (target_qty * bom_item.quantity_required) to calculate total intermediate 
+            # bulk required. We programmatically instantiate the Stage 1 bulk WorkOrder (and ProductionOrder) 
+            # with status='IN_PROGRESS' and link it as self.parent_work_order within an atomic transaction.
+            if is_new and self.product and self.product.product_type == 'FINISHED' and self.parent_work_order is None:
+                active_bom = self.bill_of_material or self.product.boms.filter(is_active=True).first()
+                if active_bom:
+                    intermediate_item = active_bom.items.filter(component__product_type='INTERMEDIATE').first()
+                    if intermediate_item:
+                        target_qty = self.target_quantity or Decimal('0.00')
+                        bulk_required = (target_qty * intermediate_item.quantity_required).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        
+                        bulk_product = intermediate_item.component
+                        bulk_bom = bulk_product.boms.filter(is_active=True).first()
+                        
+                        parent_wo = WorkOrder.objects.create(
+                            product=bulk_product,
+                            bill_of_material=bulk_bom,
+                            production_start_date=self.production_start_date or timezone.now().date(),
+                            status='IN_PROGRESS',
+                            quantity_produced=bulk_required if bulk_required > Decimal('0.00') else Decimal('0.00')
+                        )
+                        
+                        self.parent_work_order = parent_wo
+                        super().save(update_fields=['parent_work_order'])
+                        print(f"[AUTO-BUNDLING] Auto-spawned parent Stage 1 Bulk WorkOrder #{parent_wo.pk} ({parent_wo.work_order_code}) requiring {bulk_required} units of '{bulk_product.name}'.", flush=True)
 
-            print(f"[LOG] Calculated Target Batch Quantity: {target_qty}")
+            # INITIALIZE / SYNC MATERIAL LINES FROM BOM
+            if self.bill_of_material:
+                self.sync_material_lines()
 
-            for item in self.bill_of_material.items.all():
-                per_unit_req = item.quantity_required or Decimal('0.00')
-                total_expected = per_unit_req * target_qty
-                
-                line, created = WorkOrderMaterialLine.objects.get_or_create(
-                    work_order=self,
-                    component=item.component,
-                    defaults={
-                        'quantity_expected': total_expected, 
-                        'quantity_actual': Decimal('0.00'),
-                        'quantity_issued': Decimal('0.00')
-                    }
-                )
-                print(f"      Created material line for {item.component.name}: Expected={total_expected}")
+            # AUTOMATED PRODUCTION ORDER STATUS SYNC
+            if self.pk:
+                from .models import ProductionOrder
+                linked_pos = ProductionOrder.objects.filter(work_order=self)
+                print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).", flush=True)
+                for po in linked_pos:
+                    po_status = (po.status or '').upper().strip()
+                    if is_completed and po_status != 'COMPLETED':
+                        po.status = 'COMPLETED'
+                        po.completed_at = timezone.now()
+                        po.save(update_fields=['status', 'completed_at'])
+                        print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.", flush=True)
 
-        # AUTOMATED PRODUCTION ORDER STATUS SYNC
-        if self.pk:
-            from .models import ProductionOrder
-            linked_pos = ProductionOrder.objects.filter(work_order=self)
-            print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).")
-            for po in linked_pos:
-                po_status = (po.status or '').upper().strip()
-                if is_completed and po_status != 'COMPLETED':
-                    po.status = 'COMPLETED'
-                    po.completed_at = timezone.now()
-                    po.save(update_fields=['status', 'completed_at'])
-                    print(f"    Updated ProductionOrder #{po.pk} status to COMPLETED.")
+            # DYNAMIC YIELD AUTO-SCALING TRIGGER FOR PARENT BULK RUNS
+            if is_completed and self.product and self.product.product_type == 'INTERMEDIATE':
+                self.sync_child_packaging_expectations()
 
-        print("[WORK ORDER SAVE END]")
-        print("==================================================\n")
+        print("[WORK ORDER SAVE END]", flush=True)
+        print("==================================================\n", flush=True)
                 
         
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
-   
 
 class BillOfMaterial(models.Model):
     bom_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']}, help_text="The finished or intermediate good this recipe creates.")
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='boms', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']}, help_text="Finished or Intermediate product this build recipe belongs to.")
     name = models.CharField(max_length=255, blank=True, help_text="name is auto-generated after the selected product if left blank.")
     is_active = models.BooleanField(default=True, help_text="Designates whether this is the active recipe used for live manufacturing runs.")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -768,7 +984,7 @@ class BillOfMaterial(models.Model):
         super().save(*args, **kwargs)        
 
     def __str__(self):
-        return f"BOM: {self.product.name} ({self.name}) - Active: {self.is_active}"
+        return self.name or f"BOM #{self.bom_id} ({self.product.name})"
 
 # The ingredient going into the recipe
 class BOMItem(models.Model):
@@ -796,70 +1012,228 @@ class BOMItem(models.Model):
 class WorkOrderMaterialLine(models.Model):
     work_order = models.ForeignKey('WorkOrder', on_delete=models.CASCADE, related_name='material_lines')
     component = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order_usages', limit_choices_to={'product_type__in': ['RAW', 'INTERMEDIATE']})
-    # What the recipe (BOM) says we should use for the PLANNED quantity
-    quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="Theoretical quantity calculated from BOM.") 
-    # What the team ACTUALLY consumed (default matches expected, but can be edited)
-    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), help_text="The actual physical quantity consumed during this run.")   
-    # Automated counter tracking stock already deducted for this line in prior saves.
-    quantity_issued = models.DecimalField(max_digits=10, decimal_places=4, default=Decimal('0.00'),help_text="Automated counter tracking stock already deducted for this line in prior saves.")
+    quantity_expected = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Planned / expected component requirement for this line.")
+    quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="The actual physical quantity consumed during this run.")   
+    deducted_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), editable=False, help_text="Tracks quantity already deducted from inventory.")
     
+    @property
+    def quantity_allocated(self):
+        """
+        Calculates planned quantity allocated for this material line based on BOM requirement
+        multiplied by ProductionOrder target quantity.
+        """
+        if not self.work_order or not self.work_order.bill_of_material:
+            return Decimal('0.00')
+
+        bom_item = self.work_order.bill_of_material.items.filter(component=self.component).first()
+        if not bom_item:
+            return Decimal('0.00')
+
+        target_qty = self.work_order.target_quantity
+        return (bom_item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
     class Meta:
         # Prevents adding the same raw material/component to the same work order twice
         unique_together = ('work_order', 'component')
         verbose_name = "Work Order Material Line"
         verbose_name_plural = "Work Order Material Lines"
-    @property
-    def variance(self):
-        """
-        Calculates material usage variance.
-        Positive = Over-consumption.
-        Negative = Under-consumption / Savings due to efficiency.
-        """
-        actual = self.quantity_actual or Decimal('0.00')
-        expected = self.quantity_expected or Decimal('0.00')
-        return actual - expected
 
-    @property
-    def waste(self):
-        """
-        Waste is only recorded when actual consumption exceeds expected usage.
-        If actual usage is <= expected, waste is 0.00.
-        """
-        return max(Decimal('0.00'), self.variance)
-
-    def clean(self):
-        super().clean()
-        # Fallback: Auto-calculate quantity_expected if blank but BOM/WorkOrder exists
-        if (not self.quantity_expected or self.quantity_expected == Decimal('0.00')) and self.work_order_id:
-            # Look up BOM item requirement for this component
-            if self.work_order.bill_of_material:
-                bom_item = self.work_order.bill_of_material.items.filter(component=self.component).first()
-                if bom_item and self.work_order.quantity_produced:
-                    self.quantity_expected = bom_item.quantity_required * self.work_order.quantity_produced
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        MaterialVarianceRecord.sync_from_material_line(self)
 
     def __str__(self):
-        return f"{self.component.name} for Work Order #{self.work_order.work_order_id}"
+        return f"{self.component.name} ({self.quantity_actual} consumed) for Work Order #{self.work_order.work_order_id}"
+
+class MaterialVarianceRecord(models.Model):
+    VARIANCE_CLASSIFICATION_CHOICES = [
+        ('FAVOURABLE', 'Favourable (Material Efficiency / Saved)'),
+        ('UNFAVOURABLE', 'Unfavourable (Waste / Over-consumption / Scrap)'),
+        ('EXACT', 'Exact Match / Zero Variance'),
+    ]
+
+    variance_id = models.AutoField(primary_key=True)
+    variance_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique material variance code.")
+    work_order_material_line = models.OneToOneField(
+        'WorkOrderMaterialLine',
+        on_delete=models.CASCADE,
+        related_name='variance_record',
+        null=True,
+        blank=True,
+        help_text="The work order material line this material variance originates from."
+    )
+    work_order = models.ForeignKey(
+        'WorkOrder',
+        on_delete=models.CASCADE,
+        related_name='variance_records',
+        null=True,
+        blank=True,
+        help_text="Parent Work Order."
+    )
+    product = models.ForeignKey(
+        'Product',
+        on_delete=models.PROTECT,
+        related_name='variance_records',
+        help_text="Component product associated with this variance record."
+    )
+    quantity_expected = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Planned / allocated BOM quantity required for this production run."
+    )
+    quantity_actual = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Actual physical quantity consumed during production."
+    )
+    quantity_variance = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Quantity variance (quantity_actual - quantity_expected)."
+    )
+    unit_cost = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Unit cost of component at time of variance calculation."
+    )
+    financial_impact = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Calculated financial impact (quantity_variance * unit_cost)."
+    )
+    variance_percentage = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('0.00'),
+        help_text="Percentage usage variance relative to expected."
+    )
+    efficiency_rate = models.DecimalField(
+        max_digits=10, decimal_places=2, default=Decimal('100.00'),
+        help_text="Material utilization efficiency rate percentage."
+    )
+    variance_classification = models.CharField(
+        max_length=20, choices=VARIANCE_CLASSIFICATION_CHOICES, default='EXACT', db_index=True
+    )
+    recorded_at = models.DateTimeField(auto_now=True, db_index=True)
+    notes = models.TextField(blank=True, help_text="Audit notes or breakdown for this variance record.")
+
+    def save(self, *args, **kwargs):
+        if not self.variance_code:
+            prefix = "MVR"
+            last_rec = MaterialVarianceRecord.objects.filter(
+                variance_code__startswith=prefix
+            ).order_by('variance_id').last()
+
+            if last_rec and last_rec.variance_code:
+                try:
+                    last_seq = int(last_rec.variance_code.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+
+            self.variance_code = f"{prefix}-{new_seq:04d}"
+
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def sync_from_material_line(cls, line):
+        if not line or not line.pk:
+            return None
+
+        actual = line.quantity_actual or Decimal('0.00')
+
+        expected = Decimal('0.00')
+        if line.work_order and line.work_order.bill_of_material:
+            bom_item = line.work_order.bill_of_material.items.filter(component=line.component).first()
+            if bom_item:
+                target_qty = line.work_order.target_quantity
+                expected = (bom_item.quantity_required * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        qty_var = (actual - expected).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        unit_cost = Decimal('0.00')
+        if line.component:
+            inv = line.component.stock.first()
+            if inv and inv.unit_cost:
+                unit_cost = inv.unit_cost
+
+        cost_impact = (qty_var * unit_cost).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        if expected > Decimal('0.00'):
+            pct = (qty_var / expected) * Decimal('100.00')
+            pct = pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            pct = Decimal('0.00')
+
+        if actual > Decimal('0.00'):
+            eff = (expected / actual) * Decimal('100.00')
+            eff = eff.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            eff = Decimal('100.00')
+
+        if qty_var > Decimal('0.00'):
+            v_class = 'UNFAVOURABLE'
+        elif qty_var < Decimal('0.00'):
+            v_class = 'FAVOURABLE'
+        else:
+            v_class = 'EXACT'
+
+        rec, created = cls.objects.get_or_create(
+            work_order_material_line=line,
+            defaults={
+                'work_order': line.work_order,
+                'product': line.component,
+                'quantity_expected': expected,
+                'quantity_actual': actual,
+                'quantity_variance': qty_var,
+                'unit_cost': unit_cost,
+                'financial_impact': cost_impact,
+                'variance_percentage': pct,
+                'efficiency_rate': eff,
+                'variance_classification': v_class,
+                'notes': f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
+            }
+        )
+
+        if not created:
+            rec.work_order = line.work_order
+            rec.product = line.component
+            rec.quantity_expected = expected
+            rec.quantity_actual = actual
+            rec.quantity_variance = qty_var
+            rec.unit_cost = unit_cost
+            rec.financial_impact = cost_impact
+            rec.variance_percentage = pct
+            rec.efficiency_rate = eff
+            rec.variance_classification = v_class
+            rec.notes = f"Auto-calculated material variance for WO #{line.work_order_id} ({line.component.name})"
+            rec.save()
+
+        return rec
+
+    def __str__(self):
+        code = self.variance_code or f"MVR-{self.variance_id:04d}"
+        sign = "+" if self.quantity_variance > 0 else ""
+        return f"{code} — {self.product.name} ({sign}{self.quantity_variance:.2f} units, ${self.financial_impact:.2f})"
+
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [
-        ('IN_PROGRESS', 'in_progress'),
-        ('COMPLETED', 'completed'),
-        ('CANCELLED', 'cancelled'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('ON_HOLD_SHORTAGE', 'On Hold (Stock Shortage)'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
     ]
     production_order_id = models.AutoField(primary_key=True)
+    production_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique production order code.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.01'))], help_text="Quantity to be produced in this specific run.")
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Manufacturing cost per unit for this specific batch.")
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='IN_PROGRESS', db_index=True)
     notes = models.TextField(blank=True, null=True, help_text="Any issues or notes during this production run.")
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     completed_at = models.DateTimeField(auto_now=True)
 
     def complete_production(self):
-        """Calculates moving average cost and adds finished goods to Inventory."""
-        if self.status != 'completed':
+        """Calculates moving average cost (AVCO) without modifying quantity_available."""
+        if (self.status or '').upper().strip() != 'COMPLETED':
             return
 
         inventory, created = Inventory.objects.get_or_create(
@@ -870,21 +1244,19 @@ class ProductionOrder(models.Model):
             }
         )
 
-        current_qty = inventory.quantity_available
-        current_cost = inventory.unit_cost
-        batch_qty = self.quantity_produced
-        batch_cost = self.unit_cost
+        current_qty = inventory.quantity_available or Decimal('0.00')
+        current_cost = inventory.unit_cost or Decimal('0.00')
+        batch_qty = self.quantity or Decimal('0.00')
+        batch_cost = self.unit_cost or Decimal('0.00')
 
         total_qty = current_qty + batch_qty
 
-        if total_qty > 0:
+        if total_qty > Decimal('0.00'):
             current_value = current_qty * current_cost
             batch_value = batch_qty * batch_cost
             
             new_weighted_cost = (current_value + batch_value) / total_qty
-            
-            inventory.unit_cost = round(new_weighted_cost, 2)
-            inventory.quantity_available = total_qty
+            inventory.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             inventory.save()
  
 
@@ -921,7 +1293,7 @@ class ProductionOrder(models.Model):
                 old_status = old_status.upper().strip()
 
         is_now_in_progress = (current_status == 'IN_PROGRESS')
-        was_in_progress = (old_status == 'IN_PROGRESS')
+        was_in_progress = (old_status in ['IN_PROGRESS', 'COMPLETED'])
 
         # Trigger stock pre-check when starting production run
         if is_now_in_progress and not was_in_progress:
@@ -938,6 +1310,7 @@ class ProductionOrder(models.Model):
                 bom = self.work_order.bill_of_material
 
             if bom:
+                shortage_msgs = []
                 for item in bom.items.all():
                     item_req = item.quantity_required or Decimal('0.00')
                     total_needed = item_req * target_qty
@@ -951,13 +1324,37 @@ class ProductionOrder(models.Model):
 
                     if total_available < total_needed:
                         shortage = total_needed - total_available
-                        raise ValidationError(
-                            f"Insolvent Stock Error: Insufficient inventory for ingredient '{item.component.name}'. "
-                            f"Required for planned run: {total_needed:.2f}, Available: {total_available:.2f} (Shortage: {shortage:.2f})."
-                        )
+                        shortage_msgs.append(f"{item.component.name} (Need: {total_needed:.2f}, Avail: {total_available:.2f}, Short: {shortage:.2f})")
+
+                if shortage_msgs:
+                    self.status = 'ON_HOLD_SHORTAGE'
+                    shortage_note = f"[MRP SHORTAGE FLAGGED] Insufficient inventory: {'; '.join(shortage_msgs)}"
+                    if not self.notes:
+                        self.notes = shortage_note
+                    elif shortage_note not in self.notes:
+                        self.notes = f"{self.notes}\n{shortage_note}"
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
+
+        # Auto-generate unique production order code if missing
+        if not self.production_order_code:
+            prefix = "POC"
+            last_po = ProductionOrder.objects.filter(
+                production_order_code__startswith=prefix
+            ).order_by('production_order_id').last()
+
+            if last_po and last_po.production_order_code:
+                try:
+                    last_seq = int(last_po.production_order_code.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+
+            self.production_order_code = f"{prefix}-{new_seq:04d}"
+
         old_status = None
         if not is_new:
             old_status = ProductionOrder.objects.filter(pk=self.pk).values_list('status', flat=True).first()
@@ -972,7 +1369,6 @@ class ProductionOrder(models.Model):
         elif self.status == 'CANCELLED':
             self.completed_at = None
 
-
         with transaction.atomic():
             super().save(*args, **kwargs)
 
@@ -980,12 +1376,18 @@ class ProductionOrder(models.Model):
             if is_new and self.work_order_id and hasattr(self.work_order, 'employee'):
                 self.employee.set(self.work_order.employee.all())
 
+            # Sync WorkOrder inventory processing from ProductionOrder target quantity
+            if self.work_order:
+                self.work_order.process_inventory()
+
             # Non-inventory completion logic (ensure this method does NOT update stock!)
             if is_transitioning_to_completed:
                 self.complete_production()
                 
     def __str__(self):
-        return f"Prod Order {self.production_order_id} ({self.get_status_display()}) - Blueprint: WO-{self.work_order.work_order_id}"            
+        code = self.production_order_code or f"POC-{self.production_order_id:04d}"
+        wo_code = getattr(self.work_order, 'work_order_code', f"WO-{self.work_order_id}") if self.work_order else "N/A"
+        return f"{code} ({self.get_status_display()}) - Blueprint: {wo_code}"            
 class Customer(models.Model):
     customer_id = models.AutoField(primary_key=True)    
     customer_name = models.CharField(max_length=255)
@@ -994,7 +1396,7 @@ class Customer(models.Model):
 
     def __str__(self):
         return self.customer_name
-    
+
 class SalesOrder(models.Model):
     STATUS_CHOICES = [
         ('draft', 'Draft'),
@@ -1006,70 +1408,117 @@ class SalesOrder(models.Model):
     
     order_number = models.CharField(max_length=50, unique=True, editable=False, blank=True)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT)
-    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft')
-    created_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft', editable=False, db_index=True, help_text="Automated state machine based on items and dispatch progress.")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def update_status(self, save=True):
+        """
+        Recalculates and updates Sales Order status automatically based on items and dispatch progress:
+        - If status is 'cancelled': preserve 'cancelled'.
+        - If no items or total_ordered == 0: 'draft'
+        - If items exist and total_dispatched == 0: 'approved'
+        - If 0 < total_dispatched < total_ordered: 'partially_dispatched'
+        - If total_dispatched >= total_ordered (> 0): 'completed'
+        """
+        if self.status == 'cancelled':
+            return self.status
+
+        if not self.pk:
+            return self.status
+
+        items = list(self.items.all())
+        if not items:
+            new_status = 'draft'
+        else:
+            total_ordered = sum(Decimal(str(item.quantity_ordered or 0)) for item in items)
+            total_dispatched = sum(Decimal(str(item.quantity_dispatched or 0)) for item in items)
+
+            if total_ordered <= Decimal('0.00'):
+                new_status = 'draft'
+            elif total_dispatched <= Decimal('0.00'):
+                new_status = 'approved'
+            elif total_dispatched < total_ordered:
+                new_status = 'partially_dispatched'
+            else:
+                new_status = 'completed'
+
+        if self.status != new_status:
+            self.status = new_status
+            if save:
+                SalesOrder.objects.filter(pk=self.pk).update(status=new_status)
+        return new_status
+
     def save(self, *args, **kwargs):
         # Auto-generate order number 
         if not self.order_number:
-            year_month = timezone.now().strftime('%Y%m') # e.g. "202607"
-            prefix = f"SO-{year_month}"
+            year_month = timezone.now().strftime('%Y%m')
+            prefix = f"SO-{year_month}-"
 
-            # Looks up the last created order for the current year & month
-            last_order = SalesOrder.objects.filter(
+            latest_order = SalesOrder.objects.filter(
                 order_number__startswith=prefix
             ).order_by('id').last()
 
-            if last_order and last_order.order_number:
-                # Extracts trailing digits and increments by 1
+            if latest_order and latest_order.order_number:
                 try:
-                    last_sequence = int(last_order.order_number.split('-')[-1])
-                    new_sequence = last_sequence + 1
-                except ValueError:
-                    new_sequence = 1
+                    last_sequence = int(latest_order.order_number.split('-')[-1])
+                    next_sequence = last_sequence + 1
+                except (ValueError, IndexError):
+                    next_sequence = 1
             else:
-                new_sequence = 1
+                next_sequence = 1
 
-            # Formats like: SO-202607-0001, SO-202607-0002, etc.
-            self.order_number = f"{prefix}-{new_sequence:04d}"
+            self.order_number = f"{prefix}{next_sequence:04d}"
 
         super().save(*args, **kwargs)
 
+        if self.pk and self.status != 'cancelled':
+            self.update_status(save=True)
+
     def __str__(self):
-        return f"SO-{self.order_number}"
+        return f"{self.order_number} - {self.customer.customer_name} ({self.get_status_display()})"
 
 class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})  
     quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2)
-    quantity_dispatched = models.PositiveIntegerField(default=0)  # Crucial for tracking partial shipments
-    unit_price = models.DecimalField(max_digits=10, decimal_places=2, blank=True)
-    # Use Sum Aggregation instead of `+=` to handle additions, updates, and deletes
-    def update_dispatched_quantity(self):
-        """Recalculates the exact sum of all related dispatches from the ground truth."""
-        # 'dispatch_records' is the related_name from the ForeignKey on DispatchRecord
-        total = self.dispatch_records.aggregate(
-            total_dispatched=Sum('quantity_dispatched')
-        )['total_dispatched'] or Decimal('0.00')
-        
-        # Only save if the data actually drifted
-        if self.quantity_dispatched != total:
-            self.quantity_dispatched = total
-            # update_fields is a win and avoids overwriting other fields
-            self.save(update_fields=['quantity_dispatched'])
+    quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
 
-    def save(self, *args, **kwargs):
-        # Auto-populate line item price from the finished good's catalog selling price
-        if not self.unit_price and self.product and self.product.selling_price:
-            self.unit_price = self.product.selling_price
-        super().save(*args, **kwargs)        
+    @property
+    def unit_price(self):
+        if self.product and self.product.selling_price is not None:
+            return self.product.selling_price
+        return Decimal('0.00')
 
     @property
     def total_price(self):
-        return (self.quantity_ordered or 0) * (self.unit_price or 0)    
+        qty = Decimal(str(self.quantity_ordered or '0.00'))
+        return qty * self.unit_price
+
+    def update_dispatched_quantity(self):
+        """Recalculates the exact sum of all related shipped/delivered dispatches from the ground truth."""
+        total = self.dispatch_records.filter(status__in=['shipped', 'delivered']).aggregate(
+            total_dispatched=Sum('quantity_dispatched')
+        )['total_dispatched'] or Decimal('0.00')
+        
+        if self.quantity_dispatched != total:
+            self.quantity_dispatched = total
+            self.save(update_fields=['quantity_dispatched'])
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.sales_order_id:
+            self.sales_order.update_status(save=True)
+
+    def delete(self, *args, **kwargs):
+        so = self.sales_order
+        super().delete(*args, **kwargs)
+        if so and so.pk:
+            so.update_status(save=True)
 
     def __str__(self):
         return f"Item: {self.product.name} ({self.quantity_dispatched}/{self.quantity_ordered} Dispatched)"
+
 class DispatchRecord(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending / Preparing'),
@@ -1078,15 +1527,16 @@ class DispatchRecord(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     dispatch_id = models.AutoField(primary_key=True)  
-    sales_order_item = models.ForeignKey('SalesOrder', on_delete=models.PROTECT, related_name='dispatches')
+    dispatch_code = models.CharField(max_length=30, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique dispatch code (e.g. DISP-0001).")
+    customer = models.ForeignKey('Customer', on_delete=models.PROTECT, related_name='dispatch_records', null=True, blank=True, help_text="Customer receiving this dispatch (must match Sales Order customer).")
+    sales_order_item = models.ForeignKey('SalesOrderItem', on_delete=models.PROTECT, related_name='dispatch_records', limit_choices_to={'sales_order__status__in': ['draft', 'approved', 'partially_dispatched']}, help_text="Only active, non-completed sales order items can be selected for dispatch.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
-    dispatch_date = models.DateField()
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    dispatch_date = models.DateField(default=timezone.now, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', db_index=True)
     delivery_date = models.DateField(blank=True, null=True, editable=False)
     is_stock_deducted = models.BooleanField(default=False, editable=False)
 
-        # Store original database values to track net differences on edit
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._orig_quantity = self.quantity_dispatched if self.pk else Decimal('0.00')
@@ -1094,192 +1544,209 @@ class DispatchRecord(models.Model):
     
     def clean(self):
         super().clean()
+
+        if self.sales_order_item:
+            so = self.sales_order_item.sales_order
+            expected_product = self.sales_order_item.product
+
+            if so:
+                # 1. Disallow dispatching to completed or cancelled sales orders for new dispatches
+                if not self.pk and so.status in ['completed', 'cancelled']:
+                    raise ValidationError({
+                        'sales_order_item': f"Cannot create dispatch for Sales Order #{so.order_number} because it has already been {so.get_status_display()}."
+                    })
+
+                # 2. Prevent adding a customer that does not match the sales order customer
+                if self.customer and self.customer != so.customer:
+                    raise ValidationError({
+                        'customer': f"Customer '{self.customer.customer_name}' does not match Customer '{so.customer.customer_name}' assigned to Sales Order #{so.order_number}."
+                    })
+
+            # 3. Prevent adding a product that does not match the sales order item product & suggest matching product
+            if self.product and expected_product and self.product != expected_product:
+                raise ValidationError({
+                    'product': f"Product Mismatch: The selected product '{self.product.name}' (SKU: {self.product.sku}) "
+                               f"does not match the product in Sales Order #{so.order_number if so else ''}. "
+                               f"Suggested matching product: '{expected_product.name}' (SKU: {expected_product.sku})."
+                })
         
         if not self.product or not self.quantity_dispatched or not self.sales_order_item:
             return
 
-        # 1. Calculate the net extra stock required for this save operation
-        if self.is_stock_deducted and self.status == 'delivered':
-            # Record was already deducted; check if quantity increased
-            additional_stock_needed = self.quantity_dispatched - self._orig_quantity
-        elif self.status == 'delivered':
-            # Moving to delivered for the first time
-            additional_stock_needed = self.quantity_dispatched
-        else:
-            additional_stock_needed = Decimal('0.00')
-
-        # 2. Check LIVE warehouse inventory if more stock is needed
-        if additional_stock_needed > 0:
-            total_available = self.product.stock.aggregate(
-                total=Sum('quantity_available')
-            )['total'] or Decimal('0.00')
-
-            if additional_stock_needed > total_available:
-                raise ValidationError({
-                    'quantity_dispatched': f"Cannot process request. Additional {additional_stock_needed} units required, "
-                                          f"but only {total_available} units are currently available in inventory."
-                })
-
-        # 3. Order line validation based on current DB state
-        order_item = self.sales_order_item.items.filter(product=self.product).first()
-        if not order_item:
-            raise ValidationError({
-                'product': f"This product is not part of Sales Order #{self.sales_order_item.order_number}."
-            })
-
-        other_dispatches = DispatchRecord.objects.filter(
-            sales_order_item=self.sales_order_item,
-            product=self.product
-        )
-        if self.pk:
-            other_dispatches = other_dispatches.exclude(pk=self.pk)
-
-        already_shipped = other_dispatches.aggregate(
-            total=Sum('quantity_dispatched')
-        )['total'] or Decimal('0.00')
-
-        remaining_order_qty = order_item.quantity_ordered - already_shipped
-
-        if self.quantity_dispatched > remaining_order_qty:
-            raise ValidationError({
-                'quantity_dispatched': f"Cannot dispatch {self.quantity_dispatched} units. "
-                                      f"Only {remaining_order_qty} units remain on this order line."
-            })
+        was_deducted_before = self._orig_status in ['shipped', 'delivered']
+        is_deducting_now = self.status in ['shipped', 'delivered']
+        
+        if is_deducting_now:
+            if was_deducted_before:
+                diff = self.quantity_dispatched - self._orig_quantity
+            else:
+                diff = self.quantity_dispatched
+            
+            if diff > Decimal('0.00') and self.product:
+                inventory = Inventory.objects.filter(product=self.product).first()
+                current_available = inventory.quantity_available if inventory else Decimal('0.00')
+                
+                if diff > current_available:
+                    raise ValidationError({
+                        'quantity_dispatched': f"Insufficient stock available! You requested {self.quantity_dispatched} "
+                                               f"(Net addition of +{diff}), but only {current_available} units of "
+                                               f"'{self.product.name}' are currently available in inventory."
+                    })
 
     def save(self, *args, **kwargs):
-        self.full_clean()  
-        
-        # Executes once when status is marked 'delivered'
-        with transaction.atomic():
-            # Handle stock deductions or dynamic adjustments
-            if self.status == 'delivered':
+        # Auto-populate customer from Sales Order if missing
+        if self.sales_order_item and self.sales_order_item.sales_order and not self.customer:
+            self.customer = self.sales_order_item.sales_order.customer
+
+        # Auto-populate product from Sales Order Item if missing
+        if self.sales_order_item and self.sales_order_item.product and not self.product:
+            self.product = self.sales_order_item.product
+        # Auto-generate unique dispatch code if missing
+        if not self.dispatch_code:
+            prefix = "DISP"
+            latest = DispatchRecord.objects.filter(
+                dispatch_code__startswith=prefix
+            ).order_by('-dispatch_code').first()
+
+            if latest and latest.dispatch_code:
+                try:
+                    last_seq = int(latest.dispatch_code.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+
+            self.dispatch_code = f"{prefix}-{new_seq:04d}"
+
+        # Status Automation & Stock Deductions
+        was_deducted_before = self._orig_status in ['shipped', 'delivered']
+        is_deducting_now = self.status in ['shipped', 'delivered']
+
+        becoming_deducted = is_deducting_now and not was_deducted_before
+        leaving_deducted = not is_deducting_now and was_deducted_before
+        quantity_changed = is_deducting_now and was_deducted_before and (self.quantity_dispatched != self._orig_quantity)
+
+        if is_deducting_now:
+            self.is_stock_deducted = True
+            if self.status == 'delivered' and not self.delivery_date:
                 self.delivery_date = timezone.now().date()
-                
-                # Compute net stock change
-                if not self.is_stock_deducted:
-                    qty_to_deduct = self.quantity_dispatched
-                else:
-                    qty_to_deduct = self.quantity_dispatched - self._orig_quantity
-
-                if qty_to_deduct != 0:
-                    self._apply_stock_change(qty_to_deduct)
-                    self.is_stock_deducted = True
-
-            elif self._orig_status == 'delivered' and self.status != 'delivered':
-                # Status changed away from delivered -> restore stock back to warehouse
-                self._apply_stock_change(-self.quantity_dispatched)
-                self.is_stock_deducted = False
+            elif self.status != 'delivered':
                 self.delivery_date = None
+        else:
+            self.is_stock_deducted = False
+            self.delivery_date = None
 
+        self.full_clean()
+
+        with transaction.atomic():
             super().save(*args, **kwargs)
-            
-            # Recalculate parent order item state dynamically from database
+
+            if becoming_deducted:
+                self._apply_stock_change(self.quantity_dispatched)
+            elif leaving_deducted:
+                self._apply_stock_change(-self._orig_quantity)
+            elif quantity_changed:
+                diff = self.quantity_dispatched - self._orig_quantity
+                self._apply_stock_change(diff)
+
             self._sync_parent_order_status()
 
+            # Refresh original tracked values for instance reuse
+            self._orig_quantity = self.quantity_dispatched
+            self._orig_status = self.status
+
+    def _apply_stock_change(self, qty_to_deduct):
+        """
+        Deducts (or restores) stock in Inventory for this dispatch record's product
+        and records a StockTransaction entry.
+        """
+        qty = Decimal(str(qty_to_deduct))
+        if qty == Decimal('0.00'):
+            return
+
+        inventory_item, _ = Inventory.objects.select_for_update().get_or_create(
+            product=self.product,
+            defaults={'quantity_available': Decimal('0.00')}
+        )
+
+        inventory_item.quantity_available -= qty
+        inventory_item.save()
+
+        StockTransaction.objects.create(
+            product=self.product,
+            dispatch_record=self,
+            quantity=-qty,
+            transaction_type='SHIPMENT',
+            notes=f"Stock adjustment of {-qty} units via Dispatch #{self.dispatch_code or self.dispatch_id}"
+        )
+
     def _sync_parent_order_status(self):
-        # Calculate total shipped for this order item
         total_shipped = DispatchRecord.objects.filter(
             sales_order_item=self.sales_order_item,
-            product=self.product,
-            status='delivered'
+            status__in=['shipped', 'delivered']
         ).aggregate(total=Sum('quantity_dispatched'))['total'] or Decimal('0.00')
         
         sales_order_item = self.sales_order_item
         sales_order_item.quantity_dispatched = total_shipped
         sales_order_item.save(update_fields=['quantity_dispatched'])
 
-        # Local reference for clarity (self.sales_order_item points to SalesOrderItem)
-        sales_order = sales_order_item.sales_order
-        order_items = sales_order.items.all()
+        if sales_order_item.sales_order:
+            sales_order_item.sales_order.update_status(save=True)
 
-        if order_items.exists():
-            all_completed = all(item.quantity_dispatched >= item.quantity_ordered for item in order_items)
-            any_shipped = any(item.quantity_dispatched > 0 for item in order_items)
-
-            if all_completed:
-                sales_order.status = 'completed'
-            elif any_shipped:
-                sales_order.status = 'partially_dispatched'
-            else:
-                # Only revert to 'approved' if it was previously dispatched/completed
-                if sales_order.status in ['completed', 'partially_dispatched']:
-                    sales_order.status = 'approved'
-
-            sales_order.save(update_fields=['status'])
     def delete(self, *args, **kwargs):
         # Capture the item reference before deleting the row
         with transaction.atomic():
             if self.is_stock_deducted:
                 self._apply_stock_change(-self.quantity_dispatched)
-            parent_order = self.sales_order_item
+            parent_item = self.sales_order_item
             super().delete(*args, **kwargs)
             
-            # Re-sync parent order after deletion
-            if parent_order:
-                for item in parent_order.items.all():
-                    item.quantity_dispatched = DispatchRecord.objects.filter(
-                        sales_order_item=parent_order,
-                        product=item.product,
-                        status='delivered'
-                    ).aggregate(total=Sum('quantity_dispatched'))['total'] or Decimal('0.00')
-                    item.save(update_fields=['quantity_dispatched'])            
-        
-        # Save modifications cleanly
-        super().save(*args, **kwargs)   
+            # Re-sync parent order item and order status after deletion
+            if parent_item:
+                parent_item.update_dispatched_quantity()
+                if parent_item.sales_order:
+                    parent_item.sales_order.update_status(save=True)
         
     def __str__(self):
+        code = self.dispatch_code or f"DISP-{self.dispatch_id:04d}"
         status_str = f" [{self.get_status_display()}]"
         date_str = f" delivered {self.delivery_date}" if self.delivery_date else ""
-        return f"Dispatch {self.dispatch_id}{status_str} — {self.quantity_dispatched}x {self.product.name}{date_str}"
-class Invoice(models.Model):
+        return f"{code}{status_str} — {self.quantity_dispatched}x {self.product.name}{date_str}"
+class SalesInvoice(models.Model):
     ENTRY_TYPE_CHOICES = [
         ('Paid', 'Paid'),
         ('Partial', 'Partial Payment'),
         ('Unpaid', 'Unpaid'),
     ]
     invoice_id = models.AutoField(primary_key=True)
-    invoice_number = models.CharField(max_length=255, unique=True, blank=True, help_text="Unique identifier for the invoice. Auto-generated if left blank.")
-    customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    invoice_date = models.DateField()
+    invoice_number = models.CharField(max_length=255, unique=True, editable=False, blank=True, help_text="Unique identifier for the invoice. Auto-generated.")
+    customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
+    dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
+    invoice_date = models.DateField(default=timezone.now, db_index=True)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
-    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
+    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid', db_index=True)
 
-    def clean_fields(self, exclude=None):
-        # Round right as Django starts validating individual fields
+    def clean(self):  
+        super().clean()     
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
                 rounding=ROUND_HALF_UP
             )
-        super().clean_fields(exclude=exclude)
-
-    def clean(self):  
-        super().clean()     
-        if self.total_amount is not None:
-                self.total_amount = Decimal(str(self.total_amount)).quantize(
-                    Decimal('0.01'), 
-                    rounding=ROUND_HALF_UP
-                )
-        if self.dispatch and self.invoice_date < self.dispatch.dispatch_date:
+        if self.dispatch and self.dispatch.dispatch_date and self.invoice_date and self.invoice_date < self.dispatch.dispatch_date:
             raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the physical dispatch date.'}) 
-                   
-    # validation to ensure that invoice date is not before dispatch date and total amount is calculated based on quantity dispatched and cost per unit of the material in the production order
-            
-        
+
     def save(self, *args, **kwargs):
-        # Auto-calculates total amount based on dispatch volume and true inventory cost
-        if self.dispatch and hasattr(self.dispatch, 'production_order') and self.dispatch.production_order.product:
-            target_product = self.dispatch.production_order.product
-            
-            # Look up the warehouse bucket for this item to grab its live average asset cost
-            inventory_record = Inventory.objects.filter(
-                product=target_product, 
-                location='Main Warehouse' # Adjust to the primary location string if different
-            ).first()
-            # Fall back to 0.00 if no inventory record exists yet
-            current_unit_cost = inventory_record.unit_cost if inventory_record else Decimal('0.00')
-            self.total_amount = self.dispatch.quantity_dispatched * current_unit_cost
+        # Auto-calculate total amount based on dispatch volume and selling price
+        if self.dispatch and self.dispatch.product:
+            price = self.dispatch.product.selling_price or Decimal('0.00')
+            if price == Decimal('0.00') and hasattr(self.dispatch.product, 'stock'):
+                inv = self.dispatch.product.stock.first()
+                if inv and inv.unit_cost:
+                    price = inv.unit_cost
+            self.total_amount = (self.dispatch.quantity_dispatched or Decimal('0.00')) * price
+
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
@@ -1287,43 +1754,62 @@ class Invoice(models.Model):
             )
        
         if not self.invoice_number:
-            # Generate a clean corporate format: INV-YEAR-MONTH-ID (e.g., INV-2026-07-0001)
-            from datetime import datetime
-            year_month = datetime.today().strftime("%Y-%m")
-            
-            # Find the last invoice ID to make it sequential
-            last_invoice = Invoice.objects.all().order_by('invoice_id').last()
-            next_id = (last_invoice.invoice_id + 1) if last_invoice else 1
-            
-            # Format with leading zeros so it stays neat (zfill padding)
-            self.invoice_number = f"INV-{year_month}-{str(next_id).zfill(4)}"
+            year_month = timezone.now().strftime('%Y%m')
+            prefix = f"SINV-{year_month}-"
+            latest = SalesInvoice.objects.filter(
+                invoice_number__startswith=prefix
+            ).order_by('-invoice_number').first()
+
+            if latest and latest.invoice_number:
+                try:
+                    last_seq = int(latest.invoice_number.split('-')[-1])
+                    next_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    next_seq = 1
+            else:
+                next_seq = 1
+
+            self.invoice_number = f"{prefix}{next_seq:04d}"
+
         self.full_clean()    
         super().save(*args, **kwargs)
 
     @property
+    def total_paid(self):
+        """Calculates exact total payments collected for this sales invoice."""
+        total = self.sales_payments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        return Decimal(str(total)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @property
     def remaining_balance(self):
-        """Calculates the live remaining balance on the invoice."""
-        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.01')
-        return self.total_amount - total_paid
+        """Calculates accurate live remaining balance on the sales invoice."""
+        total = self.total_amount or Decimal('0.00')
+        rem = total - self.total_paid
+        return max(Decimal('0.00'), rem.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
-    def update_payment_status(self):
-        """Auto-updates customer bill status based on incoming payments."""
-        total_paid = self.sales_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.01')
+    def update_payment_status(self, save=True):
+        """Auto-updates customer invoice status based on incoming payments."""
+        paid = self.total_paid
+        total = self.total_amount or Decimal('0.00')
         
-        if total_paid >= self.total_amount:
-            self.status = 'Paid'
-        elif total_paid > 0:
-            self.status = 'Partial'
+        if paid >= total and total > Decimal('0.00'):
+            new_status = 'Paid'
+        elif paid > Decimal('0.00'):
+            new_status = 'Partial'
         else:
-            self.status = 'Unpaid'
-        self.save(update_fields=['status']) 
+            new_status = 'Unpaid'
 
+        if self.status != new_status:
+            self.status = new_status
+            if save and self.pk:
+                SalesInvoice.objects.filter(pk=self.pk).update(status=new_status)
+        return new_status
 
     def __str__(self):
-        return f"[Customer Invoice] #{self.invoice_number} — ${self.total_amount} ({self.customer.customer_name})"
+        return f"Sales Invoice #{self.invoice_number} — ${self.total_amount:.2f} ({self.customer.customer_name if self.customer else 'N/A'})"
 
 class SalesInvoicePayments(models.Model):
-    invoice = models.ForeignKey('Invoice', on_delete=models.CASCADE, related_name='sales_payments')
+    invoice = models.ForeignKey('SalesInvoice', on_delete=models.CASCADE, related_name='sales_payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
     payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card Transfer'), ('TRANSFER', 'Bank Transfer')])
     reference_number = models.CharField(max_length=100, blank=True)
@@ -1331,58 +1817,27 @@ class SalesInvoicePayments(models.Model):
 
     def clean(self):
         super().clean()
-        
-        # Normalizing the payment method to uppercase to handle any casing variations
         method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
         ref_num = (self.reference_number or '').strip()
-        method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
-        ref_num = (self.reference_number or '').strip()
-
         requires_reference = ['CARD', 'BANK']
 
         if method in requires_reference and not ref_num:
             raise ValidationError({
                 'reference_number': "A reference number (transaction ID or deposit confirmation) is required for payments made by card or bank transfer."
             })
-        # Skip validation if invoice or amount missing during form typing
-        if not hasattr(self, 'invoice') or self.amount is None:
-            return
-
-        # Gather all OTHER historical payments for this specific invoice
-        other_payments = self.invoice.sales_payments.all()
-        
-        # Edge Case Safeguard: If EDITING an existing payment row, 
-        # exclude its own old value from the history so we don't double-count it.
-        if self.pk:
-            other_payments = other_payments.exclude(pk=self.pk)
-
-        # Summing up what has already been collected
-        total_already_paid = other_payments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        
-        # Calculating remaining threshold limit
-        remaining_balance = self.invoice.total_amount - total_already_paid
-
-    @property
-    def remaining_balance(self):
-        """
-        Calculates live outstanding balance. 
-        """
-        total_paid = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
-        return self.total_amount - total_paid    
-        
-        
 
     def save(self, *args, **kwargs):
-        # Force the full validation routine to run before saving
         self.full_clean()
-        
         with transaction.atomic():
             super().save(*args, **kwargs)
-            self.invoice.update_payment_status()
+            if self.invoice:
+                self.invoice.update_payment_status(save=True)
+
+    def delete(self, *args, **kwargs):
+        inv = self.invoice
+        super().delete(*args, **kwargs)
+        if inv and inv.pk:
+            inv.update_payment_status(save=True)
 class PurchaseInvoice(models.Model):
     STATUS_CHOICES = [
         ('PAID', 'Paid'),
@@ -1390,89 +1845,84 @@ class PurchaseInvoice(models.Model):
         ('PARTIAL', 'Partially Paid'),
     ]   
     invoice_id = models.AutoField(primary_key=True)
-    invoice_number = models.CharField(max_length=50, unique=True, help_text="Unique identifier for the purchase invoice from the supplier.")
+    invoice_number = models.CharField(max_length=50, unique=True, null=True, blank=True, help_text="Unique identifier for the purchase invoice from the supplier.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
-    invoice_date = models.DateField()
-    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False)
+    invoice_date = models.DateField(default=timezone.now, db_index=True)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
 
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
-    paid_date = models.DateField(null=True, blank=True, help_text="Date when this invoice was fully settled.")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID', db_index=True)
+    paid_date = models.DateField(null=True, blank=True, editable=False, help_text="Date when this invoice was fully settled.")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def clean(self):
         super().clean()
         
         if self.procurement_order:
-            # Used getattr to safely fetch 'order_date'. 
-            # If it doesn't exist on ProcurementOrder, it returns None instead of crashing.
             po_date = getattr(self.procurement_order, 'order_date', None)
             
-            if po_date and self.invoice_date < po_date:
+            if po_date and self.invoice_date and self.invoice_date < po_date:
                 raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the procurement order date.'})
             
-            # Ensure supplier match
             if self.procurement_order.supplier != self.supplier:
                 raise ValidationError({'supplier': 'The supplier on the invoice must match the supplier on the procurement order.'})
             
     def save(self, *args, **kwargs):
         if self.procurement_order:
-            # Pulls the final calculated cost straight from the delivery record
             self.total_amount = self.procurement_order.total_cost
         else:
             if not self.total_amount:
                 self.total_amount = Decimal('0.00')
 
-        self.total_amount = Decimal(str(self.total_amount)).quantize(Decimal('0.01'))
+        self.total_amount = Decimal(str(self.total_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        if not self.invoice_date:
+            self.invoice_date = timezone.now().date()
         
         self.full_clean()    
         super().save(*args, **kwargs)
     
     @property
+    def total_paid(self):
+        """Calculates total payments made for this purchase invoice."""
+        if not self.pk:
+            return Decimal('0.00')
+        total = self.payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+        return Decimal(str(total)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    @property
     def remaining_balance(self):
         """Calculates live outstanding balance owed to the supplier."""
-        # Forced the invoice total to be a Decimal, even if Django/DB thinks it is None
-        invoice_total = self.total_amount
-        if invoice_total is None:
-            invoice_total = Decimal('0.00')
-            
-        # If the invoice has not been saved to the database yet (it has no primary key),
-        # there cannot possibly be any payments yet. Return the total immediately.
-        if not self.pk:
-            return invoice_total.quantize(Decimal('0.01'))
-            
-        # Safely calculate payments if the invoice exists in the database
-        try:
-            total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total']
-            if total_paid is None:
-                total_paid = Decimal('0.00')
-        except Exception:
-            total_paid = Decimal('0.00')
-            
-        # Run the math safely with guaranteed Decimal types on both sides
-        balance = invoice_total - total_paid
-        return balance.quantize(Decimal('0.01'))
+        invoice_total = self.total_amount or Decimal('0.00')
+        balance = invoice_total - self.total_paid
+        return max(Decimal('0.00'), balance.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
-    def update_payment_status(self):
-        """Auto-updates supplier bill status and date stamps based on outgoing payments."""
-        total_paid = self.purchase_payments.aggregate(total=models.Sum('amount'))['total'] or Decimal('0.00')
+    def update_payment_status(self, save=True):
+        """Auto-updates supplier bill status and paid_date stamp based on outgoing payments."""
+        total_paid = self.total_paid
+        invoice_total = self.total_amount or Decimal('0.00')
         
-        if total_paid >= self.total_amount:
+        if total_paid >= invoice_total and invoice_total > Decimal('0.00'):
             self.status = 'PAID'
-            
-                
-        elif total_paid > 0:
+            if not self.paid_date:
+                latest = self.payments.order_by('-paid_at').first()
+                if latest and latest.paid_at:
+                    self.paid_date = latest.paid_at.date()
+                else:
+                    self.paid_date = timezone.now().date()
+        elif total_paid > Decimal('0.00'):
             self.status = 'PARTIAL'
-            # Clear the date stamp if a payment is deleted and it drops back to partial
             self.paid_date = None
-            
         else:
             self.status = 'UNPAID'
-            # Clear the date stamp if all payments are deleted
             self.paid_date = None
-            
-        # Add 'paid_date' to the update_fields list so Django saves it
-        self.save(update_fields=['status', 'paid_date'])
+
+        if save and self.pk:
+            PurchaseInvoice.objects.filter(pk=self.pk).update(
+                status=self.status,
+                paid_date=self.paid_date
+            )
+        return self.status
 
 
     def __str__(self):
@@ -1482,30 +1932,36 @@ class PurchaseInvoice(models.Model):
         inv_number = self.invoice_number or "New"
         return f"Purchase Invoice #{inv_number} — ${invoice_total} ({supplier_name})"
 class PurchasePayment(models.Model):
-    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='purchase_payments')
-    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))])
-    payment_method = models.CharField(max_length=50, choices=[('CASH', 'Cash'), ('CARD', 'Card Transfer'), ('TRANSFER', 'Bank Transfer')])
-    reference_number = models.CharField(max_length=100, blank=True, null=True, help_text="Transaction reference/receipt ID for Bank and Mobile money transfers")
-    paid_at = models.DateTimeField(auto_now_add=True)
+    PAYMENT_METHOD_CHOICES = [
+        ('CASH', 'Cash'),
+        ('TRANSFER', 'Bank Transfer'),
+        ('CHEQUE', 'Cheque'),
+    ]
+
+    payment_id = models.AutoField(primary_key=True)
+    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='payments')
+    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default='TRANSFER')
+    paid_at = models.DateTimeField(default=timezone.now)
+    reference_number = models.CharField(max_length=100, blank=True, null=True, default='')
 
     def clean(self):
-        super().clean()        
-        # Normalizing the payment method to uppercase to handle any casing variations
-        method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
-        ref_num = (self.reference_number or '').strip()
-        method = (self.payment_method or '').upper()
-        
-        # Clean up the reference number by stripping empty spaces
-        ref_num = (self.reference_number or '').strip()
+        super().clean()
+        if self.purchase_invoice_id and self.amount:
+            already_paid = self.purchase_invoice.payments.exclude(pk=self.pk).aggregate(
+                total=models.Sum('amount')
+            )['total'] or Decimal('0.00')
+            remaining = (self.purchase_invoice.total_amount or Decimal('0.00')) - already_paid
+            if self.amount > remaining:
+                raise ValidationError({
+                    'amount': f"Payment of ${self.amount} exceeds remaining bill balance of ${remaining:.2f}."
+                })
 
-        requires_reference = ['CARD', 'BANK']
-
-        if method in requires_reference and not ref_num:
+        if self.payment_method in ['TRANSFER', 'CHEQUE'] and not self.reference_number:
             raise ValidationError({
                 'reference_number': "A reference number (transaction ID or deposit confirmation) is required for payments made by card or bank transfer."
             })
+
     def save(self, *args, **kwargs):
         # Keeps native Django field validations active
         self.full_clean()
@@ -1517,8 +1973,8 @@ class PurchasePayment(models.Model):
         with transaction.atomic():
             invoice = self.purchase_invoice
             super().delete(*args, **kwargs)
-            invoice.update_payment_status()    
-     
+            invoice.update_payment_status()
+
 class Return(models.Model):
     STATUS_TYPE_CHOICES = [
          ('PENDING', 'Pending Inspection'),
@@ -1533,7 +1989,7 @@ class Return(models.Model):
     
     quality_control_status = models.CharField(max_length=255, choices=STATUS_TYPE_CHOICES, default='PENDING')
     return_warehouse_location = models.CharField(max_length=255, default='Main Warehouse')
-        # validation to ensure that quantity returned does not exceed quantity dispatched in the dispatch record
+
     def save(self, *args, **kwargs):
         # 1. Secure our references (handles whether production_order is a direct field or accessed via dispatch)
         prod_order = getattr(self, 'production_order', None) or (self.dispatch.production_order if self.dispatch else None)
@@ -1578,45 +2034,19 @@ class Return(models.Model):
                     inventory_item.quantity_available += self.quantity_returned
                     inventory_item.save()
 
-                # Step B: Safely deduct returned items cost from the associated Invoice row
-                invoice_record = Invoice.objects.filter(dispatch=self.dispatch).first()
+                # Step B: Safely deduct returned items cost from the associated SalesInvoice row
+                invoice_record = SalesInvoice.objects.filter(dispatch=self.dispatch).first()
                 if invoice_record and invoice_record.total_amount and prod_order:
                     raw_return_value = self.quantity_returned * prod_order.product.cost_per_unit
-                    
-                    # FIXED: We clip the return value to exactly 2 decimal places BEFORE modifying the invoice!
                     return_value = raw_return_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    
                     invoice_record.total_amount -= return_value
                     # Extra safety shield: ensure the final invoice total is cleanly quantized too
                     invoice_record.total_amount = invoice_record.total_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    
                     invoice_record.save()
 
     def __str__(self):
         return f"Return #{self.return_id} — {self.quantity_returned} units from Dispatch #{self.dispatch.dispatch_id} ({self.quality_control_status})"        
-            
-class LossRecord(models.Model):
-    loss_id = models.AutoField(primary_key=True)
-    product = models.ForeignKey('Product', on_delete=models.CASCADE)
-    quantity_lost = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity lost must be a positive amount greater than zero.")
-    loss_date = models.DateField()
-    reason = models.TextField()
-    loss_location = models.CharField(max_length=255, default='Main Warehouse')
 
-    def save(self, *args, **kwargs):
-        self.full_clean()
-        with transaction.atomic():
-            super().save(*args, **kwargs)
-            
-            # CRITICAL ADDITION: Automatically deduct lost material amounts from physical inventory stock lines
-            inventory_item = Inventory.objects.filter(product=self.product, location=self.loss_location).first()
-            if inventory_item:
-                inventory_item.quantity_available -= self.quantity_lost
-                # Triggers clean validation checks if loss plunges stock into negative boundaries
-                inventory_item.save()
-
-    def __str__(self):
-        return f"Loss #{self.loss_id} — {self.quantity_lost} of {self.product.name} written off"
 class FinanceEntry(models.Model):
     finance_entry_id = models.AutoField(primary_key=True)
     ENTRY_TYPE_CHOICES = [
@@ -1631,27 +2061,26 @@ class FinanceEntry(models.Model):
         ('CUSTOMER_REFUND', 'Customer refund'),
         ('LOSS', 'Inventory Loss'),
     ]
-    entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE')  # e.g., 'Revenue', 'Expense'
-    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')  # e.g., 'Raw Material', 'Labor', 'Overhead'        
+    entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE', db_index=True)
+    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES', db_index=True)
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
-    Invoice = models.ForeignKey('Invoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
-    loss = models.ForeignKey('LossRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
+    sales_invoice = models.ForeignKey('SalesInvoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
+    material_variance = models.ForeignKey('MaterialVarianceRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
-    entry_date = models.DateField()
+    entry_date = models.DateField(db_index=True)
 
-    # validation to ensure that if entry type is 'Revenue', category cannot be 'Procurement' or 'Loss', and if entry type is 'Expense', category cannot be 'Sales'
     def clean(self):
         # 1. Prevent negative entries from skewing totals
         if self.entry_type == 'REVENUE' and self.category in ['PROCUREMENT', 'LOSS', 'LABOR', 'OVERHEAD']:
             raise ValidationError(f"A Revenue entry cannot be categorized under {self.get_category_display()}.")
         if self.entry_type == 'EXPENSE' and self.category == 'SALES':
             raise ValidationError("An Expense entry cannot be categorized under Sales Revenue.")
-        if self.loss and (self.entry_type != 'EXPENSE' and self.category != 'LOSS'):
-            raise ValidationError("Entries tied to a Loss Record must be set as an Expense under the Loss category.")
+        if self.material_variance and (self.entry_type != 'EXPENSE' and self.category != 'LOSS'):
+            raise ValidationError("Entries tied to a Material Variance Record must be set as an Expense under the Loss category.")
     
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
+
     def __str__(self):
         return f"[{self.get_entry_type_display()}] ${self.amount} — {self.get_category_display()} ({self.entry_date})"
-    

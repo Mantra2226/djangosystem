@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Executive Reporting Analytics Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #f8fafc;
+            --bg-card: #ffffff;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --border-color: #e2e8f0;
+            --brand-blue: #2563eb;
+            --brand-dark: #1e293b;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-amber: #f59e0b;
+            --accent-purple: #8b5cf6;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-main);
+            padding: 24px;
+            line-height: 1.5;
+        }
+
+        .header-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            background: var(--bg-card);
+            padding: 20px 28px;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+
+        .header-title h1 {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--brand-dark);
+        }
+
+        .header-title p {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .nav-actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: 600;
+            border-radius: 6px;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border: 1px solid transparent;
+        }
+
+        .btn-primary {
+            background-color: var(--brand-blue);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background-color: #1d4ed8;
+        }
+
+        .btn-outline {
+            background-color: transparent;
+            border-color: var(--border-color);
+            color: var(--text-main);
+        }
+
+        .btn-outline:hover {
+            background-color: #f1f5f9;
+        }
+
+        .filter-card {
+            background: var(--bg-card);
+            padding: 16px 24px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .filter-form {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .form-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .form-group input[type="date"] {
+            padding: 6px 10px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+        }
+
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .kpi-card {
+            background: var(--bg-card);
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background-color: var(--brand-blue);
+        }
+
+        .kpi-card.green::before { background-color: var(--accent-green); }
+        .kpi-card.red::before { background-color: var(--accent-red); }
+        .kpi-card.amber::before { background-color: var(--accent-amber); }
+        .kpi-card.purple::before { background-color: var(--accent-purple); }
+
+        .kpi-label {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .kpi-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--brand-dark);
+        }
+
+        .kpi-subtext {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .section-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+            gap: 24px;
+            margin-bottom: 28px;
+        }
+
+        .report-block {
+            background: var(--bg-card);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            padding: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+        }
+
+        .report-block-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 18px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .report-block-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--brand-dark);
+        }
+
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        .data-table th, .data-table td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid #f1f5f9;
+        }
+
+        .data-table th {
+            background-color: #f8fafc;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+        }
+
+        .data-table tr:hover {
+            background-color: #f8fafc;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .badge-danger { background: #fee2e2; color: #991b1b; }
+        .badge-success { background: #d1fae5; color: #065f46; }
+        .badge-warning { background: #fef3c7; color: #92400e; }
+        .badge-info { background: #e0f2fe; color: #075985; }
+
+        .metric-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px dashed var(--border-color);
+            font-size: 13px;
+        }
+
+        .metric-row:last-child {
+            border-bottom: none;
+        }
+
+        .metric-row.total {
+            font-weight: 700;
+            font-size: 14px;
+            color: var(--brand-dark);
+            border-top: 2px solid var(--border-color);
+            border-bottom: none;
+            padding-top: 12px;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header-bar">
+        <div class="header-title">
+            <h1>Executive Reporting Analytics Dashboard</h1>
+            <p>Real-time Financial P&L, COGM, Yield Efficiency, OTIF, and Cash Flow Metrics</p>
+        </div>
+        <div class="nav-actions">
+            <a href="/admin/" class="btn btn-outline">← Back to Django Admin</a>
+            <a href="/admin/core/salesinvoice/" class="btn btn-primary">Sales Reports</a>
+        </div>
+    </div>
+
+    <div class="filter-card">
+        <form method="GET" action="" class="filter-form">
+            <div class="form-group">
+                <label for="start_date">From Date:</label>
+                <input type="date" id="start_date" name="start_date" value="{{ start_date }}">
+            </div>
+            <div class="form-group">
+                <label for="end_date">To Date:</label>
+                <input type="date" id="end_date" name="end_date" value="{{ end_date }}">
+            </div>
+            <button type="submit" class="btn btn-primary">Filter Analytics</button>
+            {% if start_date or end_date %}
+                <a href="/reports/" class="btn btn-outline">Reset Filter</a>
+            {% endif %}
+        </form>
+        <span style="font-size: 12px; color: var(--text-muted);">Showing live system analytics as of {% now "Y-m-d H:i" %}</span>
+    </div>
+
+    <!-- Executive KPI Grid -->
+    <div class="kpi-grid">
+        <div class="kpi-card green">
+            <div class="kpi-label">Total Revenue</div>
+            <div class="kpi-value">${{ pnl.total_revenue|floatformat:2 }}</div>
+            <div class="kpi-subtext">Sales Invoices & Revenue Ledger</div>
+        </div>
+        <div class="kpi-card green">
+            <div class="kpi-label">Gross Profit</div>
+            <div class="kpi-value">${{ pnl.gross_profit|floatformat:2 }}</div>
+            <div class="kpi-subtext">Margin Rate: <strong>{{ pnl.gross_margin_pct }}%</strong></div>
+        </div>
+        <div class="kpi-card red">
+            <div class="kpi-label">COGS</div>
+            <div class="kpi-value">${{ pnl.cogs|floatformat:2 }}</div>
+            <div class="kpi-subtext">Cost of Goods Sold (Dispatches)</div>
+        </div>
+        <div class="kpi-card purple">
+            <div class="kpi-label">Total COGM</div>
+            <div class="kpi-value">${{ cogm.total_cogm|floatformat:2 }}</div>
+            <div class="kpi-subtext">Completed Builds: {{ cogm.completed_orders_count }}</div>
+        </div>
+        <div class="kpi-card amber">
+            <div class="kpi-label">Yield Efficiency</div>
+            <div class="kpi-value">{{ yield_scrap.yield_rate_pct }}%</div>
+            <div class="kpi-subtext">Produced vs Target Ratio</div>
+        </div>
+        <div class="kpi-card {% if inventory_otif.low_stock_count > 0 %}red{% else %}green{% endif %}">
+            <div class="kpi-label">Low-Stock Alerts</div>
+            <div class="kpi-value">{{ inventory_otif.low_stock_count }}</div>
+            <div class="kpi-subtext">Stock &le; 10 Units</div>
+        </div>
+        <div class="kpi-card green">
+            <div class="kpi-label">Supplier OTIF %</div>
+            <div class="kpi-value">{{ inventory_otif.otif_pct }}%</div>
+            <div class="kpi-subtext">On-Time In-Full Delivery</div>
+        </div>
+    </div>
+
+    <!-- Section Grid: P&L & COGM -->
+    <div class="section-grid">
+        <!-- Profit & Loss Summary -->
+        <div class="report-block">
+            <div class="report-block-header">
+                <span class="report-block-title">Profit &amp; Loss (P&amp;L) Financial Statement</span>
+                <span class="badge badge-info">Financial</span>
+            </div>
+            <div class="metric-row">
+                <span>Sales Invoice Revenue</span>
+                <span>${{ pnl.sales_revenue|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>Cost of Goods Sold (COGS)</span>
+                <span style="color: var(--accent-red);">-${{ pnl.cogs|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row total">
+                <span>Gross Profit</span>
+                <span>${{ pnl.gross_profit|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row" style="margin-top: 8px;">
+                <span>Operating Expenses (Ledger)</span>
+                <span style="color: var(--accent-red);">-${{ pnl.operating_expenses|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row total" style="color: var(--brand-blue);">
+                <span>Net Operating Income</span>
+                <span>${{ pnl.net_income|floatformat:2 }}</span>
+            </div>
+        </div>
+
+        <!-- Cost of Goods Manufactured (COGM) -->
+        <div class="report-block">
+            <div class="report-block-header">
+                <span class="report-block-title">Cost of Goods Manufactured (COGM)</span>
+                <span class="badge badge-warning">Production Cost</span>
+            </div>
+            <div class="metric-row">
+                <span>Direct Raw Materials Consumed</span>
+                <span>${{ cogm.raw_material_cost|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>Unfavourable Scrap &amp; Waste Variance</span>
+                <span style="color: var(--accent-red);">+${{ cogm.unfavourable_scrap|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>Favourable Material Savings</span>
+                <span style="color: var(--accent-green);">-${{ cogm.favourable_savings|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>Direct Labor Cost ({{ cogm.total_labor_hours }} Hours @ $25/hr)</span>
+                <span>${{ cogm.labor_cost|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row total">
+                <span>Total Manufactured Output Cost (COGM)</span>
+                <span>${{ cogm.total_cogm|floatformat:2 }}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Section Grid: Scrap Analytics & Low Stock Alerts -->
+    <div class="section-grid">
+        <!-- Production Yield & Scrap Analytics -->
+        <div class="report-block">
+            <div class="report-block-header">
+                <span class="report-block-title">Production Yield &amp; Machine Workload</span>
+                <span class="badge badge-info">Operations</span>
+            </div>
+            <div class="metric-row">
+                <span>Target Batch Volume</span>
+                <span>{{ yield_scrap.total_target_qty|floatformat:2 }} Units</span>
+            </div>
+            <div class="metric-row">
+                <span>Actual Output Volume</span>
+                <span>{{ yield_scrap.total_produced_qty|floatformat:2 }} Units</span>
+            </div>
+            <div class="metric-row">
+                <span>Material Variance Breakdown</span>
+                <span>
+                    <span class="badge badge-danger">{{ yield_scrap.unfavourable_count }} Waste</span>
+                    <span class="badge badge-success">{{ yield_scrap.favourable_count }} Saved</span>
+                    <span class="badge badge-info">{{ yield_scrap.exact_count }} Exact</span>
+                </span>
+            </div>
+            <div style="margin-top: 14px;">
+                <strong style="font-size: 12px; color: var(--text-muted); text-transform: uppercase;">Machine Center Load Breakdown:</strong>
+                <table class="data-table" style="margin-top: 6px;">
+                    <thead>
+                        <tr>
+                            <th>Workstation / Machine</th>
+                            <th>Total Steps</th>
+                            <th>Allocated Time (Mins)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for m in yield_scrap.machine_workload %}
+                        <tr>
+                            <td><strong>{{ m.machine }}</strong></td>
+                            <td>{{ m.step_count }}</td>
+                            <td>{{ m.total_time }} mins</td>
+                        </tr>
+                        {% empty %}
+                        <tr>
+                            <td colspan="3" style="text-align: center; color: var(--text-muted);">No machine routing steps logged.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Inventory Health & Low Stock Alerts -->
+        <div class="report-block">
+            <div class="report-block-header">
+                <span class="report-block-title">Inventory Health &amp; Low-Stock Alerts</span>
+                <span class="badge badge-danger">Reorder Control</span>
+            </div>
+            <div class="metric-row">
+                <span>Total Warehouse Valuation</span>
+                <span><strong>${{ inventory_otif.total_valuation|floatformat:2 }}</strong></span>
+            </div>
+            <div class="metric-row" style="margin-bottom: 12px;">
+                <span>Total Inventory Items Tracked</span>
+                <span>{{ inventory_otif.total_inventory_items }} SKUs</span>
+            </div>
+
+            <strong style="font-size: 12px; color: var(--text-muted); text-transform: uppercase;">Critical Reorder Point Items (&le; 10 Units):</strong>
+            <table class="data-table" style="margin-top: 6px;">
+                <thead>
+                    <tr>
+                        <th>Product / SKU</th>
+                        <th>Location</th>
+                        <th>Available Stock</th>
+                        <th>Supplier</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in inventory_otif.low_stock_items %}
+                    <tr>
+                        <td><strong>{{ item.product_name }}</strong><br><span style="font-size: 11px; color: var(--text-muted);">{{ item.sku }}</span></td>
+                        <td>{{ item.location }}</td>
+                        <td><span class="badge badge-danger">{{ item.available }}</span></td>
+                        <td>{{ item.supplier_name }}</td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: var(--accent-green); font-weight: 500;">✓ All stock levels exceed reorder safety thresholds.</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Section Grid: Accounts Receivable & Accounts Payable Aging -->
+    <div class="section-grid">
+        <!-- Accounts Receivable (A/R) Aging -->
+        <div class="report-block">
+            <div class="report-block-header">
+                <span class="report-block-title">Accounts Receivable (A/R) Aging Schedule</span>
+                <span class="badge badge-success">Sales Cash Flow</span>
+            </div>
+            <div class="metric-row">
+                <span>Current (0-30 Days)</span>
+                <span>${{ ar_aging.current_30|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>31-60 Days Overdue</span>
+                <span style="color: var(--accent-amber);">${{ ar_aging.days_31_60|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>61-90 Days Overdue</span>
+                <span style="color: var(--accent-red);">${{ ar_aging.days_61_90|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>90+ Days Critical</span>
+                <span style="color: var(--accent-red); font-weight: 700;">${{ ar_aging.days_90_plus|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row total">
+                <span>Total Outstanding Receivables</span>
+                <span>${{ ar_aging.total_ar|floatformat:2 }}</span>
+            </div>
+        </div>
+
+        <!-- Accounts Payable (A/P) Aging -->
+        <div class="report-block">
+            <div class="report-block-header">
+                <span class="report-block-title">Accounts Payable (A/P) Aging Schedule</span>
+                <span class="badge badge-warning">Supplier Liabilities</span>
+            </div>
+            <div class="metric-row">
+                <span>Current (0-30 Days)</span>
+                <span>${{ ap_aging.current_30|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>31-60 Days Owed</span>
+                <span style="color: var(--accent-amber);">${{ ap_aging.days_31_60|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>61-90 Days Owed</span>
+                <span style="color: var(--accent-red);">${{ ap_aging.days_61_90|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row">
+                <span>90+ Days Overdue</span>
+                <span style="color: var(--accent-red); font-weight: 700;">${{ ap_aging.days_90_plus|floatformat:2 }}</span>
+            </div>
+            <div class="metric-row total">
+                <span>Total Outstanding Payables</span>
+                <span>${{ ap_aging.total_ap|floatformat:2 }}</span>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
