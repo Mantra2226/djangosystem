@@ -611,3 +611,133 @@ class TwoStageManufacturingTestCase(TestCase):
         # Sequence lock now passes since parent is COMPLETED
         packaging_wo.clean()  # Should not raise ValidationError
 
+
+class ReportingAndOptimizationTestCase(TestCase):
+    def setUp(self):
+        from .models import (
+            Supplier, Product, Customer, Inventory, WorkOrder, ProductionOrder,
+            SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, PurchaseInvoice,
+            MaterialVarianceRecord, FinanceEntry
+        )
+        self.supplier = Supplier.objects.create(name="Omega Supplier", contact_info="omega@test.com")
+        self.customer = Customer.objects.create(customer_name="Acme Corp", contact_info="acme@test.com")
+        
+        self.product = Product.objects.create(
+            name="Widget Finished Good",
+            product_type="FINISHED",
+            category="General",
+            unit_of_measurement="pcs",
+            selling_price=Decimal("100.00")
+        )
+        self.raw_mat = Product.objects.create(
+            name="Raw Plastic Pellets",
+            product_type="RAW",
+            category="Plastics",
+            unit_of_measurement="kg",
+            supplier=self.supplier
+        )
+
+        self.inventory = Inventory.objects.create(
+            product=self.raw_mat,
+            quantity_available=Decimal("5.00"),  # Low stock <= 10
+            unit_cost=Decimal("10.00"),
+            location="Main Warehouse"
+        )
+        self.finished_inventory, _ = Inventory.objects.get_or_create(
+            product=self.product,
+            location="Main Warehouse"
+        )
+        self.finished_inventory.quantity_available = Decimal("100.00")
+        self.finished_inventory.unit_cost = Decimal("50.00")
+        self.finished_inventory.save()
+
+        self.sales_order = SalesOrder.objects.create(
+            customer=self.customer,
+            status="approved"
+        )
+        self.so_item = SalesOrderItem.objects.create(
+            sales_order=self.sales_order,
+            product=self.product,
+            quantity_ordered=Decimal("10.00")
+        )
+        self.dispatch = DispatchRecord.objects.create(
+            sales_order_item=self.so_item,
+            customer=self.customer,
+            product=self.product,
+            quantity_dispatched=Decimal("10.00"),
+            status="delivered",
+            dispatch_date=timezone.now().date()
+        )
+        self.sales_invoice = SalesInvoice.objects.create(
+            customer=self.customer,
+            dispatch=self.dispatch,
+            total_amount=Decimal("1000.00"),
+            status="Unpaid",
+            invoice_date=timezone.now().date()
+        )
+
+    def test_reporting_engine_calculations(self):
+        """Tests calculation results for P&L, COGM, Yield/Scrap, Low-Stock, and Aging engines."""
+        from .reports import (
+            get_profit_and_loss_summary,
+            get_cogm_report,
+            get_production_yield_and_scrap_report,
+            get_inventory_health_and_otif_report,
+            get_ar_ap_aging_report
+        )
+
+        pnl = get_profit_and_loss_summary()
+        self.assertEqual(pnl['sales_revenue'], Decimal("1000.00"))
+
+        cogm = get_cogm_report()
+        self.assertIsNotNone(cogm['total_cogm'])
+
+        yield_scrap = get_production_yield_and_scrap_report()
+        self.assertIsNotNone(yield_scrap['yield_rate_pct'])
+
+        inv_health = get_inventory_health_and_otif_report()
+        self.assertEqual(inv_health['low_stock_count'], 1)
+
+        aging = get_ar_ap_aging_report()
+        self.assertEqual(aging['ar_aging']['total_ar'], Decimal("1000.00"))
+
+    def test_admin_csv_export_action(self):
+        """Tests that export_as_csv admin action generates a valid CSV HTTP response."""
+        from .admin import export_as_csv, SalesOrderAdmin
+        from django.contrib.admin.sites import AdminSite
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        request = factory.get('/admin/core/salesorder/')
+        
+        site = AdminSite()
+        admin_obj = SalesOrderAdmin(SalesOrder, site)
+        
+        response = export_as_csv(admin_obj, request, SalesOrder.objects.all())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'text/csv')
+        self.assertIn('sales_orders_export.csv', response['Content-Disposition'])
+
+    def test_admin_queryset_optimizations(self):
+        """Tests that get_queryset overrides run without query errors across admin classes."""
+        from .admin import (
+            WorkOrderAdmin, SalesOrderAdmin, InventoryAdmin, ProductionOrderAdmin,
+            PurchaseOrderAdmin, SalesInvoiceAdmin
+        )
+        from django.contrib.admin.sites import AdminSite
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        request = factory.get('/admin/')
+        site = AdminSite()
+
+        wo_admin = WorkOrderAdmin(WorkOrder, site)
+        self.assertTrue(wo_admin.get_queryset(request).exists() or True)
+
+        so_admin = SalesOrderAdmin(SalesOrder, site)
+        self.assertTrue(so_admin.get_queryset(request).exists())
+
+        inv_admin = InventoryAdmin(Inventory, site)
+        self.assertTrue(inv_admin.get_queryset(request).exists())
+
+

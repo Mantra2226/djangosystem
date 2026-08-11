@@ -247,4 +247,58 @@ def mrp_resolve_action(request):
         redirect_url = request.META.get('HTTP_REFERER') or f'/admin/core/productionorder/{po_id}/change/'
         return redirect(redirect_url)
 
-    return redirect('/admin/')
+    return redirect('/admin/')
+
+
+@staff_member_required
+def reports_dashboard_view(request):
+    """
+    Executive Reporting Analytics Dashboard.
+    Provides consolidated operational metrics across Financial P&L, COGM, Yield/Scrap, 
+    Inventory Health/OTIF, and Accounts Receivable/Payable Aging.
+    """
+    from datetime import datetime
+    from .reports import (
+        get_profit_and_loss_summary,
+        get_cogm_report,
+        get_production_yield_and_scrap_report,
+        get_inventory_health_and_otif_report,
+        get_ar_ap_aging_report
+    )
+
+    start_date_str = request.GET.get('start_date')
+    end_date_str = request.GET.get('end_date')
+
+    start_date = None
+    end_date = None
+
+    if start_date_str:
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    if end_date_str:
+        try:
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    pnl = get_profit_and_loss_summary(start_date, end_date)
+    cogm = get_cogm_report(start_date, end_date)
+    yield_scrap = get_production_yield_and_scrap_report(start_date, end_date)
+    inventory_otif = get_inventory_health_and_otif_report()
+    aging = get_ar_ap_aging_report()
+
+    context = {
+        'start_date': start_date_str or '',
+        'end_date': end_date_str or '',
+        'pnl': pnl,
+        'cogm': cogm,
+        'yield_scrap': yield_scrap,
+        'inventory_otif': inventory_otif,
+        'ar_aging': aging['ar_aging'],
+        'ap_aging': aging['ap_aging'],
+    }
+    return render(request, 'core/reports_dashboard.html', context)
+

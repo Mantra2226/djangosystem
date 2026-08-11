@@ -32,6 +32,38 @@ admin.register(BillOfMaterial)
 admin.register(WorkOrderMaterialLine)
 admin.register(BOMItem)
 
+def export_as_csv(modeladmin, request, queryset):
+    """
+    GENERIC ADMIN ACTION:
+    Exports selected records from any Django Admin changelist view into a downloadable CSV file.
+    Extracts model field values dynamically and sanitizes output formatting.
+    """
+    import csv
+    from django.http import HttpResponse
+
+    opts = modeladmin.model._meta
+    response = HttpResponse(content_type='text/csv')
+    response['Content-Disposition'] = f'attachment; filename={opts.verbose_name_plural.replace(" ", "_").lower()}_export.csv'
+
+    writer = csv.writer(response)
+    field_names = [field.name for field in opts.fields if not field.many_to_many]
+    writer.writerow(field_names)
+
+    for obj in queryset:
+        row = []
+        for field in field_names:
+            val = getattr(obj, field)
+            if callable(val):
+                try:
+                    val = val()
+                except Exception:
+                    val = ''
+            row.append(val)
+        writer.writerow(row)
+    return response
+
+export_as_csv.short_description = "Export Selected Records to CSV"
+
 # Register your models here.
 class WorkOrderInstructionInline(admin.TabularInline):
     model = WorkOrderInstruction
@@ -161,6 +193,11 @@ class InventoryAdmin(admin.ModelAdmin):
     search_fields = ('product__name', 'product__sku', 'location')
     readonly_fields = ['get_total_valuation', 'quantity_allocated']  
     autocomplete_fields = ['product']  # Enables searching products
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Product and Product Supplier."""
+        return super().get_queryset(request).select_related('product', 'product__supplier')
 
     @admin.display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
@@ -209,7 +246,11 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     search_fields = ('production_order_code', 'work_order__work_order_code', 'work_order__work_order_id', 'employee__employee_name', 'product__name')  
     filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
     readonly_fields = ['production_order_code', 'status', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
-    actions = ['trigger_mrp_auto_resume']
+    actions = [export_as_csv, 'trigger_mrp_auto_resume']
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly loads Product and WorkOrder."""
+        return super().get_queryset(request).select_related('product', 'work_order')
 
     @admin.action(description="Check Stock & Auto-Resume On-Hold Orders")
     def trigger_mrp_auto_resume(self, request, queryset):
@@ -361,65 +402,30 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         return "0.00"
 
     def work_order_details_viewer(self, obj):
-        work_orders = WorkOrder.objects.all()
-        blueprint_data = {}
-        for wo in work_orders:
-            if hasattr(wo, 'product') and wo.product:
+        """
+        PERFORMANCE OPTIMIZATION:
+        Targeted preview lookup that serializes only the specific linked WorkOrder 
+        instead of executing full table scans across all historical WorkOrder records.
+        """
+        if not obj or not obj.work_order_id:
+            return format_html("<span style='color: #666; font-style: italic;'>Select a Work Order from the dropdown above to view specifications...</span>")
 
-                emp_list = []
-                if hasattr(wo, 'employee') and wo.employee:
-                    emp_list = [getattr(emp, 'employee_name', str(emp)) for emp in wo.employee.all()]
-                
-                blueprint_data[wo.work_order_id] = {
-                    'product_name': wo.product.name,
-                    'product_sku': getattr(wo.product, 'sku', ''),
-                    'assigned_employees': emp_list,
-                    'quantity': getattr(wo, 'quantity', getattr(wo, 'quantity', '0.00')),
-                    'production_start_date': getattr(wo, 'production_start_date', ''),
-                    'production_end_date': getattr(wo, 'production_end_date', ''),
-                    'status': getattr(wo, 'status', 'N/A'),
-                }
+        wo = obj.work_order
+        if not wo:
+            return format_html("<span style='color: #666; font-style: italic;'>No Work Order linked.</span>")
 
-        json_data = json.dumps(blueprint_data, cls=DjangoJSONEncoder)   
-
+        emp_list = [str(emp) for emp in wo.employee.all()]
         html_string = f"""
         <div id="wo-preview-panel" style="margin-top: 10px; padding: 12px; background: #f8f9fa; border-left: 4px solid #79aec8; border-radius: 4px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.05); color: #333; max-width: 600px;">
             <strong style="color: #555; display: block; margin-bottom: 5px;">Blueprint Live Specifications:</strong>
             <div id="wo-preview-content" style="font-size: 13px; line-height: 1.6;">
-                <span style="color: #666; font-style: italic;">Select a Work Order from the dropdown above to look into its structural details...</span>
+                <strong>Target Product:</strong> {wo.product.name} ({getattr(wo.product, 'sku', '')}) <br>
+                <strong>Expected Yield:</strong> {wo.quantity_produced or '0.00'}<br>
+                <strong>Assigned Team/Crew:</strong> {', '.join(emp_list) if emp_list else 'Unassigned'}<br>
+                <strong>Current Step Status:</strong> <span style='text-transform: uppercase; font-weight: bold; color: #264b5d;'>{wo.status}</span>
             </div>
         </div>
-        
-        <script type="text/javascript">
-            document.addEventListener('DOMContentLoaded', function() {{
-                var blueprintLookup = {json_data};
-                var selectField = document.getElementById('id_work_order');
-                var displayBox = document.getElementById('wo-preview-content');
-                
-                if (!selectField) return;
-                
-                function updateLiveUI() {{
-                    var selectedId = selectField.value;
-                    if (selectedId && blueprintLookup[selectedId]) {{
-                        var info = blueprintLookup[selectedId];
-                        displayBox.innerHTML = 
-                            "<strong>Target Product:</strong> " + info.product_name + "(" + info.product_sku + ") <br>" +
-                            "<strong>Expected Yield:</strong> " + info.quantity_produced + "<br>" +
-                            "<strong>Assigned Team/Crew:</strong> " + info.assigned_employees + "<br>" +
-                            "<strong>Current Step Status:</strong> <span style='text-transform: uppercase; font-weight: bold; color: #264b5d;'>" + info.status + "</span>";
-                    }} else {{
-                        displayBox.innerHTML = "<span style='color: #666; font-style: italic;'>Select a Work Order from the dropdown above to look into its structural details...</span>";
-                    }}
-                }}
-                
-                // Fire update every time the user clicks a different option
-                selectField.addEventListener('change', updateLiveUI);
-                
-                // Fire instantly on page load if editing an existing run
-                updateLiveUI(); 
-            }});
-        </script>
-        """ 
+        """
         return format_html(html_string)
     
     work_order_details_viewer.short_description = "Blueprint Live Specifications"
@@ -432,6 +438,11 @@ class SalesInvoiceAdmin(admin.ModelAdmin):
     search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_code')
     inlines = [SalesInvoicePaymentsInline]
     readonly_fields = ('invoice_number', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'status')
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Customer, Dispatch, and Payments."""
+        return super().get_queryset(request).select_related('customer', 'dispatch').prefetch_related('sales_payments')
 
     @admin.display(description='Total Paid')
     def get_total_paid(self, obj):
@@ -452,6 +463,11 @@ class PurchaseInvoiceAdmin(admin.ModelAdmin):
     search_fields = ('invoice_number', 'supplier__name', 'procurement_order__procurement_order_id')
     inlines = [PurchasePaymentInline]
     readonly_fields = ['status', 'paid_date', 'remaining_balance', 'total_amount', 'created_at']
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Supplier, ProcurementOrder, and Payments."""
+        return super().get_queryset(request).select_related('supplier', 'procurement_order').prefetch_related('payments')
 
     def get_balance_status(self, obj):
         balance = obj.remaining_balance
@@ -466,12 +482,17 @@ class ReturnAdmin(admin.ModelAdmin):
     list_display = ('dispatch_id', 'customer', 'quantity_returned', 'reason_for_return', 'quality_control_status')
     list_filter = ['quality_control_status']
     search_fields = ('dispatch_id__dispatch_id', 'customer__customer_name')
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('dispatch_id', 'customer')
 
 @admin.register(FinanceEntry)
 class FinanceEntryAdmin(admin.ModelAdmin):
     list_display = ('finance_entry_id', 'entry_type', 'amount', 'entry_date', 'category')
     list_filter = ['entry_type', 'category']
     search_fields = ['category', 'sales_invoice__invoice_number', 'procurement_order__procurement_order_id']
+    actions = [export_as_csv]
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
@@ -479,10 +500,13 @@ class EmployeeAdmin(admin.ModelAdmin):
     search_fields = ('employee_id', 'employee_code', 'employee_name', 'role')    
     readonly_fields = ['employee_code']
     ordering=['employee_id']
+    actions = [export_as_csv]
+
 @admin.register(Customer)
 class CustomerAdmin(admin.ModelAdmin):
     list_display = ('customer_name', 'contact_info', 'shipping_address')
     search_fields = ('customer_name', 'contact_info')
+    actions = [export_as_csv]
 
 @admin.register(SalesOrder)
 class SalesOrderAdmin(admin.ModelAdmin):
@@ -491,6 +515,11 @@ class SalesOrderAdmin(admin.ModelAdmin):
     search_fields = ('order_number', 'customer__customer_name')
     readonly_fields = ('order_number', 'status', 'created_at', 'updated_at')
     inlines = [SalesOrderItemInline]
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Customer and prefetches SalesOrderItems with Product."""
+        return super().get_queryset(request).select_related('customer').prefetch_related('items__product')
 
     def save_related(self, request, form, formsets, change):
         super().save_related(request, form, formsets, change)
@@ -532,20 +561,18 @@ class PurchaseOrderAdmin(admin.ModelAdmin):
     list_filter = ('status', 'order_date', 'supplier')
     search_fields = ('po_number', 'supplier__name')
     inlines = [PurchaseOrderItemInline]
-
-    # -------------------------------------------------------------------------
-    # 'status' is system-managed via signals and update_delivery_status().
-    # Operators must never be able to edit it manually — mark it read-only here.
-    # 'po_number' and 'order_date' are also auto-generated / auto-stamped.
-    # -------------------------------------------------------------------------
     readonly_fields = ('po_number', 'order_date', 'status')
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Supplier and prefetches items with Product."""
+        return super().get_queryset(request).select_related('supplier').prefetch_related('items__product')
 
     fieldsets = (
         ('Order Details', {
             'fields': ('po_number', 'supplier', 'order_date', 'notes')
         }),
         ('Status (Auto-Managed)', {
-            # Grouped separately to make it obvious this field is read-only
             'fields': ('status',),
             'description': (
                 'Status is automatically updated by the system: '
@@ -555,28 +582,18 @@ class PurchaseOrderAdmin(admin.ModelAdmin):
         }),
     )
 
-    # -------------------------------------------------------------------------
-    # Dynamic field lockdown: once the PO is in a terminal state (RECEIVED or
-    # CANCELLED) every field on the form becomes read-only to protect the record.
-    # -------------------------------------------------------------------------
     def get_readonly_fields(self, request, obj=None):
         if obj and obj.status in ('RECEIVED', 'CANCELLED'):
-            # Lock the entire form — return every field name as read-only
             return [field.name for field in self.model._meta.fields]
-        # For active orders, only lock the auto-managed fields
         return self.readonly_fields
 
-    # -------------------------------------------------------------------------
-    # Coloured status badge for the list view — makes the current state
-    # immediately obvious without opening the record.
-    # -------------------------------------------------------------------------
     @admin.display(description='Status')
     def status_badge(self, obj):
         colours = {
             'DRAFT':      '#718096',   # grey
-            'SENT':       '#3182ce',   # blue  — pending delivery
-            'PARTIAL':    '#d69e2e',   # amber — some goods received
-            'RECEIVED':   '#38a169',   # green — fully received
+            'SENT':       '#3182ce',   # blue
+            'PARTIAL':    '#d69e2e',   # amber
+            'RECEIVED':   '#38a169',   # green
             'CANCELLED':  '#e53e3e',   # red
         }
         colour = colours.get(obj.status, '#718096')
@@ -589,11 +606,16 @@ class PurchaseOrderAdmin(admin.ModelAdmin):
 @admin.register(ProcurementOrder)
 class ProcurementOrderAdmin(admin.ModelAdmin):
     form = ProcurementOrderForm
-    autocomplete_fields = ['purchase_order']    # Optional: Use autocomplete for quick search if POs grow large
+    autocomplete_fields = ['purchase_order']
     list_display = ('procurement_order_id', 'purchase_order', 'product', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
     list_filter = ['status', 'delivery_date', 'delivery_location']
     search_fields = ('product__name', 'product__sku', 'purchase_order__po_number')
-    readonly_fields = ['total_cost', 'delivery_date']  # Computed field, should not be editable
+    readonly_fields = ['total_cost', 'delivery_date']
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins PurchaseOrder, Product, and Supplier."""
+        return super().get_queryset(request).select_related('purchase_order', 'product', 'purchase_order__supplier')
 
 @admin.register(DispatchRecord)
 class DispatchRecordAdmin(admin.ModelAdmin):
@@ -601,18 +623,17 @@ class DispatchRecordAdmin(admin.ModelAdmin):
     list_filter = ['dispatch_date', 'status', 'delivery_date', 'customer']
     search_fields = ['dispatch_code', 'sales_order_item__sales_order__order_number', 'customer__customer_name', 'product__sku', 'product__name']
     readonly_fields = ('dispatch_code', 'delivery_date', 'is_stock_deducted')
+    actions = [export_as_csv]
 
-    # DYNAMIC FIELD LOCKDOWN: Once delivered, lock the whole form!
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Customer, Product, and SalesOrderItem."""
+        return super().get_queryset(request).select_related('customer', 'product', 'sales_order_item__sales_order')
+
     def get_readonly_fields(self, request, obj=None):
-        # If the record already exists and stock has already been deducted...
         if obj and obj.is_stock_deducted:
-            # Return ALL fields as read-only to prevent tampering with historical data
             return [field.name for field in self.model._meta.fields]
-        
-        # If it's still pending/shipped, only the automated fields are read-only
         return self.readonly_fields
 
-    # better UI presentation grouping
     fieldsets = (
         ('Order & Logistics Information', {
             'fields': ('dispatch_code', 'customer', 'sales_order_item', 'product', 'quantity_dispatched')
@@ -622,7 +643,6 @@ class DispatchRecordAdmin(admin.ModelAdmin):
         }),
     )
 
-
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
     list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
@@ -630,7 +650,13 @@ class WorkOrderAdmin(admin.ModelAdmin):
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
     list_filter = ['status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
-    filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget
+    filter_horizontal = ('employee',)
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly loads product, BOM, parent order, employees, and production runs."""
+        return super().get_queryset(request).select_related('product', 'bill_of_material', 'parent_work_order').prefetch_related('employee', 'production_runs', 'material_lines')
+
     fieldsets = (
         ('Order Specification', {
             'fields': (
@@ -720,6 +746,11 @@ class MaterialVarianceRecordAdmin(admin.ModelAdmin):
     list_filter = ['variance_classification', 'recorded_at']
     search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('variance_code', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins WorkOrder, Product, and MaterialLine."""
+        return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')
 
     @admin.display(description='Financial Impact')
     def get_financial_impact(self, obj):

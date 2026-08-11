@@ -103,8 +103,8 @@ class PurchaseOrder(models.Model):
     po_id = models.AutoField(primary_key=True)
     po_number = models.CharField(max_length=100, unique=True, editable=False, help_text="System generated unique purchase order number.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_orders')
-    order_date = models.DateField(auto_now_add=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    order_date = models.DateField(auto_now_add=True, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True)
     notes = models.TextField(blank=True, help_text="Delivery instructions or terms")
 
     def update_delivery_status(self, save=True):
@@ -264,9 +264,9 @@ class ProcurementOrder(models.Model):
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Quantity ordered must be a positive amount greater than zero.")
     price_per_unit = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Price per unit must be a positive amount greater than zero.")
     total_cost = models.DecimalField(max_digits=10, decimal_places=2, editable=False, blank=True, default=Decimal('0.00'), help_text="Total cost is automatically calculated based on quantity ordered and price per unit.")
-    order_date = models.DateField(default=timezone.now)
+    order_date = models.DateField(default=timezone.now, db_index=True)
     delivery_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captures when status changes to Delivered.")
-    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING')   
+    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='PENDING', db_index=True)   
     delivery_location = models.CharField(max_length=255, default='Main Warehouse')
 
     # Tracking changes for calculations
@@ -402,7 +402,7 @@ class Inventory(models.Model):
     Inventory_id = models.AutoField(primary_key=True) 
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='stock')   
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Moving weighted average cost calculated from delivered procurements.")
-    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Unreserved stock physically available for new production orders. Cannot drop below zero.")
+    quantity_available = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), db_index=True, validators=[MinValueValidator(Decimal('0.00'))], help_text="Unreserved stock physically available for new production orders. Cannot drop below zero.")
     quantity_allocated = models.DecimalField(max_digits=12, decimal_places=4, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="Stock reserved for active Work Orders currently IN_PROGRESS.")
     location = models.CharField(max_length=255, default='Main Warehouse') 
     last_updated = models.DateTimeField(auto_now=True)
@@ -532,11 +532,11 @@ class WorkOrder(models.Model):
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
-    production_start_date = models.DateField()
+    production_start_date = models.DateField(db_index=True)
     production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
     is_inventory_allocated = models.BooleanField(default=False, help_text="Flag indicating BOM expected stock has been reserved on IN_PROGRESS.")
-    status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, help_text="Automatically managed based on step completion statuses.")
+    status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, db_index=True, help_text="Automatically managed based on step completion statuses.")
 
     @property
     def target_quantity(self):
@@ -1105,9 +1105,9 @@ class MaterialVarianceRecord(models.Model):
         help_text="Material utilization efficiency rate percentage."
     )
     variance_classification = models.CharField(
-        max_length=20, choices=VARIANCE_CLASSIFICATION_CHOICES, default='EXACT'
+        max_length=20, choices=VARIANCE_CLASSIFICATION_CHOICES, default='EXACT', db_index=True
     )
-    recorded_at = models.DateTimeField(auto_now=True)
+    recorded_at = models.DateTimeField(auto_now=True, db_index=True)
     notes = models.TextField(blank=True, help_text="Audit notes or breakdown for this variance record.")
 
     def save(self, *args, **kwargs):
@@ -1225,10 +1225,10 @@ class ProductionOrder(models.Model):
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.01'))], help_text="Quantity to be produced in this specific run.")
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Manufacturing cost per unit for this specific batch.")
-    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='IN_PROGRESS')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='IN_PROGRESS', db_index=True)
     notes = models.TextField(blank=True, null=True, help_text="Any issues or notes during this production run.")
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     completed_at = models.DateTimeField(auto_now=True)
 
     def complete_production(self):
@@ -1408,8 +1408,8 @@ class SalesOrder(models.Model):
     
     order_number = models.CharField(max_length=50, unique=True, editable=False, blank=True)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT)
-    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft', editable=False, help_text="Automated state machine based on items and dispatch progress.")
-    created_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft', editable=False, db_index=True, help_text="Automated state machine based on items and dispatch progress.")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def update_status(self, save=True):
@@ -1532,8 +1532,8 @@ class DispatchRecord(models.Model):
     sales_order_item = models.ForeignKey('SalesOrderItem', on_delete=models.PROTECT, related_name='dispatch_records', limit_choices_to={'sales_order__status__in': ['draft', 'approved', 'partially_dispatched']}, help_text="Only active, non-completed sales order items can be selected for dispatch.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='dispatches', limit_choices_to={'product_type': 'FINISHED'}, help_text="Only finished goods can be selected for dispatch.")  
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2)
-    dispatch_date = models.DateField(default=timezone.now)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    dispatch_date = models.DateField(default=timezone.now, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', db_index=True)
     delivery_date = models.DateField(blank=True, null=True, editable=False)
     is_stock_deducted = models.BooleanField(default=False, editable=False)
 
@@ -1723,9 +1723,9 @@ class SalesInvoice(models.Model):
     invoice_number = models.CharField(max_length=255, unique=True, editable=False, blank=True, help_text="Unique identifier for the invoice. Auto-generated.")
     customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
-    invoice_date = models.DateField(default=timezone.now)
+    invoice_date = models.DateField(default=timezone.now, db_index=True)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
-    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid')
+    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid', db_index=True)
 
     def clean(self):  
         super().clean()     
@@ -1848,10 +1848,10 @@ class PurchaseInvoice(models.Model):
     invoice_number = models.CharField(max_length=50, unique=True, null=True, blank=True, help_text="Unique identifier for the purchase invoice from the supplier.")
     supplier = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, blank=True, null=True, related_name='purchase_invoices')
-    invoice_date = models.DateField(default=timezone.now)
+    invoice_date = models.DateField(default=timezone.now, db_index=True)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
 
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNPAID', db_index=True)
     paid_date = models.DateField(null=True, blank=True, editable=False, help_text="Date when this invoice was fully settled.")
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -2061,13 +2061,13 @@ class FinanceEntry(models.Model):
         ('CUSTOMER_REFUND', 'Customer refund'),
         ('LOSS', 'Inventory Loss'),
     ]
-    entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE')
-    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES')
+    entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE', db_index=True)
+    category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES', db_index=True)
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     sales_invoice = models.ForeignKey('SalesInvoice', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     material_variance = models.ForeignKey('MaterialVarianceRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
-    entry_date = models.DateField()
+    entry_date = models.DateField(db_index=True)
 
     def clean(self):
         # 1. Prevent negative entries from skewing totals
