@@ -552,7 +552,7 @@ class ProductAdmin(admin.ModelAdmin):
     def get_selling_price(self, obj):
         if obj.selling_price is not None:
             return f"${obj.selling_price:,.2f}"
-        return "-"  # Shows dash for Raw Materials & Intermediates
+        return "-"  # Shows dash for items without a selling price (e.g. Raw Materials)
 
 
 @admin.register(PurchaseOrder)

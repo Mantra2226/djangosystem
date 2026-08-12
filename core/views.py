@@ -109,10 +109,19 @@ def product_form(request):
         product_type = request.POST.get('product_type', 'FINISHED')
         category = request.POST.get('category', 'General')
         unit_of_measurement = request.POST.get('unit_of_measurement', 'pcs')
-        Product.objects.create(
-            name=name, supplier_id=supplier_id, 
-            product_type=product_type, category=category, unit_of_measurement=unit_of_measurement
-        )
+        selling_price = request.POST.get('selling_price')
+        
+        create_kwargs = {
+            'name': name,
+            'supplier_id': supplier_id if product_type == 'RAW' else None,
+            'product_type': product_type,
+            'category': category,
+            'unit_of_measurement': unit_of_measurement
+        }
+        if selling_price and product_type in ['FINISHED', 'INTERMEDIATE']:
+            create_kwargs['selling_price'] = selling_price
+
+        Product.objects.create(**create_kwargs)
         messages.success(request, 'Product added successfully!')
     inventory_items = Inventory.objects.all()
     return render(request, 'core/product_form.html', {'inventory_items': inventory_items})

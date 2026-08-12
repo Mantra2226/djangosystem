@@ -87,7 +87,7 @@ class ProductSerializer(BaseSerializer):
             "category": category or "General",
             "unit_of_measurement": unit_of_measurement or "pcs",
             "supplier_id": supplier_id if product_type == 'RAW' else None,
-            "selling_price": Decimal(str(selling_price)) if selling_price is not None else None
+            "selling_price": Decimal(str(selling_price)) if (selling_price is not None and product_type in ['FINISHED', 'INTERMEDIATE']) else None
         }
 
 

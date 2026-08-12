@@ -30,7 +30,7 @@ class Product(models.Model):
     name = models.CharField(max_length=255)
     category = models.CharField(max_length=255)
     unit_of_measurement = models.CharField(max_length=255)
-    selling_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Required for Finished Goods. Leave blank for raw materials and intermediates.")
+    selling_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Required for Finished Goods. Allowed for Sub-assemblies/Intermediates. Leave blank for raw materials.")
     # Added field-level validation rules
     def clean(self):       
         super().clean()
@@ -39,8 +39,8 @@ class Product(models.Model):
             raise ValidationError({
                 'selling_price': "Finished Goods must have a valid selling price."
             })
-        # 2. Automatically clear selling price if the item is Raw or Intermediate
-        if self.product_type != 'FINISHED' and self.selling_price is not None:
+        # 2. Automatically clear selling price if the item is Raw Material
+        if self.product_type == 'RAW' and self.selling_price is not None:
             self.selling_price = None
 
         if self.product_type == 'RAW' and not self.supplier:

@@ -34,6 +34,11 @@ A full-stack Enterprise Resource Planning (ERP) system built with **Django 5.2**
 
 ### Production & Manufacturing
 - **Bills of Materials (BOMs)** — Multi-level recipe management with circular dependency detection. Supports `RAW` and `INTERMEDIATE` components. Enforces single active BOM per product.
+
+
+
+
+
 - **Work Orders** — Auto-coded (`WOC-NNNN`) production blueprints with step-by-step instruction sequences, employee assignments, BOM locking, and automated status state machine (`IN_PROGRESS` → `COMPLETED` / `CANCELLED`).
 - **Production Orders** — Batch run records (`POC-NNNN`) with pre-run MRP stock availability checks. Automatically transitions to `ON_HOLD_SHORTAGE` when inventory is insufficient.
 - **Two-Stage Manufacturing** — Automated Stage 1 Bulk Intermediate → Stage 2 Packaging flow with sequence lock validation, auto-spawning parent orders, and dynamic yield auto-scaling.

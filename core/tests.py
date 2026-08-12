@@ -837,5 +837,63 @@ class APISerializerAndMiddlewareTestCase(TestCase):
         self.assertEqual(data['status'], 'error')
         self.assertIn('name', data['errors'])
 
+    def test_selling_price_permission_by_product_type(self):
+        """Tests that selling price can be set for FINISHED and INTERMEDIATE products, but cleared for RAW."""
+        from .serializers import ProductSerializer
+
+        # 1. INTERMEDIATE product with selling_price
+        inter_prod = Product.objects.create(
+            name="Engine Bracket Assembly",
+            product_type="INTERMEDIATE",
+            category="Sub-Assemblies",
+            unit_of_measurement="pcs",
+            selling_price=Decimal("175.50")
+        )
+        self.assertEqual(inter_prod.selling_price, Decimal("175.50"))
+
+        # 2. RAW product with selling_price passed (should automatically clear to None)
+        raw_prod = Product.objects.create(
+            name="Raw Rubber Sheet",
+            product_type="RAW",
+            category="Materials",
+            unit_of_measurement="kg",
+            supplier=self.supplier,
+            selling_price=Decimal("45.00")
+        )
+        self.assertIsNone(raw_prod.selling_price)
+
+        # 3. FINISHED product without selling_price should raise ValidationError
+        with self.assertRaises(ValidationError):
+            p = Product(
+                name="Completed Engine",
+                product_type="FINISHED",
+                category="Engines",
+                unit_of_measurement="pcs",
+                selling_price=None
+            )
+            p.full_clean()
+
+        # 4. ProductSerializer payload for INTERMEDIATE with selling_price
+        validated_data = ProductSerializer.validate_and_deserialize({
+            "name": "Gearbox Assembly",
+            "product_type": "INTERMEDIATE",
+            "category": "Components",
+            "unit_of_measurement": "pcs",
+            "selling_price": "250.00"
+        })
+        self.assertEqual(validated_data['selling_price'], Decimal("250.00"))
+
+        # 5. ProductSerializer payload for RAW with selling_price (should deserialize to None)
+        raw_validated = ProductSerializer.validate_and_deserialize({
+            "name": "Steel Bar",
+            "product_type": "RAW",
+            "category": "Metals",
+            "unit_of_measurement": "pcs",
+            "supplier_id": self.supplier.pk,
+            "selling_price": "50.00"
+        })
+        self.assertIsNone(raw_validated['selling_price'])
+
+
 
 
