@@ -1,0 +1,15 @@
+/* Custom CSS styling for WorkOrder admin interface */
+
+.field-parent_work_order {
+    transition: all 0.3s ease-in-out;
+}
+
+.field-parent_work_order.highlight-parent-wo {
+    background-color: #f0f4fe !important;
+    border-left: 4px solid #805ad5 !important;
+    padding: 12px 16px !important;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+}

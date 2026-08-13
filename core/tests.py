@@ -673,6 +673,35 @@ class TwoStageManufacturingTestCase(TestCase):
         self.assertEqual(pack_wo3.quantity_produced, Decimal("3.00"))
         self.assertEqual(pack_wo3.status, 'IN_PROGRESS')
 
+    def test_work_order_form_dynamic_labels_and_requirements(self):
+        """Tests WorkOrderForm dynamic field requirements and labels for PACKAGING vs PRODUCTION categories."""
+        from core.forms import WorkOrderForm
+
+        # 1. Packaging Form
+        pack_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        pack_form = WorkOrderForm(instance=pack_wo)
+        self.assertTrue(pack_form.fields['parent_work_order'].required)
+        self.assertEqual(pack_form.fields['parent_work_order'].label, "Source Bulk Batch (Parent WO)")
+        self.assertEqual(pack_form.fields['quantity_produced'].label, "Target Pack Count (Units/Tins)")
+        self.assertEqual(pack_form.fields['quantity_produced'].help_text, "Total discrete containers to fill.")
+
+        # 2. Production Form
+        prod_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        prod_form = WorkOrderForm(instance=prod_wo)
+        self.assertFalse(prod_form.fields['parent_work_order'].required)
+        self.assertEqual(prod_form.fields['quantity_produced'].label, "Bulk Yield Target (kg/L)")
+        self.assertEqual(prod_form.fields['quantity_produced'].help_text, "Total bulk weight/volume to mix.")
+
 
 class ReportingAndOptimizationTestCase(TestCase):
     def setUp(self):

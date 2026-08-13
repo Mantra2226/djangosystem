@@ -7,6 +7,7 @@ from django import forms
 from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
 )
 from decimal import Decimal
+from .forms import WorkOrderForm
 
 admin.register(Supplier)
 admin.register(Product)
@@ -645,13 +646,20 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
+    form = WorkOrderForm
     list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
-    readonly_fields = ['work_order_code', 'category', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date', 'parent_work_order']
+    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
     list_filter = ['category', 'status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
     actions = [export_as_csv, 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
+
+    class Media:
+        js = ('admin/js/work_order_category_toggle.js',)
+        css = {
+            'all': ('admin/css/work_order_admin.css',)
+        }
 
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly loads product, BOM, parent order, employees, and production runs."""
