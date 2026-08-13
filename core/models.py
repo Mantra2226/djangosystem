@@ -525,8 +525,21 @@ class WorkOrderInstruction(models.Model):
         snippet = f"{text_preview}..." if len(self.instruction_text) > 50 else text_preview
         return f"step {self.step_number}: {self.step_name} ({self.status})"     
 class WorkOrder(models.Model):
+    CATEGORY_CHOICES = [
+        ('PRODUCTION', 'Production (Bulk Mixing)'),
+        ('PACKAGING', 'Packaging'),
+    ]
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
+        ('AWAITING_RESOLUTION', 'Awaiting Shortage Resolution'),
+        ('ON_HOLD_SHORTAGE', 'On Hold (Bulk Shortage)'),
+    ]
     work_order_id = models.AutoField(primary_key=True)
     work_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True)
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, blank=True, null=True, help_text="Auto-assigned based on product type: INTERMEDIATE -> PRODUCTION, FINISHED -> PACKAGING.")
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
     parent_work_order = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_packaging_orders', help_text="The Stage 1 Bulk Intermediate work order required prior to running packaging operations.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
@@ -536,7 +549,7 @@ class WorkOrder(models.Model):
     production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
     is_inventory_allocated = models.BooleanField(default=False, help_text="Flag indicating BOM expected stock has been reserved on IN_PROGRESS.")
-    status = models.CharField(max_length=20, choices=WorkOrderInstruction.STATUS_CHOICES, default='IN_PROGRESS', editable=False, db_index=True, help_text="Automatically managed based on step completion statuses.")
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='IN_PROGRESS', db_index=True, help_text="State machine status of the work order run.")
 
     @property
     def target_quantity(self):
@@ -579,6 +592,130 @@ class WorkOrder(models.Model):
             if new_status == 'COMPLETED':
                 self.sync_child_packaging_expectations()
 
+    def check_bulk_availability(self):
+        """
+        BULK SHORTAGE DETECTION ENGINE:
+        Queries live intermediate warehouse inventory stock against required packaging BOM quantities
+        and returns calculated shortfall metrics, available stock, required quantity, and maximum achievable units.
+        """
+        target_qty = self.target_quantity or Decimal('0.00')
+        active_bom = self.bill_of_material or (self.product.boms.filter(is_active=True).first() if self.product else None)
+
+        if not active_bom:
+            return {
+                'has_shortfall': False,
+                'intermediate_product': None,
+                'required_quantity': Decimal('0.00'),
+                'available_stock': Decimal('0.00'),
+                'shortfall': Decimal('0.00'),
+                'max_achievable_units': target_qty
+            }
+
+        intermediate_item = active_bom.items.filter(component__product_type='INTERMEDIATE').first()
+        if not intermediate_item:
+            return {
+                'has_shortfall': False,
+                'intermediate_product': None,
+                'required_quantity': Decimal('0.00'),
+                'available_stock': Decimal('0.00'),
+                'shortfall': Decimal('0.00'),
+                'max_achievable_units': target_qty
+            }
+
+        intermediate_product = intermediate_item.component
+        qty_req_per_unit = intermediate_item.quantity_required or Decimal('0.00')
+        required_qty = (target_qty * qty_req_per_unit).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        from .models import Inventory
+        available_stock = Inventory.objects.filter(
+            product=intermediate_product
+        ).aggregate(total=Sum('quantity_available'))['total'] or Decimal('0.00')
+
+        shortfall = max(Decimal('0.00'), required_qty - available_stock)
+        has_shortfall = shortfall > Decimal('0.00')
+
+        if qty_req_per_unit > Decimal('0.00'):
+            max_achievable_units = (available_stock / qty_req_per_unit).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            max_achievable_units = target_qty
+
+        return {
+            'has_shortfall': has_shortfall,
+            'intermediate_product': intermediate_product,
+            'required_quantity': required_qty,
+            'available_stock': available_stock,
+            'shortfall': shortfall,
+            'max_achievable_units': max_achievable_units
+        }
+
+    def resolve_bulk_shortage(self, action_choice):
+        """
+        INTERACTIVE SHORTAGE RESOLUTION PATHWAYS:
+        Executes resolution strategy inside an atomic transaction:
+          - TOP_UP_BULK: Spawns supplemental bulk parent WorkOrder for missing shortfall,
+                         links it as parent_work_order, and sets status to ON_HOLD_SHORTAGE.
+          - DOWNSCALE_TARGET: Recalculates maximum achievable packaging units from available stock,
+                               scales down quantity_produced, and resumes order to IN_PROGRESS.
+          - HOLD_FOR_EXISTING: Places order on ON_HOLD_SHORTAGE to await active bulk run completion.
+        """
+        valid_choices = ['TOP_UP_BULK', 'DOWNSCALE_TARGET', 'HOLD_FOR_EXISTING']
+        if action_choice not in valid_choices:
+            raise ValidationError(f"Invalid resolution choice '{action_choice}'. Must be one of {valid_choices}.")
+
+        metrics = self.check_bulk_availability()
+
+        with transaction.atomic():
+            if action_choice == 'TOP_UP_BULK':
+                shortfall = metrics['shortfall']
+                intermediate_product = metrics['intermediate_product']
+
+                if not intermediate_product:
+                    raise ValidationError("Cannot execute TOP_UP_BULK: No intermediate bulk component found in BOM.")
+
+                if shortfall <= Decimal('0.00'):
+                    self.status = 'IN_PROGRESS'
+                    super().save(update_fields=['status'])
+                    return self
+
+                bulk_bom = intermediate_product.boms.filter(is_active=True).first()
+                parent_wo = WorkOrder.objects.create(
+                    product=intermediate_product,
+                    bill_of_material=bulk_bom,
+                    production_start_date=self.production_start_date or timezone.now().date(),
+                    status='IN_PROGRESS',
+                    quantity_produced=shortfall
+                )
+
+                self.parent_work_order = parent_wo
+                self.status = 'ON_HOLD_SHORTAGE'
+                super().save(update_fields=['parent_work_order', 'status'])
+                print(f"[SHORTAGE RESOLUTION] Executed TOP_UP_BULK: Spawned parent Bulk WorkOrder #{parent_wo.pk} for {shortfall} units.", flush=True)
+
+            elif action_choice == 'DOWNSCALE_TARGET':
+                max_units = metrics['max_achievable_units']
+                if max_units <= Decimal('0.00'):
+                    raise ValidationError("Cannot execute DOWNSCALE_TARGET: Available bulk inventory is zero.")
+
+                self.quantity_produced = max_units
+                self.status = 'IN_PROGRESS'
+                super().save(update_fields=['quantity_produced', 'status'])
+
+                from .models import ProductionOrder
+                for po in ProductionOrder.objects.filter(work_order=self):
+                    po.quantity = max_units
+                    po.status = 'IN_PROGRESS'
+                    po.save(update_fields=['quantity', 'status'])
+
+                self.sync_material_lines()
+                print(f"[SHORTAGE RESOLUTION] Executed DOWNSCALE_TARGET: Scaled batch quantity down to {max_units}.", flush=True)
+
+            elif action_choice == 'HOLD_FOR_EXISTING':
+                self.status = 'ON_HOLD_SHORTAGE'
+                super().save(update_fields=['status'])
+                print(f"[SHORTAGE RESOLUTION] Executed HOLD_FOR_EXISTING: WorkOrder #{self.pk} placed on ON_HOLD_SHORTAGE.", flush=True)
+
+        return self
+
     def clean(self):
         super().clean()
 
@@ -587,7 +724,8 @@ class WorkOrder(models.Model):
         # Stage 2 packaging operations depend directly on intermediate bulk materials produced in Stage 1 mixing.
         # Allowing packaging operations to start or complete prior to Stage 1 completion creates high operational
         # risk of stock record corruption, negative inventory allocations, and physical staging errors.
-        if self.parent_work_order:
+        is_packaging = (self.category == 'PACKAGING') or (self.product and self.product.product_type == 'FINISHED')
+        if is_packaging and self.parent_work_order:
             parent_status = (self.parent_work_order.status or '').upper().strip()
             current_status = (self.status or '').upper().strip()
             if current_status in ['IN_PROGRESS', 'COMPLETED'] and parent_status != 'COMPLETED':
@@ -859,6 +997,13 @@ class WorkOrder(models.Model):
         print(f"[WORK ORDER SAVE START] ID: {self.pk} | Code: {self.work_order_code}", flush=True)
 
         with transaction.atomic():
+            # AUTO-ASSIGN CATEGORY BASED ON PRODUCT CLASSIFICATION
+            if self.product:
+                if self.product.product_type == 'INTERMEDIATE':
+                    self.category = 'PRODUCTION'
+                elif self.product.product_type == 'FINISHED':
+                    self.category = 'PACKAGING'
+
             # AUTO-GENERATE CODE & ASSIGN BOM
             if not self.work_order_code:
                 prefix = "WOC"

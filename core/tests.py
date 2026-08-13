@@ -611,6 +611,68 @@ class TwoStageManufacturingTestCase(TestCase):
         # Sequence lock now passes since parent is COMPLETED
         packaging_wo.clean()  # Should not raise ValidationError
 
+    def test_work_order_category_and_shortage_resolution(self):
+        """Tests WorkOrder category classification, check_bulk_availability, and resolve_bulk_shortage options."""
+        # 1. Test category auto-assignment
+        prod_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        self.assertEqual(prod_wo.category, 'PRODUCTION')
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            quantity_produced=Decimal("5.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        self.assertEqual(pack_wo.category, 'PACKAGING')
+
+        # 2. Test check_bulk_availability
+        # 500ml Bottled Sauce requires 0.50 Liters Bulk Sauce per Bottle => 5 bottles need 2.50 Liters.
+        availability = pack_wo.check_bulk_availability()
+        self.assertEqual(availability['intermediate_product'], self.bulk_sauce)
+        self.assertEqual(availability['required_quantity'], Decimal("2.50"))
+        self.assertTrue(availability['has_shortfall'])
+        self.assertEqual(availability['shortfall'], Decimal("2.50"))
+
+        # 3. Test resolve_bulk_shortage('TOP_UP_BULK')
+        pack_wo.resolve_bulk_shortage('TOP_UP_BULK')
+        self.assertEqual(pack_wo.status, 'ON_HOLD_SHORTAGE')
+        self.assertIsNotNone(pack_wo.parent_work_order)
+        self.assertEqual(pack_wo.parent_work_order.product, self.bulk_sauce)
+        self.assertEqual(pack_wo.parent_work_order.quantity_produced, Decimal("2.50"))
+        self.assertEqual(pack_wo.parent_work_order.category, 'PRODUCTION')
+
+        # 4. Test resolve_bulk_shortage('HOLD_FOR_EXISTING')
+        pack_wo2 = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            quantity_produced=Decimal("3.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        pack_wo2.resolve_bulk_shortage('HOLD_FOR_EXISTING')
+        self.assertEqual(pack_wo2.status, 'ON_HOLD_SHORTAGE')
+
+        # 5. Test resolve_bulk_shortage('DOWNSCALE_TARGET') with available bulk stock
+        Inventory.objects.create(
+            product=self.bulk_sauce,
+            quantity_available=Decimal("1.50"),
+            location="Main Warehouse"
+        )
+        pack_wo3 = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            quantity_produced=Decimal("5.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        pack_wo3.resolve_bulk_shortage('DOWNSCALE_TARGET')
+        # Available stock is 1.50, requirement is 0.50 per unit => max_achievable = 3.00
+        self.assertEqual(pack_wo3.quantity_produced, Decimal("3.00"))
+        self.assertEqual(pack_wo3.status, 'IN_PROGRESS')
+
 
 class ReportingAndOptimizationTestCase(TestCase):
     def setUp(self):

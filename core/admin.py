@@ -1,5 +1,5 @@
 from django.utils.safestring import mark_safe
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
@@ -645,13 +645,13 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date', 'parent_work_order']
+    list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
+    readonly_fields = ['work_order_code', 'category', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date', 'parent_work_order']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
-    list_filter = ['status', 'is_inventory_updated', 'production_start_date']
+    list_filter = ['category', 'status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
 
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly loads product, BOM, parent order, employees, and production runs."""
@@ -660,6 +660,7 @@ class WorkOrderAdmin(admin.ModelAdmin):
     fieldsets = (
         ('Order Specification', {
             'fields': (
+                'category',
                 'product',
                 'bill_of_material',
                 'quantity_produced',
@@ -715,6 +716,14 @@ class WorkOrderAdmin(admin.ModelAdmin):
         work_order = form.instance
         work_order.process_inventory()
 
+    @admin.display(description='Category')
+    def category_badge(self, obj):
+        if obj.category == 'PRODUCTION':
+            return format_html('<span style="background-color: #2b6cb0; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">PRODUCTION</span>')
+        elif obj.category == 'PACKAGING':
+            return format_html('<span style="background-color: #805ad5; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">PACKAGING</span>')
+        return "-"
+
     @admin.display(description='Assigned Employees')
     def display_employees(self, obj):
         employees = obj.employee.all()
@@ -732,6 +741,8 @@ class WorkOrderAdmin(admin.ModelAdmin):
             'COMPLETED': 'green',
             'IN_PROGRESS': '#3182ce',
             'CANCELLED': 'red',
+            'AWAITING_RESOLUTION': '#dd6b20',
+            'ON_HOLD_SHORTAGE': '#e53e3e',
         }
         color = colors.get(obj.status, 'gray')
         return format_html(
@@ -739,6 +750,42 @@ class WorkOrderAdmin(admin.ModelAdmin):
             color, 
             obj.get_status_display()
         )
+
+    @admin.action(description="Shortage Resolution: Top-Up Parent Bulk Order")
+    def action_top_up_bulk(self, request, queryset):
+        count = 0
+        for wo in queryset:
+            try:
+                wo.resolve_bulk_shortage('TOP_UP_BULK')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Successfully executed Top-Up Bulk resolution for {count} order(s).", level=messages.SUCCESS)
+
+    @admin.action(description="Shortage Resolution: Downscale Target Batch")
+    def action_downscale_target(self, request, queryset):
+        count = 0
+        for wo in queryset:
+            try:
+                wo.resolve_bulk_shortage('DOWNSCALE_TARGET')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Successfully downscaled target batch for {count} order(s).", level=messages.SUCCESS)
+
+    @admin.action(description="Shortage Resolution: Hold for Existing Bulk Run")
+    def action_hold_for_existing(self, request, queryset):
+        count = 0
+        for wo in queryset:
+            try:
+                wo.resolve_bulk_shortage('HOLD_FOR_EXISTING')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Successfully placed {count} order(s) on hold for bulk shortage.", level=messages.SUCCESS)
 
 @admin.register(MaterialVarianceRecord)
 class MaterialVarianceRecordAdmin(admin.ModelAdmin):

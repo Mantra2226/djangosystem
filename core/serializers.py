@@ -1,5 +1,5 @@
 """
-CORE SERIALIZERS MODULE (core/serializers.py)
+CORE SERIALIZERS MODULE
 
 Provides object-to-dictionary serialization, data formatting, and input 
 validation/deserialization for core ERP domain models.
@@ -119,6 +119,7 @@ class WorkOrderSerializer(BaseSerializer):
         return {
             "work_order_id": obj.work_order_id,
             "work_order_code": obj.work_order_code,
+            "category": obj.category,
             "product_id": obj.product_id,
             "product_name": obj.product.name if obj.product else "",
             "product_sku": obj.product.sku if obj.product else "",
