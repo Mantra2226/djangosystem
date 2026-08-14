@@ -1,3 +1,7 @@
+from django.urls import path, reverse
+from django.shortcuts import get_object_or_404, redirect
+from django.http import HttpResponseRedirect
+from django.core.exceptions import ValidationError
 from django.utils.safestring import mark_safe
 from django.contrib import admin, messages
 from django.utils.html import format_html
@@ -71,7 +75,7 @@ class WorkOrderInstructionInline(admin.TabularInline):
     extra = 0
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
     ordering = ['step_number']
-    readonly_fields = ['step_number']  # Auto-incremented field, should not be editable    
+    readonly_fields = ['step_number']    
 
 class BOMItemInline(admin.TabularInline):
     model = BOMItem
@@ -794,6 +798,97 @@ class WorkOrderAdmin(admin.ModelAdmin):
                 self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
         if count > 0:
             self.message_user(request, f"Successfully placed {count} order(s) on hold for bulk shortage.", level=messages.SUCCESS)
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                '<int:object_id>/start-production/',
+                self.admin_site.admin_view(self.start_production_view),
+                name='workorder-start-production',
+            ),
+            path(
+                '<int:object_id>/top-up-bulk/',
+                self.admin_site.admin_view(self.top_up_bulk_view),
+                name='workorder-top-up-bulk',
+            ),
+            path(
+                '<int:object_id>/downscale-target/',
+                self.admin_site.admin_view(self.downscale_target_view),
+                name='workorder-downscale-target',
+            ),
+            path(
+                '<int:object_id>/hold-for-existing/',
+                self.admin_site.admin_view(self.hold_for_existing_view),
+                name='workorder-hold-for-existing',
+            ),
+        ]
+        return custom_urls + urls
+
+    def start_production_view(self, request, object_id):
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+        try:
+            success, message = work_order.start_production()
+            if success:
+                self.message_user(request, message, level=messages.SUCCESS)
+            else:
+                self.message_user(request, message, level=messages.WARNING)
+        except ValidationError as e:
+            if hasattr(e, 'message_dict'):
+                for field, msgs in e.message_dict.items():
+                    for msg in msgs:
+                        field_label = field.replace('_', ' ').title() if field != '__all__' else 'Validation Error'
+                        self.message_user(request, f"{field_label}: {msg}", level=messages.ERROR)
+            elif hasattr(e, 'messages'):
+                for msg in e.messages:
+                    self.message_user(request, msg, level=messages.ERROR)
+            else:
+                self.message_user(request, str(e), level=messages.ERROR)
+        except Exception as e:
+            self.message_user(request, f"Failed to start work order: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
+    def _resolve_shortage_view(self, request, object_id, action_choice, existing_bulk_wo_id=None):
+        """Shared handler for all shortage resolution admin views."""
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+        try:
+            work_order.resolve_bulk_shortage(action_choice, existing_bulk_wo_id=existing_bulk_wo_id)
+            action_labels = {
+                'TOP_UP_BULK': 'Top-Up Bulk resolution',
+                'DOWNSCALE_TARGET': 'Downscale Target resolution',
+                'HOLD_FOR_EXISTING': 'Hold for Existing Bulk Run',
+            }
+            label = action_labels.get(action_choice, action_choice)
+            self.message_user(request, f"Successfully executed {label} for WO #{work_order.work_order_code}.", level=messages.SUCCESS)
+        except ValidationError as e:
+            if hasattr(e, 'messages'):
+                for msg in e.messages:
+                    self.message_user(request, msg, level=messages.ERROR)
+            else:
+                self.message_user(request, str(e), level=messages.ERROR)
+        except Exception as e:
+            self.message_user(request, f"Error resolving WO #{object_id}: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
+    def top_up_bulk_view(self, request, object_id):
+        return self._resolve_shortage_view(request, object_id, 'TOP_UP_BULK')
+
+    def downscale_target_view(self, request, object_id):
+        return self._resolve_shortage_view(request, object_id, 'DOWNSCALE_TARGET')
+
+    def hold_for_existing_view(self, request, object_id):
+        existing_bulk_wo_id = request.GET.get('bulk_wo_id')
+        if existing_bulk_wo_id:
+            existing_bulk_wo_id = int(existing_bulk_wo_id)
+        return self._resolve_shortage_view(request, object_id, 'HOLD_FOR_EXISTING', existing_bulk_wo_id=existing_bulk_wo_id)
 
 @admin.register(MaterialVarianceRecord)
 class MaterialVarianceRecordAdmin(admin.ModelAdmin):

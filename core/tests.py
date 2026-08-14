@@ -550,50 +550,66 @@ class TwoStageManufacturingTestCase(TestCase):
             unit_cost=Decimal("2.00")
         )
 
-    def test_auto_spawning_parent_bulk_order(self):
-        """Creating a FINISHED product packaging WorkOrder automatically spawns its Stage 1 parent bulk WorkOrder."""
+    def test_no_auto_spawning_parent_bulk_order(self):
+        """Creating a FINISHED product packaging WorkOrder no longer auto-spawns a parent bulk WorkOrder."""
         packaging_wo = WorkOrder.objects.create(
             product=self.bottled_sauce,
             bill_of_material=self.finished_bom,
             quantity_produced=Decimal("100.00"),
-            production_start_date=timezone.now().date()
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
         )
 
-        # Check parent bulk order was auto-spawned and linked
-        self.assertIsNotNone(packaging_wo.parent_work_order)
-        bulk_wo = packaging_wo.parent_work_order
-        self.assertEqual(bulk_wo.product, self.bulk_sauce)
-        self.assertEqual(bulk_wo.status, 'IN_PROGRESS')
-        # Target requirement: 100 bottles * 0.50 L = 50.00 Liters
-        self.assertEqual(bulk_wo.quantity_produced, Decimal("50.00"))
+        # Verify parent bulk order is NOT auto-spawned
+        self.assertIsNone(packaging_wo.parent_work_order)
+        self.assertEqual(packaging_wo.category, 'PACKAGING')
 
     def test_sequence_lock_validation(self):
-        """Packaging WorkOrder cannot move to IN_PROGRESS or COMPLETED if parent bulk WorkOrder is not COMPLETED."""
+        """Packaging WorkOrder cannot move to IN_PROGRESS or COMPLETED if linked parent bulk WorkOrder is not COMPLETED."""
+        # Manually create a parent bulk order and link it
+        bulk_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
         packaging_wo = WorkOrder.objects.create(
             product=self.bottled_sauce,
             bill_of_material=self.finished_bom,
             quantity_produced=Decimal("100.00"),
-            production_start_date=timezone.now().date()
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS',
+            parent_work_order=bulk_wo
         )
-        bulk_wo = packaging_wo.parent_work_order
         self.assertEqual(bulk_wo.status, 'IN_PROGRESS')
 
         # Attempting clean() on packaging order while status is IN_PROGRESS and parent is IN_PROGRESS must fail
         with self.assertRaises(ValidationError) as ctx:
             packaging_wo.clean()
-        
-        self.assertIn('status', ctx.exception.message_dict)
-        self.assertIn('Bulk mixing must be completed prior to running or completing packaging operations', ctx.exception.message_dict['status'][0])
+
+        key = 'parent_work_order' if 'parent_work_order' in ctx.exception.message_dict else 'status'
+        self.assertIn(key, ctx.exception.message_dict)
+        self.assertIn('Cannot start packaging: Linked parent bulk order', ctx.exception.message_dict[key][0])
 
     def test_dynamic_yield_auto_scaling_on_completion(self):
         """When parent bulk WorkOrder completes, child packaging material lines' quantity_expected scales to actual bulk yield."""
+        # Manually create parent bulk order
+        bulk_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
         packaging_wo = WorkOrder.objects.create(
             product=self.bottled_sauce,
             bill_of_material=self.finished_bom,
             quantity_produced=Decimal("100.00"),
-            production_start_date=timezone.now().date()
+            production_start_date=timezone.now().date(),
+            status='DRAFT',
+            parent_work_order=bulk_wo
         )
-        bulk_wo = packaging_wo.parent_work_order
 
         # Verify initial material line for packaging order
         mat_line = packaging_wo.material_lines.get(component=self.bulk_sauce)
@@ -609,6 +625,7 @@ class TwoStageManufacturingTestCase(TestCase):
         self.assertEqual(mat_line.quantity_expected, Decimal("52.50"))
 
         # Sequence lock now passes since parent is COMPLETED
+        packaging_wo.status = 'IN_PROGRESS'
         packaging_wo.clean()  # Should not raise ValidationError
 
     def test_work_order_category_and_shortage_resolution(self):
@@ -629,6 +646,7 @@ class TwoStageManufacturingTestCase(TestCase):
             status='DRAFT'
         )
         self.assertEqual(pack_wo.category, 'PACKAGING')
+        self.assertIsNone(pack_wo.parent_work_order)
 
         # 2. Test check_bulk_availability
         # 500ml Bottled Sauce requires 0.50 Liters Bulk Sauce per Bottle => 5 bottles need 2.50 Liters.
@@ -646,7 +664,7 @@ class TwoStageManufacturingTestCase(TestCase):
         self.assertEqual(pack_wo.parent_work_order.quantity_produced, Decimal("2.50"))
         self.assertEqual(pack_wo.parent_work_order.category, 'PRODUCTION')
 
-        # 4. Test resolve_bulk_shortage('HOLD_FOR_EXISTING')
+        # 4. Test resolve_bulk_shortage('HOLD_FOR_EXISTING') without existing_bulk_wo_id
         pack_wo2 = WorkOrder.objects.create(
             product=self.bottled_sauce,
             quantity_produced=Decimal("3.00"),
@@ -655,8 +673,27 @@ class TwoStageManufacturingTestCase(TestCase):
         )
         pack_wo2.resolve_bulk_shortage('HOLD_FOR_EXISTING')
         self.assertEqual(pack_wo2.status, 'ON_HOLD_SHORTAGE')
+        self.assertIsNone(pack_wo2.parent_work_order)
 
-        # 5. Test resolve_bulk_shortage('DOWNSCALE_TARGET') with available bulk stock
+        # 5. Test resolve_bulk_shortage('HOLD_FOR_EXISTING') with existing_bulk_wo_id
+        existing_bulk = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("20.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        pack_wo4 = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            quantity_produced=Decimal("4.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        pack_wo4.resolve_bulk_shortage('HOLD_FOR_EXISTING', existing_bulk_wo_id=existing_bulk.pk)
+        self.assertEqual(pack_wo4.status, 'ON_HOLD_SHORTAGE')
+        self.assertEqual(pack_wo4.parent_work_order, existing_bulk)
+
+        # 6. Test resolve_bulk_shortage('DOWNSCALE_TARGET') with available bulk stock
         Inventory.objects.create(
             product=self.bulk_sauce,
             quantity_available=Decimal("1.50"),
@@ -685,7 +722,7 @@ class TwoStageManufacturingTestCase(TestCase):
             status='DRAFT'
         )
         pack_form = WorkOrderForm(instance=pack_wo)
-        self.assertTrue(pack_form.fields['parent_work_order'].required)
+        self.assertFalse(pack_form.fields['parent_work_order'].required)
         self.assertEqual(pack_form.fields['parent_work_order'].label, "Source Bulk Batch (Parent WO)")
         self.assertEqual(pack_form.fields['quantity_produced'].label, "Target Pack Count (Units/Tins)")
         self.assertEqual(pack_form.fields['quantity_produced'].help_text, "Total discrete containers to fill.")
@@ -701,6 +738,284 @@ class TwoStageManufacturingTestCase(TestCase):
         self.assertFalse(prod_form.fields['parent_work_order'].required)
         self.assertEqual(prod_form.fields['quantity_produced'].label, "Bulk Yield Target (kg/L)")
         self.assertEqual(prod_form.fields['quantity_produced'].help_text, "Total bulk weight/volume to mix.")
+
+        # 3. Test form sequence lock validation error on parent_work_order field
+        bulk_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        pack_wo_draft = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT',
+            parent_work_order=bulk_wo
+        )
+        invalid_form = WorkOrderForm(data={
+            'product': self.bottled_sauce.pk,
+            'category': 'PACKAGING',
+            'parent_work_order': bulk_wo.pk,
+            'quantity_produced': '10.00',
+            'production_start_date': str(timezone.now().date())
+        }, instance=pack_wo_draft)
+        invalid_form.instance.status = 'IN_PROGRESS'
+        self.assertFalse(invalid_form.is_valid())
+        self.assertIn('parent_work_order', invalid_form.errors)
+        self.assertIn('Cannot start packaging: Linked parent bulk order', str(invalid_form.errors['parent_work_order']))
+
+    def test_work_order_draft_status_gate_and_field_error_mapping(self):
+        """Tests that DRAFT Work Orders bypass operational checks, while IN_PROGRESS / COMPLETED enforce field-specific errors."""
+        # Create a new product without active BOMs
+        new_prod = Product.objects.create(
+            name="Unassigned Product",
+            category="Sauces",
+            product_type="INTERMEDIATE",
+            unit_of_measurement="Liters",
+            selling_price=Decimal("15.00")
+        )
+
+        # 1. DRAFT status allows minimal constraints
+        draft_wo = WorkOrder(
+            product=new_prod,
+            status='DRAFT',
+            production_start_date=None,
+            quantity_produced=None
+        )
+        # Should not raise ValidationError on clean
+        draft_wo.clean()
+
+        # 2. Transitioning to IN_PROGRESS triggers all field-specific errors
+        draft_wo.status = 'IN_PROGRESS'
+        with self.assertRaises(ValidationError) as ctx:
+            draft_wo.clean()
+
+        errors = ctx.exception.message_dict
+        self.assertIn('target_quantity', errors)
+        self.assertIn("Target Quantity must be greater than 0 to start production.", errors['target_quantity'])
+
+        self.assertIn('production_start_date', errors)
+        self.assertIn("Please provide a Production Start Date before moving to IN_PROGRESS.", errors['production_start_date'])
+
+        self.assertIn('bill_of_material', errors)
+        self.assertIn("Cannot start order: Assign an active Bill of Materials (BOM) for this product.", errors['bill_of_material'])
+
+        # 3. Packaging Stage 2 parent bulk dependency validation (with manually linked parent)
+        bulk_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("25.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        packaging_draft = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT',
+            parent_work_order=bulk_wo
+        )
+        self.assertEqual(packaging_draft.parent_work_order.status, 'IN_PROGRESS')
+
+        # In DRAFT, clean() passes even if parent bulk order is IN_PROGRESS
+        packaging_draft.clean()
+
+        # Moving packaging order to IN_PROGRESS fails with specific linked parent message
+        packaging_draft.status = 'IN_PROGRESS'
+        with self.assertRaises(ValidationError) as ctx:
+            packaging_draft.clean()
+
+        expected_msg = f"Cannot start packaging: Linked parent bulk order #{packaging_draft.parent_work_order.work_order_code} is currently '{packaging_draft.parent_work_order.status}'. It must reach COMPLETED status first."
+        self.assertIn('parent_work_order', ctx.exception.message_dict)
+        self.assertIn(expected_msg, ctx.exception.message_dict['parent_work_order'])
+
+        # 4. Individually satisfying each constraint resolves errors
+        draft_wo.production_start_date = timezone.now().date()
+        draft_wo.quantity_produced = Decimal("20.00")
+        active_bom = BillOfMaterial.objects.create(product=new_prod, name="Active BOM", is_active=True)
+        # Now clean() passes for IN_PROGRESS
+        draft_wo.clean()
+
+        # 5. COMPLETED status enforces instruction steps completion
+        draft_wo.save()
+        draft_wo.status = 'COMPLETED'
+        with self.assertRaises(ValidationError) as ctx_completed:
+            draft_wo.clean()
+        self.assertTrue(any('incomplete instruction step' in str(e) for e in ctx_completed.exception.messages))
+
+    def test_start_production_model_workflow(self):
+        """Tests WorkOrder.start_production() state transition workflow, validation gates, shortage routing, and stock allocation."""
+        # 1. Calling start_production on non-DRAFT raises ValidationError
+        in_progress_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            in_progress_wo.start_production()
+        self.assertIn("Only DRAFT work orders can be started.", str(ctx.exception))
+
+        # 2. Starting DRAFT work order missing operational requirements fails clean validation
+        invalid_draft = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            status='DRAFT'
+        )
+        with self.assertRaises(ValidationError) as ctx_invalid:
+            invalid_draft.start_production()
+        self.assertIn('target_quantity', ctx_invalid.exception.message_dict)
+
+        # 3. Valid DRAFT production order starts successfully and allocates inventory
+        valid_draft = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("20.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        success, msg = valid_draft.start_production()
+        self.assertTrue(success)
+        self.assertEqual(msg, "Work order started successfully and stock allocated.")
+        self.assertEqual(valid_draft.status, 'IN_PROGRESS')
+        self.assertTrue(valid_draft.is_inventory_allocated)
+
+        # 4. Packaging order with bulk shortfall moves to AWAITING_RESOLUTION (no auto-spawned parent)
+        pack_draft = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        self.assertIsNone(pack_draft.parent_work_order)
+
+        success_shortage, msg_shortage = pack_draft.start_production()
+        self.assertFalse(success_shortage)
+        self.assertEqual(msg_shortage, "Bulk shortage detected. Moved to Awaiting Resolution.")
+        self.assertEqual(pack_draft.status, 'AWAITING_RESOLUTION')
+
+    def test_start_production_admin_view_routing(self):
+        """Tests custom admin route <id>/start-production/ and change form template resolution."""
+        from django.contrib.auth.models import User
+        admin_user = User.objects.create_superuser('admin_tester', 'admin@example.com', 'password123')
+        self.client.login(username='admin_tester', password='password123')
+
+        wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("30.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+
+        url = f"/admin/core/workorder/{wo.pk}/start-production/"
+        response = self.client.get(url, follow=True)
+        self.assertEqual(response.status_code, 200)
+
+        wo.refresh_from_db()
+        self.assertEqual(wo.status, 'IN_PROGRESS')
+
+    def test_admin_resolution_action_routes(self):
+        """Tests custom admin routes for shortage resolution actions (top-up-bulk, downscale-target, hold-for-existing)."""
+        from django.contrib.auth.models import User
+        admin_user = User.objects.create_superuser('admin_res', 'admin_res@example.com', 'password123')
+        self.client.login(username='admin_res', password='password123')
+
+        # Create a packaging order in AWAITING_RESOLUTION
+        pack_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+
+        # Test top-up-bulk route
+        url = f"/admin/core/workorder/{pack_wo.pk}/top-up-bulk/"
+        response = self.client.get(url, follow=True)
+        self.assertEqual(response.status_code, 200)
+        pack_wo.refresh_from_db()
+        self.assertEqual(pack_wo.status, 'ON_HOLD_SHORTAGE')
+        self.assertIsNotNone(pack_wo.parent_work_order)
+
+        # Test downscale-target route (add some bulk stock first)
+        Inventory.objects.create(
+            product=self.bulk_sauce,
+            quantity_available=Decimal("2.00"),
+            location="Main Warehouse"
+        )
+        pack_wo2 = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+        url2 = f"/admin/core/workorder/{pack_wo2.pk}/downscale-target/"
+        response2 = self.client.get(url2, follow=True)
+        self.assertEqual(response2.status_code, 200)
+        pack_wo2.refresh_from_db()
+        self.assertEqual(pack_wo2.status, 'IN_PROGRESS')
+
+        # Test hold-for-existing route with bulk_wo_id parameter
+        existing_bulk = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("30.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        pack_wo3 = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("8.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+        url3 = f"/admin/core/workorder/{pack_wo3.pk}/hold-for-existing/?bulk_wo_id={existing_bulk.pk}"
+        response3 = self.client.get(url3, follow=True)
+        self.assertEqual(response3.status_code, 200)
+        pack_wo3.refresh_from_db()
+        self.assertEqual(pack_wo3.status, 'ON_HOLD_SHORTAGE')
+        self.assertEqual(pack_wo3.parent_work_order, existing_bulk)
+
+    def test_quantity_produced_field_validation_error_pinpointing(self):
+        """Tests that invalid quantity_produced pinpoints the quantity_produced form field directly."""
+        from core.forms import WorkOrderForm
+        invalid_qty_form = WorkOrderForm(data={
+            'product': self.bulk_sauce.pk,
+            'category': 'PRODUCTION',
+            'quantity_produced': '-10.00',
+            'production_start_date': str(timezone.now().date())
+        })
+        self.assertFalse(invalid_qty_form.is_valid())
+        self.assertIn('quantity_produced', invalid_qty_form.errors)
+        self.assertIn('Bulk Yield Target (kg/L) must be a positive number', invalid_qty_form.errors['quantity_produced'][0])
+
+    def test_instruction_auto_generation_and_preservation(self):
+        """Tests default instruction blueprint auto-generation and instruction step preservation upon edit."""
+        # 1. Auto-generation on new WorkOrder
+        wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        self.assertTrue(wo.instructions.exists())
+        self.assertEqual(wo.instructions.count(), 4)
+
+        # 2. Preservation when updating instruction steps
+        inst1 = wo.instructions.first()
+        inst1.step_name = "Updated Step Name"
+        inst1.save()
+        
+        self.assertEqual(wo.instructions.count(), 4)
+        inst1_reloaded = wo.instructions.get(step_number=1)
+        self.assertEqual(inst1_reloaded.step_name, "Updated Step Name")
 
 
 class ReportingAndOptimizationTestCase(TestCase):

@@ -155,7 +155,51 @@ def return_form(request):
     return render(request, 'core/return_form.html', {'return_records': return_records})
 
 def generate_work_order_instructions(work_order):
-    pass
+    """
+    Populates standard 4-step process instruction blueprints for a newly created WorkOrder
+    if no custom instructions currently exist.
+    """
+    if not work_order or not work_order.pk:
+        return
+
+    from .models import WorkOrderInstruction
+
+    if work_order.instructions.exists():
+        return
+
+    is_packaging = (work_order.category == 'PACKAGING') or (
+        work_order.product and work_order.product.product_type == 'FINISHED'
+    )
+
+    if is_packaging:
+        default_steps = [
+            (1, "Line Prep & Staging", "Packaging Line #1", "Inspect container cleanliness & verify bulk source batch availability.", 15),
+            (2, "Container Filling", "Volumetric Filling Station", "Fill discrete containers to target unit pack count.", 45),
+            (3, "Sealing & Labeling", "Automated Capper / Labeler", "Cap, seal, and apply product barcode labels to filled containers.", 30),
+            (4, "Palletizing & Warehouse Transfer", "Pallet Wrapper", "Palletize finished goods and transfer to warehouse inventory.", 20),
+        ]
+    else:
+        # PRODUCTION / Bulk Mixing
+        default_steps = [
+            (1, "Vessel Setup & Cleanliness Check", "Mixing Vessel A", "Verify vessel cleanliness, valve seals, and raw material staging.", 15),
+            (2, "Raw Material Component Charge", "Raw Component Hopper", "Charge raw material components into mixing vessel per active BOM recipe.", 30),
+            (3, "Agitation & Thermal Reaction Processing", "High-Shear Agitator", "Run agitation and thermal processing to target viscosity and homogeneity.", 60),
+            (4, "QA Viscosity Sampling & Bulk Transfer", "Bulk Holding Tank", "Perform QA viscosity sampling and transfer bulk yield to holding tank.", 30),
+        ]
+
+    for step_num, step_name, machine, text, est_minutes in default_steps:
+        WorkOrderInstruction.objects.get_or_create(
+            work_order=work_order,
+            step_number=step_num,
+            defaults={
+                'product': work_order.product,
+                'step_name': step_name,
+                'machine': machine,
+                'instruction_text': text,
+                'estimated_time_minutes': est_minutes,
+                'status': 'IN_PROGRESS'
+            }
+        )
 
 
 @staff_member_required

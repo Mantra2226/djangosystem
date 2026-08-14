@@ -1,6 +1,5 @@
 /**
  * VANILLA JAVASCRIPT API CLIENT (static/core/js/api.js)
- * 
  * Modular asynchronous API client utility for interacting with Django RESTful API endpoints.
  * Automatically injects Django CSRF tokens, sets headers, handles promise resolution, 
  * standardizes error trapping, and displays interactive floating toast notifications.
