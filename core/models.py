@@ -446,12 +446,22 @@ class StockTransaction(models.Model):
     notes = models.TextField(blank=True, help_text="Reason for adjustment, operator name, etc.")
     created_at = models.DateTimeField(auto_now_add=True)
 
+    @property
+    def work_order_code(self):
+        """Returns the linked Work Order code or 'No WO' / None."""
+        if self.work_order and self.work_order.work_order_code:
+            return self.work_order.work_order_code
+        elif self.work_order_id:
+            return f"WO-{self.work_order_id}"
+        return None
+
     def __str__(self):
         sign = "+" if self.quantity > 0 else ""
         formatted_date = self.created_at.strftime('%Y-%m-%d') if self.created_at else "Draft"
         sku = self.product.sku if self.product else "UNKNOWN_SKU"
+        wo_part = f" | {self.work_order.work_order_code}" if (self.work_order and self.work_order.work_order_code) else (f" | WO-{self.work_order_id}" if self.work_order_id else " | No WO")
         
-        return f"{sku} | {sign}{self.quantity} | {self.get_transaction_type_display()} | {formatted_date}"
+        return f"{sku} | {sign}{self.quantity} | {self.get_transaction_type_display()}{wo_part} | {formatted_date}"
 class Employee(models.Model):
     employee_id = models.AutoField(primary_key=True) 
     employee_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True)   
@@ -507,6 +517,14 @@ class WorkOrderInstruction(models.Model):
     class Meta:
         unique_together = ('work_order', 'step_number')
         ordering = ['step_number']
+
+    def clean(self):
+        super().clean()
+        if self.work_order and self.work_order.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
+            if (self.status or '').upper() == 'COMPLETED':
+                raise ValidationError({
+                    'status': f"Instruction steps cannot be marked as COMPLETED while Work Order #{self.work_order.work_order_code or self.work_order.pk} is in '{self.work_order.status}' status. Start production first."
+                })
 
     def save(self, *args, **kwargs):
         if self.work_order:
@@ -1273,6 +1291,14 @@ class WorkOrderMaterialLine(models.Model):
         verbose_name = "Work Order Material Line"
         verbose_name_plural = "Work Order Material Lines"
 
+    def clean(self):
+        super().clean()
+        if self.work_order and self.work_order.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
+            if self.quantity_actual is not None and self.quantity_actual > Decimal('0.00'):
+                raise ValidationError({
+                    'quantity_actual': f"Actual material consumption cannot be entered while Work Order #{self.work_order.work_order_code or self.work_order.pk} is in '{self.work_order.status}' status. Start production first."
+                })
+
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         MaterialVarianceRecord.sync_from_material_line(self)
@@ -1441,10 +1467,20 @@ class MaterialVarianceRecord(models.Model):
 
         return rec
 
+    @property
+    def production_run_type(self):
+        """Returns the production run type (PRODUCTION or PACKAGING) from the linked Work Order."""
+        if self.work_order and self.work_order.category:
+            return self.work_order.category
+        if self.work_order_material_line and self.work_order_material_line.work_order:
+            return self.work_order_material_line.work_order.category
+        return "UNKNOWN"
+
     def __str__(self):
         code = self.variance_code or f"MVR-{self.variance_id:04d}"
         sign = "+" if self.quantity_variance > 0 else ""
-        return f"{code} — {self.product.name} ({sign}{self.quantity_variance:.2f} units, ${self.financial_impact:.2f})"
+        run_type = self.production_run_type
+        return f"{code} [{run_type}] — {self.product.name} ({sign}{self.quantity_variance:.2f} units, ${self.financial_impact:.2f})"
 
 class ProductionOrder(models.Model):
     STATUS_CHOICES = [

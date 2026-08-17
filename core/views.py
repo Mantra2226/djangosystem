@@ -2,6 +2,7 @@ from django.shortcuts import render, redirect
 from django.contrib import messages
 from django.http import JsonResponse
 from django.contrib.admin.views.decorators import staff_member_required
+from django.views.decorators.csrf import csrf_exempt
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
     ProductionOrder, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, 
@@ -245,6 +246,8 @@ def po_products_json(request):
     return JsonResponse({"products": product_list})
 
 
+@csrf_exempt
+@staff_member_required
 def mrp_resolve_action(request):
     """
     HTTP POST Handler for executing tailored MRP resolution pathways from Admin/Dashboard.
@@ -367,6 +370,7 @@ from .serializers import (
     ProductionOrderSerializer, ProcurementOrderSerializer, SalesOrderSerializer
 )
 
+@csrf_exempt
 def api_products_list_create(request):
     """
     RESTful JSON API Endpoint for Product resources.

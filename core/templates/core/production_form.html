@@ -1,0 +1,22 @@
+{% extends 'core/index.html' %}
+{% block content %}
+<div class="container">
+    <h2>Production Run Orders</h2>
+    <form method="post" action="">
+        {% csrf_token %}
+        <div class="form-group mb-3">
+            <label for="product_id">Product ID:</label>
+            <input type="number" class="form-control" id="product_id" name="product_id" required>
+        </div>
+        <div class="form-group mb-3">
+            <label for="work_order_id">Work Order ID:</label>
+            <input type="number" class="form-control" id="work_order_id" name="work_order_id">
+        </div>
+        <div class="form-group mb-3">
+            <label for="quantity">Target Quantity:</label>
+            <input type="number" step="0.01" class="form-control" id="quantity" name="quantity" required>
+        </div>
+        <button type="submit" class="btn btn-primary">Create Production Order</button>
+    </form>
+</div>
+{% endblock %}

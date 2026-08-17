@@ -75,7 +75,12 @@ class WorkOrderInstructionInline(admin.TabularInline):
     extra = 0
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
     ordering = ['step_number']
-    readonly_fields = ['step_number']    
+    readonly_fields = ['step_number']
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None or obj.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
+            return ['step_number', 'status']
+        return self.readonly_fields
 
 class BOMItemInline(admin.TabularInline):
     model = BOMItem
@@ -90,6 +95,11 @@ class WorkOrderMaterialLineInline(admin.TabularInline):
     extra = 0  # Don't show empty lines by default
     fields = ('component', 'quantity_expected', 'quantity_actual')
     readonly_fields = ('quantity_expected',)
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None or obj.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
+            return ('quantity_expected', 'quantity_actual')
+        return self.readonly_fields
 
 class ChildPackagingInline(admin.TabularInline):
     """
@@ -214,10 +224,22 @@ class InventoryAdmin(admin.ModelAdmin):
 
 @admin.register(StockTransaction)
 class StockTransactionAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity', 'transaction_type', 'created_at')
+    list_display = ('product', 'quantity', 'transaction_type', 'get_work_order_code', 'created_at')
     list_filter = ('transaction_type', 'created_at')
-    search_fields = ('product__name', 'product__sku', 'reference_type')
-    readonly_fields = ('created_at', 'work_order', 'dispatch_record')
+    search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
+    readonly_fields = ('created_at', 'work_order', 'get_work_order_code', 'dispatch_record')
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Product and WorkOrder."""
+        return super().get_queryset(request).select_related('product', 'work_order')
+
+    @admin.display(description='Work Order')
+    def get_work_order_code(self, obj):
+        if obj.work_order and obj.work_order.work_order_code:
+            return obj.work_order.work_order_code
+        elif obj.work_order_id:
+            return f"WO-{obj.work_order_id}"
+        return "-"
     
     # Prevents anyone from manually editing transaction logs to maintain audit integrity
     def has_add_permission(self, request):
@@ -933,15 +955,24 @@ class WorkOrderAdmin(admin.ModelAdmin):
 
 @admin.register(MaterialVarianceRecord)
 class MaterialVarianceRecordAdmin(admin.ModelAdmin):
-    list_display = ('variance_code', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'get_classification_badge', 'recorded_at')
-    list_filter = ['variance_classification', 'recorded_at']
+    list_display = ('variance_code', 'work_order', 'get_production_run_type', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'get_classification_badge', 'recorded_at')
+    list_filter = ['work_order__category', 'variance_classification', 'recorded_at']
     search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
-    readonly_fields = ('variance_code', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
+    readonly_fields = ('variance_code', 'get_production_run_type', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
     actions = [export_as_csv]
 
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly joins WorkOrder, Product, and MaterialLine."""
         return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')
+
+    @admin.display(description='Run Type')
+    def get_production_run_type(self, obj):
+        run_type = obj.production_run_type
+        if run_type == 'PRODUCTION':
+            return format_html('<span style="background-color: #2b6cb0; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;">PRODUCTION</span>')
+        elif run_type == 'PACKAGING':
+            return format_html('<span style="background-color: #6b46c1; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;">PACKAGING</span>')
+        return format_html('<span style="color: #666;">{}</span>', run_type)
 
     @admin.display(description='Financial Impact')
     def get_financial_impact(self, obj):

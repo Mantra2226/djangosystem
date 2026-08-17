@@ -6,7 +6,8 @@ from .models import (
     Supplier, Product, BillOfMaterial, BOMItem, Inventory, 
     WorkOrder, ProductionOrder, PurchaseOrder, PurchaseOrderItem, 
     ProcurementOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
-    SalesInvoice, SalesInvoicePayments, PurchaseInvoice, PurchasePayment
+    SalesInvoice, SalesInvoicePayments, PurchaseInvoice, PurchasePayment,
+    StockTransaction, MaterialVarianceRecord
 )
 from .services import (
     evaluate_mrp_shortages,
@@ -212,6 +213,149 @@ class MRPEngineTestCase(TestCase):
         self.assertEqual(var_rec.quantity_variance, Decimal("-2.00"))
         self.assertEqual(var_rec.financial_impact, Decimal("-30.00"))
         self.assertEqual(var_rec.variance_classification, "FAVOURABLE")
+        self.assertEqual(var_rec.production_run_type, "PRODUCTION")
+        self.assertIn("[PRODUCTION]", str(var_rec))
+
+    def test_variance_and_stock_transaction_output_customizations(self):
+        """Tests that MaterialVarianceRecord outputs production run type (PRODUCTION/PACKAGING) and StockTransaction outputs work order code."""
+        from django.contrib.admin.sites import AdminSite
+        from .admin import MaterialVarianceRecordAdmin, StockTransactionAdmin
+        from .serializers import MaterialVarianceRecordSerializer, StockTransactionSerializer
+
+        # 1. Packaging Work Order and Material Variance
+        pack_wo = WorkOrder.objects.create(
+            product=self.finished_good,
+            category="PACKAGING",
+            status="IN_PROGRESS",
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("20.00"),
+            production_start_date=timezone.now().date()
+        )
+        line = pack_wo.material_lines.get(component=self.inter_good)
+        line.quantity_actual = Decimal("42.00")
+        line.save()
+
+        var_rec = MaterialVarianceRecord.objects.get(work_order_material_line=line)
+        self.assertEqual(var_rec.production_run_type, "PACKAGING")
+        self.assertIn("[PACKAGING]", str(var_rec))
+        self.assertIn(self.inter_good.name, str(var_rec))
+
+        # Admin display for MaterialVarianceRecord
+        site = AdminSite()
+        mvr_admin = MaterialVarianceRecordAdmin(MaterialVarianceRecord, site)
+        run_type_badge = mvr_admin.get_production_run_type(var_rec)
+        self.assertIn("PACKAGING", run_type_badge)
+
+        # Serializer for MaterialVarianceRecord
+        mvr_serialized = MaterialVarianceRecordSerializer.serialize(var_rec)
+        self.assertEqual(mvr_serialized['production_run_type'], "PACKAGING")
+        self.assertEqual(mvr_serialized['work_order_code'], pack_wo.work_order_code)
+
+        # 2. StockTransaction with linked WorkOrder
+        st_linked = StockTransaction.objects.create(
+            product=self.raw_mat,
+            work_order=pack_wo,
+            quantity=Decimal("-10.00"),
+            transaction_type="PRODUCTION_CONSUMPTION",
+            notes="Consumption run"
+        )
+        self.assertEqual(st_linked.work_order_code, pack_wo.work_order_code)
+        self.assertIn(pack_wo.work_order_code, str(st_linked))
+        self.assertIn("-10.00", str(st_linked))
+
+        # Admin display for linked StockTransaction
+        st_admin = StockTransactionAdmin(StockTransaction, site)
+        self.assertEqual(st_admin.get_work_order_code(st_linked), pack_wo.work_order_code)
+
+        # Serializer for linked StockTransaction
+        st_linked_serialized = StockTransactionSerializer.serialize(st_linked)
+        self.assertEqual(st_linked_serialized['work_order_code'], pack_wo.work_order_code)
+        self.assertEqual(st_linked_serialized['work_order_id'], pack_wo.pk)
+
+        # 3. StockTransaction without linked WorkOrder
+        st_unlinked = StockTransaction.objects.create(
+            product=self.raw_mat,
+            quantity=Decimal("50.00"),
+            transaction_type="RECEIPT",
+            notes="Supplier purchase receipt"
+        )
+        self.assertIsNone(st_unlinked.work_order_code)
+        self.assertIn("No WO", str(st_unlinked))
+        self.assertEqual(st_admin.get_work_order_code(st_unlinked), "-")
+
+        st_unlinked_serialized = StockTransactionSerializer.serialize(st_unlinked)
+        self.assertIsNone(st_unlinked_serialized['work_order_code'])
+        self.assertIsNone(st_unlinked_serialized['work_order_id'])
+
+    def test_draft_work_order_locks_instructions_and_material_consumption(self):
+        """Tests that DRAFT work orders lock instruction completion and actual material consumption entry."""
+        from django.contrib.admin.sites import AdminSite
+        from django.test import RequestFactory
+        from .admin import WorkOrderInstructionInline, WorkOrderMaterialLineInline
+        from .models import WorkOrderInstruction, WorkOrderMaterialLine
+
+        # 1. Create a DRAFT Work Order
+        draft_wo = WorkOrder.objects.create(
+            product=self.finished_good,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("10.00"),
+            production_start_date=timezone.now().date(),
+            status="DRAFT"
+        )
+        self.assertEqual(draft_wo.status, "DRAFT")
+
+        # Material line should be auto-created with 0.00 actual
+        mat_line = draft_wo.material_lines.first()
+        self.assertIsNotNone(mat_line)
+        self.assertEqual(mat_line.quantity_actual, Decimal("0.00"))
+
+        # Instruction step should be auto-created with IN_PROGRESS
+        inst = draft_wo.instructions.first()
+        self.assertIsNotNone(inst)
+        self.assertNotEqual(inst.status, "COMPLETED")
+
+        # 2. Attempting to enter actual consumption on DRAFT must raise ValidationError
+        mat_line.quantity_actual = Decimal("15.00")
+        with self.assertRaises(ValidationError) as ctx:
+            mat_line.full_clean()
+        self.assertIn('quantity_actual', ctx.exception.message_dict)
+
+        # 3. Attempting to mark instruction COMPLETED on DRAFT must raise ValidationError
+        inst.status = "COMPLETED"
+        with self.assertRaises(ValidationError) as ctx:
+            inst.full_clean()
+        self.assertIn('status', ctx.exception.message_dict)
+
+        # 4. Verify Admin Inlines mark fields as readonly when WorkOrder is DRAFT
+        site = AdminSite()
+        factory = RequestFactory()
+        request = factory.get('/admin/')
+
+        inst_inline = WorkOrderInstructionInline(WorkOrderInstruction, site)
+        inst_readonly = inst_inline.get_readonly_fields(request, draft_wo)
+        self.assertIn('status', inst_readonly)
+
+        mat_inline = WorkOrderMaterialLineInline(WorkOrderMaterialLine, site)
+        mat_readonly = mat_inline.get_readonly_fields(request, draft_wo)
+        self.assertIn('quantity_actual', mat_readonly)
+
+        # 5. Move to IN_PROGRESS -> now both are editable and valid
+        draft_wo.status = "IN_PROGRESS"
+        draft_wo.save()
+
+        inst.refresh_from_db()
+        inst.status = "COMPLETED"
+        inst.full_clean()  # Should not raise
+
+        mat_line.refresh_from_db()
+        mat_line.quantity_actual = Decimal("15.00")
+        mat_line.full_clean()  # Should not raise
+
+        inst_readonly_in_progress = inst_inline.get_readonly_fields(request, draft_wo)
+        self.assertNotIn('status', inst_readonly_in_progress)
+
+        mat_readonly_in_progress = mat_inline.get_readonly_fields(request, draft_wo)
+        self.assertNotIn('quantity_actual', mat_readonly_in_progress)
 
     def test_production_order_code_auto_generation(self):
         wo = WorkOrder.objects.create(
@@ -1467,6 +1611,38 @@ class APISerializerAndMiddlewareTestCase(TestCase):
             "selling_price": "50.00"
         })
         self.assertIsNone(raw_validated['selling_price'])
+
+    def test_mrp_resolve_action_csrf_exempt_and_execution(self):
+        """Tests that mrp_resolve_action is CSRF exempt and processes action requests for staff without 403."""
+        from django.contrib.auth.models import User
+        from django.test import Client
+        
+        staff_user = User.objects.create_user(username="staff_admin", password="password", is_staff=True)
+        client = Client(enforce_csrf_checks=True)
+        client.login(username="staff_admin", password="password")
+
+        fg = Product.objects.create(
+            name="Assembled Machine",
+            product_type="FINISHED",
+            category="Equipment",
+            unit_of_measurement="pcs",
+            selling_price=Decimal("1500.00")
+        )
+        po = ProductionOrder.objects.create(
+            product=fg,
+            quantity=Decimal("5.00"),
+            status="IN_PROGRESS"
+        )
+
+        response = client.post('/mrp_resolve_action/', {
+            'production_order_id': po.pk,
+            'component_id': self.raw_mat.pk,
+            'shortfall_qty': '10.00',
+            'resolution_action': 'raw_hold_inbound'
+        })
+        self.assertEqual(response.status_code, 302)
+        po.refresh_from_db()
+        self.assertEqual(po.status, "ON_HOLD_SHORTAGE")
 
 
 
