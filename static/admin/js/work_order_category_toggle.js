@@ -16,8 +16,15 @@
         const $qtyLabel = $qtyRow.find('label');
         let $qtyHelp = $qtyRow.find('.help');
 
+        const $actualQtyRow = $('.field-actual_quantity_produced');
+        const $actualQtyLabel = $actualQtyRow.find('label');
+        let $actualQtyHelp = $actualQtyRow.find('.help');
+
         if ($qtyRow.length && !$qtyHelp.length) {
             $qtyHelp = $('<div class="help"></div>').appendTo($qtyRow);
+        }
+        if ($actualQtyRow.length && !$actualQtyHelp.length) {
+            $actualQtyHelp = $('<div class="help"></div>').appendTo($actualQtyRow);
         }
 
         function togglePackagingFields() {
@@ -44,6 +51,12 @@
                 if ($qtyHelp.length) {
                     $qtyHelp.text('Total discrete containers to fill.');
                 }
+                if ($actualQtyLabel.length) {
+                    $actualQtyLabel.html('Actual Quantity Produced (Units/Tins):');
+                }
+                if ($actualQtyHelp.length) {
+                    $actualQtyHelp.text('Actual count of filled containers produced by operator to save to inventory.');
+                }
             } else {
                 // PRODUCTION or default
                 $parentRow.removeClass('highlight-parent-wo').hide();
@@ -52,6 +65,12 @@
                 }
                 if ($qtyHelp.length) {
                     $qtyHelp.text('Total bulk weight/volume to mix.');
+                }
+                if ($actualQtyLabel.length) {
+                    $actualQtyLabel.html('Actual Quantity Produced (kg/L):');
+                }
+                if ($actualQtyHelp.length) {
+                    $actualQtyHelp.text('Actual bulk weight/volume produced by operator to save to inventory.');
                 }
             }
         }

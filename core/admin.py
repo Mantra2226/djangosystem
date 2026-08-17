@@ -1,7 +1,7 @@
 from django.urls import path, reverse
 from django.shortcuts import get_object_or_404, redirect
 from django.http import HttpResponseRedirect
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.utils.safestring import mark_safe
 from django.contrib import admin, messages
 from django.utils.html import format_html
@@ -236,12 +236,17 @@ class ProductionOrderAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        # If editing an existing Production Order, filter the Work Order choices to only show those for this specific product.
-        if self.instance and self.instance.product_id:
-            self.fields['work_order'].queryset = WorkOrder.objects.filter(
-                product=self.instance.product
-            )    
+        if 'work_order' in self.fields:
+            self.fields['work_order'].required = False
+            self.fields['work_order'].help_text = (
+                "Optional: Select the Work Order blueprint for this production run. "
+                "If unlinked, remember to link a Work Order later to enable recipe and material tracking."
+            )
+            # If editing an existing Production Order, filter the Work Order choices to only show those for this specific product.
+            if self.instance and getattr(self.instance, 'product_id', None):
+                self.fields['work_order'].queryset = WorkOrder.objects.filter(
+                    product=self.instance.product
+                )
 
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
@@ -256,6 +261,15 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly loads Product and WorkOrder."""
         return super().get_queryset(request).select_related('product', 'work_order')
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if not obj.work_order_id:
+            messages.warning(
+                request,
+                f"Reminder: Production Order '{obj.production_order_code or obj.pk}' was saved without a linked Work Order. "
+                f"Please link a Work Order blueprint when ready to sync specifications and inventory tracking."
+            )
 
     @admin.action(description="Check Stock & Auto-Resume On-Hold Orders")
     def trigger_mrp_auto_resume(self, request, queryset):
@@ -283,6 +297,13 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     def mrp_resolution_pathways_viewer(self, obj):
         if not obj or not obj.pk:
             return "Save record to evaluate MRP shortages."
+
+        if not obj.work_order_id:
+            return format_html(
+                "<div style='padding: 10px; background: #fff8e1; border-left: 4px solid #f57f17; color: #795548; border-radius: 4px;'>"
+                "ℹ <strong>No Work Order Linked:</strong> Link a Work Order to this Production Order to evaluate BOM recipe requirements and check inventory shortage pathways."
+                "</div>"
+            )
 
         from .services import evaluate_mrp_shortages
         report = evaluate_mrp_shortages(obj)
@@ -335,7 +356,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
                                 <input type="hidden" name="production_order_id" value="{obj.pk}">
                                 <input type="hidden" name="component_id" value="{comp.pk}">
                                 <input type="hidden" name="resolution_action" value="raw_hold_inbound">
-                                <button type="submit" style="background: #718096; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 3: Hold for Inbound POs</button>
+                                <button type="submit" style="background: #718096; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: font-size: 11px;">Execute Option 3: Hold for Inbound POs</button>
                             </form>
                         </div>
                     </div>
@@ -401,10 +422,15 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         return obj.product.name if obj.product else 'N/A'
     
     @admin.display(description='Quantity')
-    def get_quantity(self,obj):
-        if obj.work_order:
-            return getattr( obj.work_order, 'quantity_produced', getattr(obj.work_order, 'quantity', '0.00')) 
-        return "0.00"
+    def get_quantity(self, obj):
+        if obj.work_order_id:
+            try:
+                wo = obj.work_order
+                if wo:
+                    return getattr(wo, 'actual_quantity_produced', getattr(wo, 'quantity_produced', getattr(wo, 'quantity', '0.00')))
+            except ObjectDoesNotExist:
+                pass
+        return obj.quantity or "0.00"
 
     def work_order_details_viewer(self, obj):
         """
@@ -413,19 +439,32 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         instead of executing full table scans across all historical WorkOrder records.
         """
         if not obj or not obj.work_order_id:
-            return format_html("<span style='color: #666; font-style: italic;'>Select a Work Order from the dropdown above to view specifications...</span>")
+            return format_html(
+                "<div style='padding: 8px 12px; background: #fff3cd; border-left: 4px solid #ffc107; color: #856404; border-radius: 4px;'>"
+                "ℹ <strong>Reminder:</strong> No Work Order linked to this Production Order. "
+                "Select a Work Order from the dropdown above to connect blueprint specifications and material tracking."
+                "</div>"
+            )
 
-        wo = obj.work_order
+        try:
+            wo = obj.work_order
+        except ObjectDoesNotExist:
+            wo = None
+
         if not wo:
-            return format_html("<span style='color: #666; font-style: italic;'>No Work Order linked.</span>")
+            return format_html(
+                "<div style='padding: 8px 12px; background: #fff3cd; border-left: 4px solid #ffc107; color: #856404; border-radius: 4px;'>"
+                "ℹ <strong>Reminder:</strong> Linked Work Order could not be loaded. Please select a valid Work Order."
+                "</div>"
+            )
 
         emp_list = [str(emp) for emp in wo.employee.all()]
         html_string = f"""
         <div id="wo-preview-panel" style="margin-top: 10px; padding: 12px; background: #f8f9fa; border-left: 4px solid #79aec8; border-radius: 4px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.05); color: #333; max-width: 600px;">
             <strong style="color: #555; display: block; margin-bottom: 5px;">Blueprint Live Specifications:</strong>
             <div id="wo-preview-content" style="font-size: 13px; line-height: 1.6;">
-                <strong>Target Product:</strong> {wo.product.name} ({getattr(wo.product, 'sku', '')}) <br>
-                <strong>Expected Yield:</strong> {wo.quantity_produced or '0.00'}<br>
+                <strong>Target Product:</strong> {wo.product.name if wo.product else 'N/A'} ({getattr(wo.product, 'sku', '')}) <br>
+                <strong>Expected Yield:</strong> {wo.actual_quantity_produced or wo.quantity_produced or '0.00'}<br>
                 <strong>Assigned Team/Crew:</strong> {', '.join(emp_list) if emp_list else 'Unassigned'}<br>
                 <strong>Current Step Status:</strong> <span style='text-transform: uppercase; font-weight: bold; color: #264b5d;'>{wo.status}</span>
             </div>
@@ -651,7 +690,7 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
     form = WorkOrderForm
-    list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
+    list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
     readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
     list_filter = ['category', 'status', 'is_inventory_updated', 'production_start_date']
@@ -676,6 +715,7 @@ class WorkOrderAdmin(admin.ModelAdmin):
                 'product',
                 'bill_of_material',
                 'quantity_produced',
+                'actual_quantity_produced',
                 'employee',
             )
         }),
@@ -724,8 +764,9 @@ class WorkOrderAdmin(admin.ModelAdmin):
         print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...", flush=True)
         super().save_related(request, form, formsets, change)
         
-        print("[ADMIN SAVE_RELATED] Inline material lines saved. Calling process_inventory()...", flush=True)
+        print("[ADMIN SAVE_RELATED] Inline material lines saved. Refreshing instance and calling process_inventory()...", flush=True)
         work_order = form.instance
+        work_order.refresh_from_db()
         work_order.process_inventory()
 
     @admin.display(description='Category')

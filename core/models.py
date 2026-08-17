@@ -3,7 +3,7 @@ from itertools import product
 import secrets
 from sys import prefix
 from django.db import models, transaction
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from decimal import Decimal, ROUND_HALF_UP
 from django.utils.text import slugify
 from django.core.validators import MinValueValidator
@@ -554,6 +554,7 @@ class WorkOrder(models.Model):
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
+    actual_quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))], help_text="Actual physical quantity produced in this Run (saved to inventory upon work order completion).")
     production_start_date = models.DateField(null=True, blank=True, db_index=True)
     production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
@@ -852,7 +853,26 @@ class WorkOrder(models.Model):
         Phase 2: Deduct incremental actuals (Deltas) during production.
         Phase 3: Add finished goods & release remaining unconsumed allocations on COMPLETED.
         """
+        # =====================================================================
+        # SAFETY GUARD: Refresh flags from DB and early-exit if already done.
+        # Prevents double-execution when multiple call sites trigger this
+        # method within the same request cycle (e.g. ProductionOrder.save()
+        # -> process_inventory() AND admin save_related() -> process_inventory()).
+        # =====================================================================
+        if self.pk:
+            db_flags = WorkOrder.objects.filter(pk=self.pk).values_list(
+                'is_inventory_allocated', 'is_inventory_updated'
+            ).first()
+            if db_flags:
+                self.is_inventory_allocated, self.is_inventory_updated = db_flags
+
         current_status = (self.status or '').upper().strip()
+
+        # Early exit: nothing to do if already fully updated and not in a
+        # state that requires incremental processing.
+        if self.is_inventory_updated:
+            print(f"\n[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} — SKIPPED (is_inventory_updated=True)", flush=True)
+            return
 
         from .models import Inventory, StockTransaction
         target_qty = self.target_quantity
@@ -886,6 +906,14 @@ class WorkOrder(models.Model):
                         product=item.component,
                         defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
                     )
+
+                    # STOCK SUFFICIENCY CHECK: Prevent allocation that would drive inventory negative
+                    if raw_inv.quantity_available < expected_allocated_qty:
+                        raise ValidationError(
+                            f"Insufficient stock for '{item.component.name}': "
+                            f"Available={raw_inv.quantity_available}, Required={expected_allocated_qty}. "
+                            f"Please restock before starting production."
+                        )
 
                     old_avail = raw_inv.quantity_available
                     old_alloc = raw_inv.quantity_allocated
@@ -963,16 +991,21 @@ class WorkOrder(models.Model):
                 print("--------------------------------------------------", flush=True)
                 print("[PHASE 3: RECONCILIATION & FINISHED GOODS OUTPUT START]", flush=True)
 
-                # Release any unconsumed allocated stock back to available pool
+                # Release any unconsumed allocated stock back to available pool.
+                # IMPORTANT: We use deducted_quantity (not actual_consumed) to compute
+                # what portion of the original allocation has already been moved out of
+                # the allocation pool by Phase 2's incremental deductions. The remaining
+                # allocation to release = original_allocation - already_deducted.
                 if self.is_inventory_allocated and self.bill_of_material:
                     for item in self.bill_of_material.items.all():
                         line = self.material_lines.filter(component=item.component).first()
-                        actual_consumed = line.quantity_actual if line else Decimal('0.00')
+                        already_deducted = (line.deducted_quantity or Decimal('0.00')) if line else Decimal('0.00')
                         per_unit_req = item.quantity_required or Decimal('0.00')
                         expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
-                        unconsumed_alloc = expected_allocated_qty - actual_consumed
-                        if unconsumed_alloc > Decimal('0.00'):
+                        # Remaining allocation = what was originally reserved minus what Phase 2 already consumed from the pool
+                        remaining_in_alloc = expected_allocated_qty - already_deducted
+                        if remaining_in_alloc > Decimal('0.00'):
                             raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
                                 product=item.component,
                                 defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
@@ -980,16 +1013,16 @@ class WorkOrder(models.Model):
                             old_alloc = raw_inv.quantity_allocated
                             old_avail = raw_inv.quantity_available
 
-                            released = min(unconsumed_alloc, raw_inv.quantity_allocated)
+                            released = min(remaining_in_alloc, raw_inv.quantity_allocated)
                             raw_inv.quantity_allocated -= released
                             raw_inv.quantity_available += released
                             raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Allocated={expected_allocated_qty} | Actual Consumed={actual_consumed} | Unused Released={released}", flush=True)
+                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Original Allocated={expected_allocated_qty} | Already Deducted by Phase 2={already_deducted} | Remaining Released={released}", flush=True)
                             print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
                 # Record Finished Goods Output
-                finished_qty = target_qty
+                finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
                 if finished_qty > Decimal('0.00'):
                     finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
                         product=self.product,
@@ -1019,7 +1052,7 @@ class WorkOrder(models.Model):
         """
         DYNAMIC YIELD AUTO-SCALING:
         When a Stage 1 Bulk WorkOrder reaches COMPLETED status, synchronizes the actual bulk yield
-        (self.quantity_produced) to all linked child Stage 2 packaging work order material lines 
+        (self.actual_quantity_produced or self.quantity_produced) to all linked child Stage 2 packaging work order material lines 
         where component == self.product. Updates quantity_expected on each matching WorkOrderMaterialLine.
 
         Why yield auto-scaling prevents allocation crashes:
@@ -1028,7 +1061,7 @@ class WorkOrder(models.Model):
         quantity_expected to match actual bulk output ensures material variance calculations and stock deductions 
         reflect exact physical reality without triggering negative stock allocations or system crashes.
         """
-        bulk_yield = self.quantity_produced or Decimal('0.00')
+        bulk_yield = (self.actual_quantity_produced if self.actual_quantity_produced is not None else self.quantity_produced) or Decimal('0.00')
         with transaction.atomic():
             for child_wo in self.child_packaging_orders.all():
                 mat_lines = child_wo.material_lines.filter(component=self.product)
@@ -1106,7 +1139,11 @@ class WorkOrder(models.Model):
                 self.sync_material_lines()
 
             # AUTOMATED PRODUCTION ORDER QUANTITY AND STATUS SYNC
+            # Set a transient flag so that ProductionOrder.save() does NOT cascade
+            # back into process_inventory(). During admin saves, save_related() is
+            # the canonical call site for process_inventory() after inlines commit.
             if self.pk:
+                self._skip_po_inventory_sync = True
                 from .models import ProductionOrder
                 linked_pos = ProductionOrder.objects.filter(work_order=self)
                 print(f"[PRODUCTION ORDER SYNC] Found {linked_pos.count()} linked Production Order(s).", flush=True)
@@ -1122,8 +1159,10 @@ class WorkOrder(models.Model):
                         if 'quantity' not in update_fields:
                             update_fields.append('quantity')
                     if update_fields:
+                        po.work_order = self  # Ensure PO references this in-memory instance with the flag
                         po.save(update_fields=update_fields)
                         print(f"    Updated ProductionOrder #{po.pk} fields: {update_fields}.", flush=True)
+                self._skip_po_inventory_sync = False
 
             # AUTO-GENERATE DEFAULT PROCESS INSTRUCTIONS IF NONE EXIST
             if self.pk and not self.instructions.exists():
@@ -1417,7 +1456,7 @@ class ProductionOrder(models.Model):
     production_order_id = models.AutoField(primary_key=True)
     production_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True, help_text="System-generated unique production order code.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='production_runs', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
-    work_order = models.ForeignKey('WorkOrder', on_delete=models.PROTECT, related_name='production_runs')
+    work_order = models.ForeignKey('WorkOrder', on_delete=models.SET_NULL, null=True, blank=True, related_name='production_runs', help_text="Linked Work Order blueprint for this production run. Optional — link a Work Order to sync recipe and material allocations.")
     employee = models.ManyToManyField('Employee', blank=True, related_name='production_runs', help_text="Employees assigned to this production run.")
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.01'))], help_text="Quantity to be produced in this specific run.")
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, validators=[MinValueValidator(Decimal('0.00'))], help_text="Manufacturing cost per unit for this specific batch.")
@@ -1425,7 +1464,7 @@ class ProductionOrder(models.Model):
     notes = models.TextField(blank=True, null=True, help_text="Any issues or notes during this production run.")
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    completed_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True, help_text="Timestamp when the production run was marked COMPLETED.")
 
     def complete_production(self):
         """Calculates moving average cost (AVCO) without modifying quantity_available."""
@@ -1461,7 +1500,10 @@ class ProductionOrder(models.Model):
 
         # Auto-assign product from work order if blank
         if self.work_order_id and not self.product_id:
-            self.product = self.work_order.product
+            try:
+                self.product = self.work_order.product
+            except ObjectDoesNotExist:
+                pass
 
         # Normalize status string for case-insensitive checks
         current_status = (self.status or '').upper().strip()
@@ -1472,14 +1514,18 @@ class ProductionOrder(models.Model):
                 'product': "Only products designated as 'Finished Goods' or 'Intermediate' can be selected for a production run."
             })
 
-        if self.product and self.work_order:
-            if self.work_order.product != self.product:
-                raise ValidationError({
-                    'work_order': (
-                        f"Conflict: The selected Work Order ({self.work_order}) is for '{self.work_order.product}', "
-                        f"but this Production Order is set to produce '{self.product}'."
-                    )
-                })
+        if self.product and self.work_order_id:
+            try:
+                wo = self.work_order
+                if wo and wo.product != self.product:
+                    raise ValidationError({
+                        'work_order': (
+                            f"Conflict: The selected Work Order ({wo}) is for '{wo.product}', "
+                            f"but this Production Order is set to produce '{self.product}'."
+                        )
+                    })
+            except ObjectDoesNotExist:
+                pass
 
         # PRE-RUN INVENTORY AVAILABILITY CHECK
         old_status = None
@@ -1502,8 +1548,14 @@ class ProductionOrder(models.Model):
                 })
 
             bom = None
-            if self.work_order and self.work_order.bill_of_material:
-                bom = self.work_order.bill_of_material
+            if self.work_order_id:
+                try:
+                    if self.work_order and self.work_order.bill_of_material:
+                        bom = self.work_order.bill_of_material
+                except ObjectDoesNotExist:
+                    pass
+            if not bom and self.product:
+                bom = self.product.boms.filter(is_active=True).first()
 
             if bom:
                 shortage_msgs = []
@@ -1557,24 +1609,40 @@ class ProductionOrder(models.Model):
 
         is_transitioning_to_completed = (old_status != 'COMPLETED' and self.status == 'COMPLETED')
 
-        # Sets Timestamps
-        if self.status == 'IN_PROGRESS' and not getattr(self, 'created_at', None):
-            self.created_at = timezone.now()
-        elif self.status == 'COMPLETED' and not getattr(self, 'completed_at', None):
-            self.completed_at = timezone.now()
-        elif self.status == 'CANCELLED':
+        # Sets Timestamps based on status
+        if self.status == 'COMPLETED':
+            if not self.completed_at:
+                self.completed_at = timezone.now()
+        else:
             self.completed_at = None
 
         with transaction.atomic():
             super().save(*args, **kwargs)
 
             # Assign M2M Employees (Requires self.pk to exist)
-            if is_new and self.work_order_id and hasattr(self.work_order, 'employee'):
-                self.employee.set(self.work_order.employee.all())
+            if is_new and self.work_order_id:
+                try:
+                    wo = self.work_order
+                    if wo and hasattr(wo, 'employee'):
+                        self.employee.set(wo.employee.all())
+                except ObjectDoesNotExist:
+                    pass
 
-            # Sync WorkOrder inventory processing from ProductionOrder target quantity
-            if self.work_order:
-                self.work_order.process_inventory()
+            # Sync WorkOrder inventory processing from ProductionOrder target quantity.
+            # GUARD: Only call process_inventory() when a ProductionOrder is saved
+            # OUTSIDE the admin WorkOrder save flow. During admin saves, the
+            # WorkOrderAdmin.save_related() method is the canonical call site and
+            # handles process_inventory() after inlines are committed.
+            # We detect the admin flow by checking for the _skip_po_inventory_sync
+            # flag set by WorkOrder.save().
+            if self.work_order_id:
+                try:
+                    wo = self.work_order
+                    if wo and not getattr(wo, '_skip_po_inventory_sync', False):
+                        wo.refresh_from_db()
+                        wo.process_inventory()
+                except ObjectDoesNotExist:
+                    pass
 
             # Non-inventory completion logic (ensure this method does NOT update stock!)
             if is_transitioning_to_completed:
@@ -1582,7 +1650,14 @@ class ProductionOrder(models.Model):
                 
     def __str__(self):
         code = self.production_order_code or f"POC-{self.production_order_id:04d}"
-        wo_code = getattr(self.work_order, 'work_order_code', f"WO-{self.work_order_id}") if self.work_order else "N/A"
+        wo_code = "Unlinked (No WO)"
+        if self.work_order_id:
+            try:
+                wo = self.work_order
+                if wo:
+                    wo_code = getattr(wo, 'work_order_code', f"WO-{self.work_order_id}")
+            except ObjectDoesNotExist:
+                wo_code = f"WO-{self.work_order_id}"
         return f"{code} ({self.get_status_display()}) - Blueprint: {wo_code}"            
 class Customer(models.Model):
     customer_id = models.AutoField(primary_key=True)    

@@ -34,16 +34,23 @@ class WorkOrderForm(forms.ModelForm):
             if 'quantity_produced' in self.fields:
                 self.fields['quantity_produced'].label = "Target Pack Count (Units/Tins)"
                 self.fields['quantity_produced'].help_text = "Total discrete containers to fill."
+            if 'actual_quantity_produced' in self.fields:
+                self.fields['actual_quantity_produced'].label = "Actual Quantity Produced (Units/Tins)"
+                self.fields['actual_quantity_produced'].help_text = "Actual count of filled containers produced by operator to save to inventory."
         else:
             if 'parent_work_order' in self.fields:
                 self.fields['parent_work_order'].required = False
             if 'quantity_produced' in self.fields:
                 self.fields['quantity_produced'].label = "Bulk Yield Target (kg/L)"
                 self.fields['quantity_produced'].help_text = "Total bulk weight/volume to mix."
+            if 'actual_quantity_produced' in self.fields:
+                self.fields['actual_quantity_produced'].label = "Actual Quantity Produced (kg/L)"
+                self.fields['actual_quantity_produced'].help_text = "Actual bulk weight/volume produced by operator to save to inventory."
 
     def clean(self):
         cleaned_data = super().clean()
         qty = cleaned_data.get('quantity_produced')
+        actual_qty = cleaned_data.get('actual_quantity_produced')
         category = cleaned_data.get('category') or getattr(self.instance, 'category', None)
         product = cleaned_data.get('product') or getattr(self.instance, 'product', None)
 
@@ -57,6 +64,9 @@ class WorkOrderForm(forms.ModelForm):
             field_name = 'quantity_produced'
             label = "Bulk Yield Target (kg/L)" if category == 'PRODUCTION' else "Target Pack Count (Units/Tins)"
             self.add_error(field_name, f"{label} must be a positive number greater than 0.00.")
+
+        if actual_qty is not None and actual_qty < 0:
+            self.add_error('actual_quantity_produced', "Actual Quantity Produced cannot be negative.")
 
         return cleaned_data
 

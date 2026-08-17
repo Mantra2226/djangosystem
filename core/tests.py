@@ -131,6 +131,11 @@ class MRPEngineTestCase(TestCase):
         )
 
         # Option 1: Build Sub-Assembly
+        # Seed raw material inventory so Phase 1 allocation has sufficient stock
+        # (BOM requires 5.00 Raw Steel Sheets/unit × 20.00 target = 100.00 needed)
+        raw_inv, _ = Inventory.objects.get_or_create(product=self.raw_mat)
+        raw_inv.quantity_available = Decimal("200.00")
+        raw_inv.save()
         child_wo, child_po = resolve_intermediate_build(po, self.inter_good.pk, Decimal("20.00"))
         self.assertEqual(child_po.product, self.inter_good)
         self.assertEqual(child_po.quantity, Decimal("20.00"))
@@ -229,6 +234,101 @@ class MRPEngineTestCase(TestCase):
         self.assertEqual(po1.production_order_code, "POC-0001")
         self.assertEqual(po2.production_order_code, "POC-0002")
         self.assertIn("POC-0001", str(po1))
+
+    def test_production_order_without_work_order_soft_message(self):
+        """Tests that creating a ProductionOrder without a WorkOrder succeeds and shows soft reminder messages."""
+        from django.contrib.admin.sites import AdminSite
+        from django.test.client import RequestFactory
+        from django.contrib.messages.storage.fallback import FallbackStorage
+        from .admin import ProductionOrderAdmin, ProductionOrderAdminForm
+        from .serializers import ProductionOrderSerializer
+
+        # 1. Create PO without work_order (null FK)
+        po = ProductionOrder.objects.create(
+            product=self.finished_good,
+            work_order=None,
+            quantity=Decimal("15.00")
+        )
+        self.assertIsNone(po.work_order_id)
+        self.assertIsNone(po.work_order)
+        self.assertEqual(po.quantity, Decimal("15.00"))
+        self.assertIn("Unlinked (No WO)", str(po))
+
+        # 2. Test ProductionOrderAdminForm has work_order as optional
+        form = ProductionOrderAdminForm(instance=po)
+        self.assertFalse(form.fields['work_order'].required)
+        self.assertIn("Optional", form.fields['work_order'].help_text)
+
+        # 3. Test Admin work_order_details_viewer returns reminder banner
+        site = AdminSite()
+        po_admin = ProductionOrderAdmin(ProductionOrder, site)
+        details_html = po_admin.work_order_details_viewer(po)
+        self.assertIn("No Work Order linked", details_html)
+        self.assertIn("Reminder", details_html)
+
+        # 4. Test Admin mrp_resolution_pathways_viewer returns reminder banner
+        pathways_html = po_admin.mrp_resolution_pathways_viewer(po)
+        self.assertIn("No Work Order Linked", pathways_html)
+
+        # 5. Test Admin get_quantity returns po.quantity when no WO is linked
+        qty_display = po_admin.get_quantity(po)
+        self.assertEqual(qty_display, Decimal("15.00"))
+
+        # 6. Test Admin save_model triggers messages.warning
+        factory = RequestFactory()
+        request = factory.post('/admin/core/productionorder/add/', {
+            'product': self.finished_good.pk,
+            'quantity': '15.00',
+            'status': 'IN_PROGRESS'
+        })
+        # Attach message storage to request
+        setattr(request, 'session', {})
+        messages_storage = FallbackStorage(request)
+        setattr(request, '_messages', messages_storage)
+
+        po_admin.save_model(request, po, form, change=False)
+        all_messages = [msg.message for msg in messages_storage]
+        self.assertTrue(any("Reminder: Production Order" in msg for msg in all_messages))
+        self.assertTrue(any("saved without a linked Work Order" in msg for msg in all_messages))
+
+        # 7. Test Serializer serializes cleanly with unlinked WO
+        serialized = ProductionOrderSerializer.serialize(po)
+        self.assertIsNone(serialized['work_order_id'])
+        self.assertEqual(serialized['work_order_code'], "")
+
+    def test_production_order_completed_at_timestamp_lifecycle(self):
+        """Tests that completed_at is None for active POs and only stamped upon COMPLETED status."""
+        # 1. New ProductionOrder in IN_PROGRESS must have completed_at = None
+        po = ProductionOrder.objects.create(
+            product=self.finished_good,
+            quantity=Decimal("10.00"),
+            status="IN_PROGRESS"
+        )
+        self.assertIsNotNone(po.created_at)
+        self.assertIsNone(po.completed_at)
+
+        # 2. Saving while still IN_PROGRESS should keep completed_at = None
+        po.quantity = Decimal("12.00")
+        po.save()
+        po.refresh_from_db()
+        self.assertIsNone(po.completed_at)
+
+        # 3. Setting status to COMPLETED sets completed_at to now
+        po.status = "COMPLETED"
+        po.save()
+        po.refresh_from_db()
+        self.assertIsNotNone(po.completed_at)
+        self.assertAlmostEqual(
+            po.completed_at.timestamp(),
+            timezone.now().timestamp(),
+            delta=5
+        )
+
+        # 4. Changing status back to CANCELLED clears completed_at to None
+        po.status = "CANCELLED"
+        po.save()
+        po.refresh_from_db()
+        self.assertIsNone(po.completed_at)
 
     def test_purchase_order_and_procurement_status_flow(self):
         # 1. PO starts in DRAFT with 0 items
@@ -1017,6 +1117,74 @@ class TwoStageManufacturingTestCase(TestCase):
         inst1_reloaded = wo.instructions.get(step_number=1)
         self.assertEqual(inst1_reloaded.step_name, "Updated Step Name")
 
+    def test_actual_quantity_produced_form_labels_and_help_text(self):
+        """Tests that WorkOrderForm configures label and operator help text for actual_quantity_produced based on category."""
+        from core.forms import WorkOrderForm
+
+        # Production Category
+        prod_form = WorkOrderForm(initial={'category': 'PRODUCTION'})
+        self.assertIn('actual_quantity_produced', prod_form.fields)
+        self.assertEqual(prod_form.fields['actual_quantity_produced'].label, "Actual Quantity Produced (kg/L)")
+        self.assertEqual(prod_form.fields['actual_quantity_produced'].help_text, "Actual bulk weight/volume produced by operator to save to inventory.")
+
+        # Packaging Category
+        pack_form = WorkOrderForm(initial={'category': 'PACKAGING'})
+        self.assertIn('actual_quantity_produced', pack_form.fields)
+        self.assertEqual(pack_form.fields['actual_quantity_produced'].label, "Actual Quantity Produced (Units/Tins)")
+        self.assertEqual(pack_form.fields['actual_quantity_produced'].help_text, "Actual count of filled containers produced by operator to save to inventory.")
+
+    def test_process_inventory_saves_actual_quantity_produced_to_inventory(self):
+        """Tests that process_inventory saves actual_quantity_produced to inventory instead of target yield when completed."""
+        wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            quantity_produced=Decimal("100.00"),
+            actual_quantity_produced=Decimal("95.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+
+        # Complete all instruction steps
+        wo.instructions.update(status='COMPLETED')
+        wo.recalculate_status()
+
+        # Run process_inventory
+        wo.process_inventory()
+        wo.refresh_from_db()
+
+        self.assertTrue(wo.is_inventory_updated)
+        inv = Inventory.objects.get(product=self.bottled_sauce)
+        # Should be 95.00 (actual_quantity_produced), NOT 100.00 (quantity_produced target)
+        self.assertEqual(inv.quantity_available, Decimal("95.00"))
+
+    def test_sync_child_packaging_uses_actual_quantity_produced(self):
+        """Tests that sync_child_packaging_expectations uses actual_quantity_produced if set."""
+        bulk_wo = WorkOrder.objects.create(
+            product=self.bulk_sauce,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("50.00"),
+            actual_quantity_produced=Decimal("52.50"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.bottled_sauce,
+            bill_of_material=self.finished_bom,
+            parent_work_order=bulk_wo,
+            quantity_produced=Decimal("100.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+
+        # Complete bulk_wo instructions and recalculate
+        bulk_wo.instructions.update(status='COMPLETED')
+        bulk_wo.recalculate_status()
+        bulk_wo.process_inventory()
+
+        pack_mat_line = pack_wo.material_lines.get(component=self.bulk_sauce)
+        self.assertEqual(pack_mat_line.quantity_expected, Decimal("52.50"))
+
 
 class ReportingAndOptimizationTestCase(TestCase):
     def setUp(self):
@@ -1299,6 +1467,7 @@ class APISerializerAndMiddlewareTestCase(TestCase):
             "selling_price": "50.00"
         })
         self.assertIsNone(raw_validated['selling_price'])
+
 
 
 
