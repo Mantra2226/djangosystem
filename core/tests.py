@@ -1645,6 +1645,297 @@ class APISerializerAndMiddlewareTestCase(TestCase):
         self.assertEqual(po.status, "ON_HOLD_SHORTAGE")
 
 
+class WorkOrderShortageResolutionEndToEndTestCase(TestCase):
+    def setUp(self):
+        from django.contrib.auth.models import User
+        self.admin_user = User.objects.create_superuser('admin_sr', 'admin_sr@test.com', 'password123')
+        self.client.login(username='admin_sr', password='password123')
+
+        self.supplier = Supplier.objects.create(name="Apex Materials", contact_info="apex@test.com")
+        self.raw_resin = Product.objects.create(
+            name="Raw Epoxy Resin",
+            product_type="RAW",
+            category="Chemicals",
+            unit_of_measurement="kg",
+            supplier=self.supplier
+        )
+        self.bulk_putty = Product.objects.create(
+            name="Bulk Putty Base",
+            product_type="INTERMEDIATE",
+            category="Pastes",
+            unit_of_measurement="kg"
+        )
+        self.packaged_putty = Product.objects.create(
+            name="500g Tub Putty",
+            product_type="FINISHED",
+            category="Retail Tubs",
+            unit_of_measurement="tubs",
+            selling_price=Decimal("25.00")
+        )
+
+        # Raw stock in warehouse for mixing
+        Inventory.objects.create(
+            product=self.raw_resin,
+            quantity_available=Decimal("500.00"),
+            location="Main Warehouse"
+        )
+
+        # BOM for Bulk Putty: 1 kg bulk putty requires 0.8 kg raw resin
+        self.bulk_bom = BillOfMaterial.objects.create(
+            product=self.bulk_putty,
+            name="Bulk Putty Recipe",
+            is_active=True
+        )
+        BOMItem.objects.create(
+            bom=self.bulk_bom,
+            component=self.raw_resin,
+            quantity_required=Decimal("0.8000")
+        )
+
+        # BOM for Packaged Putty: 1 tub requires 0.5 kg bulk putty
+        self.pack_bom = BillOfMaterial.objects.create(
+            product=self.packaged_putty,
+            name="Tub Packaging Recipe",
+            is_active=True
+        )
+        BOMItem.objects.create(
+            bom=self.pack_bom,
+            component=self.bulk_putty,
+            quantity_required=Decimal("0.5000")
+        )
+
+    def test_start_production_detects_shortage_and_moves_to_awaiting_resolution(self):
+        """Packaging 50 tubs requires 25 kg bulk putty. Warehouse has 0. Should move to AWAITING_RESOLUTION."""
+        pack_wo = WorkOrder.objects.create(
+            product=self.packaged_putty,
+            bill_of_material=self.pack_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.packaged_putty,
+            work_order=pack_wo,
+            quantity=Decimal("50.00"),
+            status='IN_PROGRESS'
+        )
+
+        success, msg = pack_wo.start_production()
+        self.assertFalse(success)
+        pack_wo.refresh_from_db()
+        po.refresh_from_db()
+
+        self.assertEqual(pack_wo.status, 'AWAITING_RESOLUTION')
+        self.assertEqual(po.status, 'ON_HOLD_SHORTAGE')
+        self.assertIn("Bulk shortage detected", msg)
+
+    def test_option_1_top_up_bulk_execution_and_auto_resume_flow(self):
+        """
+        Option 1: Spawns parent bulk WorkOrder for exact shortfall,
+        links it as parent_work_order, sets packaging to ON_HOLD_SHORTAGE,
+        and auto-resumes packaging order when parent completes.
+        """
+        # Warehouse has 5 kg bulk putty (enough for only 10 tubs; 50 tubs need 25 kg -> shortfall 20 kg)
+        Inventory.objects.create(
+            product=self.bulk_putty,
+            quantity_available=Decimal("5.00"),
+            location="Main Warehouse"
+        )
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.packaged_putty,
+            bill_of_material=self.pack_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.packaged_putty,
+            work_order=pack_wo,
+            quantity=Decimal("50.00"),
+            status='ON_HOLD_SHORTAGE'
+        )
+
+        # Execute Option 1: Top-Up Bulk
+        pack_wo.resolve_bulk_shortage('TOP_UP_BULK')
+        pack_wo.refresh_from_db()
+        po.refresh_from_db()
+
+        self.assertEqual(pack_wo.status, 'ON_HOLD_SHORTAGE')
+        self.assertEqual(po.status, 'ON_HOLD_SHORTAGE')
+        self.assertIsNotNone(pack_wo.parent_work_order)
+
+        parent_wo = pack_wo.parent_work_order
+        self.assertEqual(parent_wo.product, self.bulk_putty)
+        self.assertEqual(parent_wo.quantity_produced, Decimal("20.00")) # Exact shortfall
+        self.assertEqual(parent_wo.status, 'IN_PROGRESS')
+        self.assertTrue(parent_wo.is_inventory_allocated) # Raw resin reserved for top-up run
+
+        # Linked PO for parent bulk work order
+        parent_po = ProductionOrder.objects.filter(work_order=parent_wo).first()
+        self.assertIsNotNone(parent_po)
+        self.assertEqual(parent_po.quantity, Decimal("20.00"))
+        self.assertEqual(parent_po.status, 'IN_PROGRESS')
+
+        # Now complete parent bulk work order
+        parent_wo.actual_quantity_produced = Decimal("20.00")
+        parent_wo.instructions.update(status='COMPLETED')
+        parent_wo.recalculate_status()
+        parent_wo.process_inventory()
+
+        # Check that parent WO is COMPLETED
+        parent_wo.refresh_from_db()
+        self.assertEqual(parent_wo.status, 'COMPLETED')
+
+        # Check that child packaging order automatically auto-resumed to IN_PROGRESS and allocated stock
+        pack_wo.refresh_from_db()
+        po.refresh_from_db()
+        self.assertEqual(pack_wo.status, 'IN_PROGRESS')
+        self.assertEqual(po.status, 'IN_PROGRESS')
+        self.assertTrue(pack_wo.is_inventory_allocated)
+
+    def test_option_2_downscale_target_execution(self):
+        """
+        Option 2: Warehouse has 10 kg bulk putty. Packaging target was 50 tubs (requiring 25 kg).
+        Downscaling should scale batch down to 10 / 0.5 = 20 tubs, transition to IN_PROGRESS, and allocate stock.
+        """
+        Inventory.objects.create(
+            product=self.bulk_putty,
+            quantity_available=Decimal("10.00"),
+            location="Main Warehouse"
+        )
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.packaged_putty,
+            bill_of_material=self.pack_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.packaged_putty,
+            work_order=pack_wo,
+            quantity=Decimal("50.00"),
+            status='ON_HOLD_SHORTAGE'
+        )
+
+        pack_wo.resolve_bulk_shortage('DOWNSCALE_TARGET')
+        pack_wo.refresh_from_db()
+        po.refresh_from_db()
+
+        self.assertEqual(pack_wo.quantity_produced, Decimal("20.00"))
+        self.assertEqual(po.quantity, Decimal("20.00"))
+        self.assertEqual(pack_wo.status, 'IN_PROGRESS')
+        self.assertEqual(po.status, 'IN_PROGRESS')
+        self.assertTrue(pack_wo.is_inventory_allocated)
+        self.assertIsNone(pack_wo.parent_work_order)
+
+    def test_option_3_hold_for_existing_bulk_run(self):
+        """
+        Option 3: Links to an active bulk run on the floor and transitions to ON_HOLD_SHORTAGE.
+        """
+        active_bulk = WorkOrder.objects.create(
+            product=self.bulk_putty,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("30.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.packaged_putty,
+            bill_of_material=self.pack_bom,
+            quantity_produced=Decimal("40.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.packaged_putty,
+            work_order=pack_wo,
+            quantity=Decimal("40.00"),
+            status='IN_PROGRESS'
+        )
+
+        pack_wo.resolve_bulk_shortage('HOLD_FOR_EXISTING', existing_bulk_wo_id=active_bulk.pk)
+        pack_wo.refresh_from_db()
+        po.refresh_from_db()
+
+        self.assertEqual(pack_wo.status, 'ON_HOLD_SHORTAGE')
+        self.assertEqual(po.status, 'ON_HOLD_SHORTAGE')
+        self.assertEqual(pack_wo.parent_work_order, active_bulk)
+
+    def test_admin_action_routes_post_and_get(self):
+        """Tests that all custom admin routes (start-production, top-up-bulk, downscale-target, hold-for-existing, check-stock-resume) function over HTTP POST and GET."""
+        Inventory.objects.create(
+            product=self.bulk_putty,
+            quantity_available=Decimal("15.00"),
+            location="Main Warehouse"
+        )
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.packaged_putty,
+            bill_of_material=self.pack_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='DRAFT'
+        )
+
+        # 1. Start production via POST
+        resp = self.client.post(f"/admin/core/workorder/{pack_wo.pk}/start-production/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        pack_wo.refresh_from_db()
+        self.assertEqual(pack_wo.status, 'AWAITING_RESOLUTION')
+
+        # 2. Top-Up Bulk via POST
+        resp = self.client.post(f"/admin/core/workorder/{pack_wo.pk}/top-up-bulk/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        pack_wo.refresh_from_db()
+        self.assertEqual(pack_wo.status, 'ON_HOLD_SHORTAGE')
+        self.assertIsNotNone(pack_wo.parent_work_order)
+
+        # 3. Check Stock Resume on on-hold order when shortage still exists
+        resp = self.client.post(f"/admin/core/workorder/{pack_wo.pk}/check-stock-resume/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        pack_wo.refresh_from_db()
+        self.assertEqual(pack_wo.status, 'ON_HOLD_SHORTAGE')
+
+        # 4. Downscale Target via POST
+        pack_wo.status = 'AWAITING_RESOLUTION'
+        pack_wo.save(update_fields=['status'])
+        resp = self.client.post(f"/admin/core/workorder/{pack_wo.pk}/downscale-target/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        pack_wo.refresh_from_db()
+        self.assertEqual(pack_wo.status, 'IN_PROGRESS')
+        self.assertEqual(pack_wo.quantity_produced, Decimal("30.00")) # 15 kg available / 0.5 = 30 tubs
+
+    def test_admin_change_view_context_data(self):
+        """Tests that change_view supplies shortage_metrics, active_bulk_orders, and parent_bulk_order to template context."""
+        active_bulk = WorkOrder.objects.create(
+            product=self.bulk_putty,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("25.00"),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+
+        pack_wo = WorkOrder.objects.create(
+            product=self.packaged_putty,
+            bill_of_material=self.pack_bom,
+            quantity_produced=Decimal("50.00"),
+            production_start_date=timezone.now().date(),
+            status='AWAITING_RESOLUTION'
+        )
+
+        resp = self.client.get(f"/admin/core/workorder/{pack_wo.pk}/change/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('shortage_metrics', resp.context)
+        self.assertIn('active_bulk_orders', resp.context)
+        self.assertTrue(resp.context['shortage_metrics']['has_shortfall'])
+        self.assertEqual(resp.context['shortage_metrics']['intermediate_product'], self.bulk_putty)
+        self.assertIn(active_bulk, resp.context['active_bulk_orders'])
+
+
+
 
 
 

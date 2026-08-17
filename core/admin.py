@@ -862,6 +862,30 @@ class WorkOrderAdmin(admin.ModelAdmin):
         if count > 0:
             self.message_user(request, f"Successfully placed {count} order(s) on hold for bulk shortage.", level=messages.SUCCESS)
 
+    change_form_template = 'admin/core/workorder/change_form.html'
+
+    def change_view(self, request, object_id, form_url='', extra_context=None):
+        extra_context = extra_context or {}
+        try:
+            wo = self.get_object(request, object_id)
+            if wo:
+                metrics = wo.check_bulk_availability()
+                extra_context['shortage_metrics'] = metrics
+                inter_prod = metrics.get('intermediate_product')
+                if inter_prod:
+                    active_bulk_orders = WorkOrder.objects.filter(
+                        product=inter_prod,
+                        status='IN_PROGRESS'
+                    ).exclude(pk=wo.pk)
+                    extra_context['active_bulk_orders'] = active_bulk_orders
+                else:
+                    extra_context['active_bulk_orders'] = []
+                extra_context['parent_bulk_order'] = wo.parent_work_order
+        except Exception as e:
+            print(f"[WORKORDER ADMIN CHANGE_VIEW ERROR] {e}", flush=True)
+
+        return super().change_view(request, object_id, form_url, extra_context=extra_context)
+
     def get_urls(self):
         urls = super().get_urls()
         custom_urls = [
@@ -884,6 +908,11 @@ class WorkOrderAdmin(admin.ModelAdmin):
                 '<int:object_id>/hold-for-existing/',
                 self.admin_site.admin_view(self.hold_for_existing_view),
                 name='workorder-hold-for-existing',
+            ),
+            path(
+                '<int:object_id>/check-stock-resume/',
+                self.admin_site.admin_view(self.check_stock_resume_view),
+                name='workorder-check-stock-resume',
             ),
         ]
         return custom_urls + urls
@@ -948,10 +977,38 @@ class WorkOrderAdmin(admin.ModelAdmin):
         return self._resolve_shortage_view(request, object_id, 'DOWNSCALE_TARGET')
 
     def hold_for_existing_view(self, request, object_id):
-        existing_bulk_wo_id = request.GET.get('bulk_wo_id')
+        existing_bulk_wo_id = request.POST.get('bulk_wo_id') or request.GET.get('bulk_wo_id')
         if existing_bulk_wo_id:
-            existing_bulk_wo_id = int(existing_bulk_wo_id)
+            try:
+                existing_bulk_wo_id = int(existing_bulk_wo_id)
+            except (ValueError, TypeError):
+                existing_bulk_wo_id = None
         return self._resolve_shortage_view(request, object_id, 'HOLD_FOR_EXISTING', existing_bulk_wo_id=existing_bulk_wo_id)
+
+    def check_stock_resume_view(self, request, object_id):
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+        try:
+            avail = work_order.check_bulk_availability()
+            if avail.get('has_shortfall'):
+                shortfall = avail.get('shortfall', Decimal('0.00'))
+                self.message_user(
+                    request,
+                    f"Intermediate bulk shortage still unresolved: Shortfall is {shortfall:.2f} units. Order remains {work_order.get_status_display()}.",
+                    level=messages.WARNING
+                )
+            else:
+                success, msg = work_order.start_production()
+                if success:
+                    self.message_user(request, f"Stock verified! {msg}", level=messages.SUCCESS)
+                else:
+                    self.message_user(request, msg, level=messages.WARNING)
+        except Exception as e:
+            self.message_user(request, f"Error re-evaluating stock: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_workorder_change', args=[object_id]))
 
 @admin.register(MaterialVarianceRecord)
 class MaterialVarianceRecordAdmin(admin.ModelAdmin):

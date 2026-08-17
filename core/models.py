@@ -685,9 +685,11 @@ class WorkOrder(models.Model):
         INTERACTIVE SHORTAGE RESOLUTION PATHWAYS:
         Executes resolution strategy inside an atomic transaction:
           - TOP_UP_BULK: Spawns supplemental bulk parent WorkOrder for missing shortfall,
-                         links it as parent_work_order, and sets status to ON_HOLD_SHORTAGE.
+                         links it as parent_work_order, creates linked ProductionOrder,
+                         allocates raw ingredients, and sets packaging status to ON_HOLD_SHORTAGE.
           - DOWNSCALE_TARGET: Recalculates maximum achievable packaging units from available stock,
-                               scales down quantity_produced, transitions to IN_PROGRESS, and runs process_inventory().
+                               scales down quantity_produced, clears parent link, transitions to IN_PROGRESS,
+                               and runs process_inventory().
           - HOLD_FOR_EXISTING: Attaches an active in-progress bulk order (by existing_bulk_wo_id) as
                                 parent_work_order and sets status to ON_HOLD_SHORTAGE.
         """
@@ -708,6 +710,11 @@ class WorkOrder(models.Model):
                 if shortfall <= Decimal('0.00'):
                     self.status = 'IN_PROGRESS'
                     super().save(update_fields=['status'])
+                    from .models import ProductionOrder
+                    for po in ProductionOrder.objects.filter(work_order=self):
+                        po.status = 'IN_PROGRESS'
+                        po.save(update_fields=['status'])
+                    self.process_inventory()
                     return self
 
                 bulk_bom = intermediate_product.boms.filter(is_active=True).first()
@@ -719,9 +726,27 @@ class WorkOrder(models.Model):
                     quantity_produced=shortfall
                 )
 
+                # Trigger Phase 1 stock allocation for the newly spawned bulk parent order
+                parent_wo.process_inventory()
+
+                # Also create linked ProductionOrder for parent bulk work order
+                from .models import ProductionOrder
+                ProductionOrder.objects.create(
+                    product=intermediate_product,
+                    work_order=parent_wo,
+                    quantity=shortfall,
+                    status='IN_PROGRESS',
+                    notes=f"Auto-generated Top-Up Bulk run for child Packaging WorkOrder #{self.work_order_code or self.pk}."
+                )
+
                 self.parent_work_order = parent_wo
                 self.status = 'ON_HOLD_SHORTAGE'
                 super().save(update_fields=['parent_work_order', 'status'])
+
+                for po in ProductionOrder.objects.filter(work_order=self):
+                    po.status = 'ON_HOLD_SHORTAGE'
+                    po.save(update_fields=['status'])
+
                 print(f"[SHORTAGE RESOLUTION] Executed TOP_UP_BULK: Spawned parent Bulk WorkOrder #{parent_wo.pk} for {shortfall} units.", flush=True)
 
             elif action_choice == 'DOWNSCALE_TARGET':
@@ -731,7 +756,8 @@ class WorkOrder(models.Model):
 
                 self.quantity_produced = max_units
                 self.status = 'IN_PROGRESS'
-                super().save(update_fields=['quantity_produced', 'status'])
+                self.parent_work_order = None  # Detach parent link since we are running standalone with existing warehouse stock
+                super().save(update_fields=['quantity_produced', 'status', 'parent_work_order'])
 
                 from .models import ProductionOrder
                 for po in ProductionOrder.objects.filter(work_order=self):
@@ -755,6 +781,12 @@ class WorkOrder(models.Model):
                 else:
                     self.status = 'ON_HOLD_SHORTAGE'
                     super().save(update_fields=['status'])
+
+                from .models import ProductionOrder
+                for po in ProductionOrder.objects.filter(work_order=self):
+                    po.status = 'ON_HOLD_SHORTAGE'
+                    po.save(update_fields=['status'])
+
                 print(f"[SHORTAGE RESOLUTION] Executed HOLD_FOR_EXISTING: WorkOrder #{self.pk} placed on ON_HOLD_SHORTAGE.", flush=True)
 
         return self
@@ -827,13 +859,13 @@ class WorkOrder(models.Model):
 
     def start_production(self):
         """
-        EXPLICIT STATE TRANSITION WORKFLOW: DRAFT -> IN_PROGRESS / AWAITING_RESOLUTION.
+        EXPLICIT STATE TRANSITION WORKFLOW: DRAFT / ON_HOLD_SHORTAGE -> IN_PROGRESS / AWAITING_RESOLUTION.
         Validates operational readiness, checks intermediate bulk material availability,
         and triggers hybrid stock allocation engine upon transition.
         """
         current_status = (self.status or '').upper().strip()
-        if current_status != 'DRAFT':
-            raise ValidationError("Only DRAFT work orders can be started.")
+        if current_status not in ['DRAFT', 'ON_HOLD_SHORTAGE']:
+            raise ValidationError("Only DRAFT or ON_HOLD_SHORTAGE work orders can be started.")
 
         # Temporarily evaluate status as IN_PROGRESS so clean() enforces operational gates
         old_status = self.status
@@ -844,7 +876,7 @@ class WorkOrder(models.Model):
             self.status = old_status
             raise
 
-        # Reset status back to DRAFT prior to shortage check and state save
+        # Reset status back to old_status prior to shortage check and state save
         self.status = old_status
 
         # Check for intermediate bulk shortage (packaging orders)
@@ -852,11 +884,22 @@ class WorkOrder(models.Model):
         if availability.get('has_shortfall'):
             self.status = 'AWAITING_RESOLUTION'
             super().save(update_fields=['status'])
-            return (False, "Bulk shortage detected. Moved to Awaiting Resolution.")
+            from .models import ProductionOrder
+            for po in ProductionOrder.objects.filter(work_order=self):
+                po.status = 'ON_HOLD_SHORTAGE'
+                po.save(update_fields=['status'])
+            shortfall = availability.get('shortfall', Decimal('0.00'))
+            inter_prod = availability.get('intermediate_product')
+            inter_name = inter_prod.name if inter_prod else 'bulk intermediate component'
+            return (False, f"Bulk shortage detected for '{inter_name}' (Shortfall: {shortfall:.2f}). Order moved to Awaiting Resolution.")
 
         with transaction.atomic():
             self.status = 'IN_PROGRESS'
             super().save(update_fields=['status'])
+            from .models import ProductionOrder
+            for po in ProductionOrder.objects.filter(work_order=self):
+                po.status = 'IN_PROGRESS'
+                po.save(update_fields=['status'])
             self.process_inventory()
 
         return (True, "Work order started successfully and stock allocated.")
@@ -1068,16 +1111,11 @@ class WorkOrder(models.Model):
 
     def sync_child_packaging_expectations(self):
         """
-        DYNAMIC YIELD AUTO-SCALING:
+        DYNAMIC YIELD AUTO-SCALING & AUTO-RESUME:
         When a Stage 1 Bulk WorkOrder reaches COMPLETED status, synchronizes the actual bulk yield
         (self.actual_quantity_produced or self.quantity_produced) to all linked child Stage 2 packaging work order material lines 
         where component == self.product. Updates quantity_expected on each matching WorkOrderMaterialLine.
-
-        Why yield auto-scaling prevents allocation crashes:
-        In continuous process manufacturing, actual intermediate bulk mixing yields vary from initial target quantities 
-        due to physical evaporation, vessel hold-up, or scrap. Automatically scaling child packaging material lines' 
-        quantity_expected to match actual bulk output ensures material variance calculations and stock deductions 
-        reflect exact physical reality without triggering negative stock allocations or system crashes.
+        Also re-checks and auto-resumes linked child packaging orders currently in ON_HOLD_SHORTAGE.
         """
         bulk_yield = (self.actual_quantity_produced if self.actual_quantity_produced is not None else self.quantity_produced) or Decimal('0.00')
         with transaction.atomic():
@@ -1088,6 +1126,19 @@ class WorkOrder(models.Model):
                     line.save(update_fields=['quantity_expected'])
                     # Synchronize corresponding MaterialVarianceRecord if exists
                     MaterialVarianceRecord.sync_from_material_line(line)
+
+                # Auto-resume child packaging work order if it was on hold and now has sufficient stock!
+                if child_wo.status == 'ON_HOLD_SHORTAGE':
+                    child_avail = child_wo.check_bulk_availability()
+                    if not child_avail.get('has_shortfall'):
+                        child_wo.status = 'IN_PROGRESS'
+                        child_wo.save(update_fields=['status'])
+                        child_wo.process_inventory()
+                        from .models import ProductionOrder
+                        for child_po in ProductionOrder.objects.filter(work_order=child_wo):
+                            child_po.status = 'IN_PROGRESS'
+                            child_po.save(update_fields=['status'])
+                        print(f"[AUTO-RESUME] Child Packaging WorkOrder #{child_wo.pk} auto-resumed to IN_PROGRESS and stock allocated.", flush=True)
 
     def sync_material_lines(self):
         """
