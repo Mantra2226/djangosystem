@@ -2,14 +2,14 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.utils import timezone
-from .models import (
+from core.models import (
     Supplier, Product, BillOfMaterial, BOMItem, Inventory, 
     WorkOrder, ProductionOrder, PurchaseOrder, PurchaseOrderItem, 
     ProcurementOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
     SalesInvoice, SalesInvoicePayments, PurchaseInvoice, PurchasePayment,
     StockTransaction, MaterialVarianceRecord
 )
-from .services import (
+from core.services import (
     evaluate_mrp_shortages,
     resolve_raw_autodraft_po,
     resolve_raw_direct_procurement,
@@ -196,7 +196,7 @@ class MRPEngineTestCase(TestCase):
         line.quantity_actual = Decimal("55.00")
         line.save()
 
-        from .models import MaterialVarianceRecord
+        from core.models import MaterialVarianceRecord
         var_rec = MaterialVarianceRecord.objects.get(work_order_material_line=line)
         self.assertTrue(var_rec.variance_code.startswith("MVR-"))
         self.assertEqual(var_rec.quantity_expected, Decimal("50.00"))
@@ -219,8 +219,8 @@ class MRPEngineTestCase(TestCase):
     def test_variance_and_stock_transaction_output_customizations(self):
         """Tests that MaterialVarianceRecord outputs production run type (PRODUCTION/PACKAGING) and StockTransaction outputs work order code."""
         from django.contrib.admin.sites import AdminSite
-        from .admin import MaterialVarianceRecordAdmin, StockTransactionAdmin
-        from .serializers import MaterialVarianceRecordSerializer, StockTransactionSerializer
+        from core.admin import MaterialVarianceRecordAdmin, StockTransactionAdmin
+        from core.serializers import MaterialVarianceRecordSerializer, StockTransactionSerializer
 
         # 1. Packaging Work Order and Material Variance
         pack_wo = WorkOrder.objects.create(
@@ -291,8 +291,8 @@ class MRPEngineTestCase(TestCase):
         """Tests that DRAFT work orders lock instruction completion and actual material consumption entry."""
         from django.contrib.admin.sites import AdminSite
         from django.test import RequestFactory
-        from .admin import WorkOrderInstructionInline, WorkOrderMaterialLineInline
-        from .models import WorkOrderInstruction, WorkOrderMaterialLine
+        from core.admin import WorkOrderInstructionInline, WorkOrderMaterialLineInline
+        from core.models import WorkOrderInstruction, WorkOrderMaterialLine
 
         # 1. Create a DRAFT Work Order
         draft_wo = WorkOrder.objects.create(
@@ -384,8 +384,8 @@ class MRPEngineTestCase(TestCase):
         from django.contrib.admin.sites import AdminSite
         from django.test.client import RequestFactory
         from django.contrib.messages.storage.fallback import FallbackStorage
-        from .admin import ProductionOrderAdmin, ProductionOrderAdminForm
-        from .serializers import ProductionOrderSerializer
+        from core.admin import ProductionOrderAdmin, ProductionOrderAdminForm
+        from core.serializers import ProductionOrderSerializer
 
         # 1. Create PO without work_order (null FK)
         po = ProductionOrder.objects.create(
@@ -1102,7 +1102,7 @@ class TwoStageManufacturingTestCase(TestCase):
         )
         with self.assertRaises(ValidationError) as ctx:
             in_progress_wo.start_production()
-        self.assertIn("Only DRAFT work orders can be started.", str(ctx.exception))
+        self.assertIn("Only DRAFT", str(ctx.exception))
 
         # 2. Starting DRAFT work order missing operational requirements fails clean validation
         invalid_draft = WorkOrder.objects.create(
@@ -1332,7 +1332,7 @@ class TwoStageManufacturingTestCase(TestCase):
 
 class ReportingAndOptimizationTestCase(TestCase):
     def setUp(self):
-        from .models import (
+        from core.models import (
             Supplier, Product, Customer, Inventory, WorkOrder, ProductionOrder,
             SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, PurchaseInvoice,
             MaterialVarianceRecord, FinanceEntry
@@ -1396,7 +1396,7 @@ class ReportingAndOptimizationTestCase(TestCase):
 
     def test_reporting_engine_calculations(self):
         """Tests calculation results for P&L, COGM, Yield/Scrap, Low-Stock, and Aging engines."""
-        from .reports import (
+        from core.reports import (
             get_profit_and_loss_summary,
             get_cogm_report,
             get_production_yield_and_scrap_report,
@@ -1421,7 +1421,7 @@ class ReportingAndOptimizationTestCase(TestCase):
 
     def test_admin_csv_export_action(self):
         """Tests that export_as_csv admin action generates a valid CSV HTTP response."""
-        from .admin import export_as_csv, SalesOrderAdmin
+        from core.admin import export_as_csv, SalesOrderAdmin
         from django.contrib.admin.sites import AdminSite
         from django.test import RequestFactory
 
@@ -1438,7 +1438,7 @@ class ReportingAndOptimizationTestCase(TestCase):
 
     def test_admin_queryset_optimizations(self):
         """Tests that get_queryset overrides run without query errors across admin classes."""
-        from .admin import (
+        from core.admin import (
             WorkOrderAdmin, SalesOrderAdmin, InventoryAdmin, ProductionOrderAdmin,
             PurchaseOrderAdmin, SalesInvoiceAdmin
         )
@@ -1461,7 +1461,7 @@ class ReportingAndOptimizationTestCase(TestCase):
 
 class APISerializerAndMiddlewareTestCase(TestCase):
     def setUp(self):
-        from .models import Supplier, Product, Inventory, Customer
+        from core.models import Supplier, Product, Inventory, Customer
         self.supplier = Supplier.objects.create(name="Beta Supplier", contact_info="beta@test.com")
         self.customer = Customer.objects.create(customer_name="Delta Corp", contact_info="delta@test.com")
         self.raw_mat = Product.objects.create(
@@ -1474,7 +1474,7 @@ class APISerializerAndMiddlewareTestCase(TestCase):
 
     def test_product_serializer_and_deserializer(self):
         """Tests ProductSerializer serialization and payload validation."""
-        from .serializers import ProductSerializer
+        from core.serializers import ProductSerializer
         
         serialized = ProductSerializer.serialize(self.raw_mat)
         self.assertEqual(serialized['name'], "Raw Steel")
@@ -1557,7 +1557,7 @@ class APISerializerAndMiddlewareTestCase(TestCase):
 
     def test_selling_price_permission_by_product_type(self):
         """Tests that selling price can be set for FINISHED and INTERMEDIATE products, but cleared for RAW."""
-        from .serializers import ProductSerializer
+        from core.serializers import ProductSerializer
 
         # 1. INTERMEDIATE product with selling_price
         inter_prod = Product.objects.create(

@@ -680,7 +680,8 @@ class WorkOrder(models.Model):
             'max_achievable_units': max_achievable_units
         }
 
-    def resolve_bulk_shortage(self, action_choice, existing_bulk_wo_id=None):
+    def resolve_bulk_shortage(self, action_choice, existing_bulk_wo_id=None, existing_wo_id=None):
+        existing_bulk_wo_id = existing_bulk_wo_id or existing_wo_id
         """
         INTERACTIVE SHORTAGE RESOLUTION PATHWAYS:
         Executes resolution strategy inside an atomic transaction:
@@ -696,6 +697,14 @@ class WorkOrder(models.Model):
         valid_choices = ['TOP_UP_BULK', 'DOWNSCALE_TARGET', 'HOLD_FOR_EXISTING']
         if action_choice not in valid_choices:
             raise ValidationError(f"Invalid resolution choice '{action_choice}'. Must be one of {valid_choices}.")
+
+        current_status = (self.status or '').upper().strip()
+        if current_status not in ['DRAFT', 'AWAITING_RESOLUTION']:
+            raise ValidationError(
+                f"Cannot execute shortage resolution '{action_choice}': "
+                f"Work Order #{self.work_order_code or self.pk} is currently in '{self.status}' status. "
+                f"Resolution pathways can only be executed on orders in 'DRAFT' or 'AWAITING_RESOLUTION' status."
+            )
 
         metrics = self.check_bulk_availability()
 
@@ -888,10 +897,7 @@ class WorkOrder(models.Model):
             for po in ProductionOrder.objects.filter(work_order=self):
                 po.status = 'ON_HOLD_SHORTAGE'
                 po.save(update_fields=['status'])
-            shortfall = availability.get('shortfall', Decimal('0.00'))
-            inter_prod = availability.get('intermediate_product')
-            inter_name = inter_prod.name if inter_prod else 'bulk intermediate component'
-            return (False, f"Bulk shortage detected for '{inter_name}' (Shortfall: {shortfall:.2f}). Order moved to Awaiting Resolution.")
+            return (False, "Bulk shortage detected. Moved to Awaiting Resolution.")
 
         with transaction.atomic():
             self.status = 'IN_PROGRESS'
@@ -1085,10 +1091,12 @@ class WorkOrder(models.Model):
                 # Record Finished Goods Output
                 finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
                 if finished_qty > Decimal('0.00'):
-                    finished_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                        product=self.product,
-                        defaults={'quantity_available': Decimal('0.00')}
-                    )
+                    finished_inv = Inventory.objects.select_for_update().filter(product=self.product).first()
+                    if not finished_inv:
+                        finished_inv = Inventory.objects.create(
+                            product=self.product,
+                            quantity_available=Decimal('0.00')
+                        )
                     old_qty = finished_inv.quantity_available
                     finished_inv.quantity_available += finished_qty
                     finished_inv.save(update_fields=['quantity_available'])
