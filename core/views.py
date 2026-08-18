@@ -2,6 +2,7 @@ from django.shortcuts import render, redirect
 from django.contrib import messages
 from django.http import JsonResponse
 from django.contrib.admin.views.decorators import staff_member_required
+from django.views.decorators.csrf import csrf_exempt
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
     ProductionOrder, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, 
@@ -109,10 +110,19 @@ def product_form(request):
         product_type = request.POST.get('product_type', 'FINISHED')
         category = request.POST.get('category', 'General')
         unit_of_measurement = request.POST.get('unit_of_measurement', 'pcs')
-        Product.objects.create(
-            name=name, supplier_id=supplier_id, 
-            product_type=product_type, category=category, unit_of_measurement=unit_of_measurement
-        )
+        selling_price = request.POST.get('selling_price')
+        
+        create_kwargs = {
+            'name': name,
+            'supplier_id': supplier_id if product_type == 'RAW' else None,
+            'product_type': product_type,
+            'category': category,
+            'unit_of_measurement': unit_of_measurement
+        }
+        if selling_price and product_type in ['FINISHED', 'INTERMEDIATE']:
+            create_kwargs['selling_price'] = selling_price
+
+        Product.objects.create(**create_kwargs)
         messages.success(request, 'Product added successfully!')
     inventory_items = Inventory.objects.all()
     return render(request, 'core/product_form.html', {'inventory_items': inventory_items})
@@ -146,7 +156,51 @@ def return_form(request):
     return render(request, 'core/return_form.html', {'return_records': return_records})
 
 def generate_work_order_instructions(work_order):
-    pass
+    """
+    Populates standard 4-step process instruction blueprints for a newly created WorkOrder
+    if no custom instructions currently exist.
+    """
+    if not work_order or not work_order.pk:
+        return
+
+    from .models import WorkOrderInstruction
+
+    if work_order.instructions.exists():
+        return
+
+    is_packaging = (work_order.category == 'PACKAGING') or (
+        work_order.product and work_order.product.product_type == 'FINISHED'
+    )
+
+    if is_packaging:
+        default_steps = [
+            (1, "Line Prep & Staging", "Packaging Line #1", "Inspect container cleanliness & verify bulk source batch availability.", 15),
+            (2, "Container Filling", "Volumetric Filling Station", "Fill discrete containers to target unit pack count.", 45),
+            (3, "Sealing & Labeling", "Automated Capper / Labeler", "Cap, seal, and apply product barcode labels to filled containers.", 30),
+            (4, "Palletizing & Warehouse Transfer", "Pallet Wrapper", "Palletize finished goods and transfer to warehouse inventory.", 20),
+        ]
+    else:
+        # PRODUCTION / Bulk Mixing
+        default_steps = [
+            (1, "Vessel Setup & Cleanliness Check", "Mixing Vessel A", "Verify vessel cleanliness, valve seals, and raw material staging.", 15),
+            (2, "Raw Material Component Charge", "Raw Component Hopper", "Charge raw material components into mixing vessel per active BOM recipe.", 30),
+            (3, "Agitation & Thermal Reaction Processing", "High-Shear Agitator", "Run agitation and thermal processing to target viscosity and homogeneity.", 60),
+            (4, "QA Viscosity Sampling & Bulk Transfer", "Bulk Holding Tank", "Perform QA viscosity sampling and transfer bulk yield to holding tank.", 30),
+        ]
+
+    for step_num, step_name, machine, text, est_minutes in default_steps:
+        WorkOrderInstruction.objects.get_or_create(
+            work_order=work_order,
+            step_number=step_num,
+            defaults={
+                'product': work_order.product,
+                'step_name': step_name,
+                'machine': machine,
+                'instruction_text': text,
+                'estimated_time_minutes': est_minutes,
+                'status': 'IN_PROGRESS'
+            }
+        )
 
 
 @staff_member_required
@@ -192,6 +246,8 @@ def po_products_json(request):
     return JsonResponse({"products": product_list})
 
 
+@csrf_exempt
+@staff_member_required
 def mrp_resolve_action(request):
     """
     HTTP POST Handler for executing tailored MRP resolution pathways from Admin/Dashboard.
@@ -314,6 +370,7 @@ from .serializers import (
     ProductionOrderSerializer, ProcurementOrderSerializer, SalesOrderSerializer
 )
 
+@csrf_exempt
 def api_products_list_create(request):
     """
     RESTful JSON API Endpoint for Product resources.

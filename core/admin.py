@@ -1,5 +1,9 @@
+from django.urls import path, reverse
+from django.shortcuts import get_object_or_404, redirect
+from django.http import HttpResponseRedirect
+from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.utils.safestring import mark_safe
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
@@ -7,6 +11,7 @@ from django import forms
 from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
 )
 from decimal import Decimal
+from .forms import WorkOrderForm
 
 admin.register(Supplier)
 admin.register(Product)
@@ -70,7 +75,12 @@ class WorkOrderInstructionInline(admin.TabularInline):
     extra = 0
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
     ordering = ['step_number']
-    readonly_fields = ['step_number']  # Auto-incremented field, should not be editable    
+    readonly_fields = ['step_number']
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None or obj.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
+            return ['step_number', 'status']
+        return self.readonly_fields
 
 class BOMItemInline(admin.TabularInline):
     model = BOMItem
@@ -85,6 +95,11 @@ class WorkOrderMaterialLineInline(admin.TabularInline):
     extra = 0  # Don't show empty lines by default
     fields = ('component', 'quantity_expected', 'quantity_actual')
     readonly_fields = ('quantity_expected',)
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None or obj.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
+            return ('quantity_expected', 'quantity_actual')
+        return self.readonly_fields
 
 class ChildPackagingInline(admin.TabularInline):
     """
@@ -209,10 +224,22 @@ class InventoryAdmin(admin.ModelAdmin):
 
 @admin.register(StockTransaction)
 class StockTransactionAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity', 'transaction_type', 'created_at')
+    list_display = ('product', 'quantity', 'transaction_type', 'get_work_order_code', 'created_at')
     list_filter = ('transaction_type', 'created_at')
-    search_fields = ('product__name', 'product__sku', 'reference_type')
-    readonly_fields = ('created_at', 'work_order', 'dispatch_record')
+    search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
+    readonly_fields = ('created_at', 'work_order', 'get_work_order_code', 'dispatch_record')
+
+    def get_queryset(self, request):
+        """N+1 Query Mitigation: Eagerly joins Product and WorkOrder."""
+        return super().get_queryset(request).select_related('product', 'work_order')
+
+    @admin.display(description='Work Order')
+    def get_work_order_code(self, obj):
+        if obj.work_order and obj.work_order.work_order_code:
+            return obj.work_order.work_order_code
+        elif obj.work_order_id:
+            return f"WO-{obj.work_order_id}"
+        return "-"
     
     # Prevents anyone from manually editing transaction logs to maintain audit integrity
     def has_add_permission(self, request):
@@ -231,12 +258,17 @@ class ProductionOrderAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        # If editing an existing Production Order, filter the Work Order choices to only show those for this specific product.
-        if self.instance and self.instance.product_id:
-            self.fields['work_order'].queryset = WorkOrder.objects.filter(
-                product=self.instance.product
-            )    
+        if 'work_order' in self.fields:
+            self.fields['work_order'].required = False
+            self.fields['work_order'].help_text = (
+                "Optional: Select the Work Order blueprint for this production run. "
+                "If unlinked, remember to link a Work Order later to enable recipe and material tracking."
+            )
+            # If editing an existing Production Order, filter the Work Order choices to only show those for this specific product.
+            if self.instance and getattr(self.instance, 'product_id', None):
+                self.fields['work_order'].queryset = WorkOrder.objects.filter(
+                    product=self.instance.product
+                )
 
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(admin.ModelAdmin):
@@ -251,6 +283,15 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly loads Product and WorkOrder."""
         return super().get_queryset(request).select_related('product', 'work_order')
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if not obj.work_order_id:
+            messages.warning(
+                request,
+                f"Reminder: Production Order '{obj.production_order_code or obj.pk}' was saved without a linked Work Order. "
+                f"Please link a Work Order blueprint when ready to sync specifications and inventory tracking."
+            )
 
     @admin.action(description="Check Stock & Auto-Resume On-Hold Orders")
     def trigger_mrp_auto_resume(self, request, queryset):
@@ -278,6 +319,13 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     def mrp_resolution_pathways_viewer(self, obj):
         if not obj or not obj.pk:
             return "Save record to evaluate MRP shortages."
+
+        if not obj.work_order_id:
+            return format_html(
+                "<div style='padding: 10px; background: #fff8e1; border-left: 4px solid #f57f17; color: #795548; border-radius: 4px;'>"
+                "ℹ <strong>No Work Order Linked:</strong> Link a Work Order to this Production Order to evaluate BOM recipe requirements and check inventory shortage pathways."
+                "</div>"
+            )
 
         from .services import evaluate_mrp_shortages
         report = evaluate_mrp_shortages(obj)
@@ -330,7 +378,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
                                 <input type="hidden" name="production_order_id" value="{obj.pk}">
                                 <input type="hidden" name="component_id" value="{comp.pk}">
                                 <input type="hidden" name="resolution_action" value="raw_hold_inbound">
-                                <button type="submit" style="background: #718096; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 3: Hold for Inbound POs</button>
+                                <button type="submit" style="background: #718096; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: font-size: 11px;">Execute Option 3: Hold for Inbound POs</button>
                             </form>
                         </div>
                     </div>
@@ -396,10 +444,15 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         return obj.product.name if obj.product else 'N/A'
     
     @admin.display(description='Quantity')
-    def get_quantity(self,obj):
-        if obj.work_order:
-            return getattr( obj.work_order, 'quantity_produced', getattr(obj.work_order, 'quantity', '0.00')) 
-        return "0.00"
+    def get_quantity(self, obj):
+        if obj.work_order_id:
+            try:
+                wo = obj.work_order
+                if wo:
+                    return getattr(wo, 'actual_quantity_produced', getattr(wo, 'quantity_produced', getattr(wo, 'quantity', '0.00')))
+            except ObjectDoesNotExist:
+                pass
+        return obj.quantity or "0.00"
 
     def work_order_details_viewer(self, obj):
         """
@@ -408,19 +461,32 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         instead of executing full table scans across all historical WorkOrder records.
         """
         if not obj or not obj.work_order_id:
-            return format_html("<span style='color: #666; font-style: italic;'>Select a Work Order from the dropdown above to view specifications...</span>")
+            return format_html(
+                "<div style='padding: 8px 12px; background: #fff3cd; border-left: 4px solid #ffc107; color: #856404; border-radius: 4px;'>"
+                "ℹ <strong>Reminder:</strong> No Work Order linked to this Production Order. "
+                "Select a Work Order from the dropdown above to connect blueprint specifications and material tracking."
+                "</div>"
+            )
 
-        wo = obj.work_order
+        try:
+            wo = obj.work_order
+        except ObjectDoesNotExist:
+            wo = None
+
         if not wo:
-            return format_html("<span style='color: #666; font-style: italic;'>No Work Order linked.</span>")
+            return format_html(
+                "<div style='padding: 8px 12px; background: #fff3cd; border-left: 4px solid #ffc107; color: #856404; border-radius: 4px;'>"
+                "ℹ <strong>Reminder:</strong> Linked Work Order could not be loaded. Please select a valid Work Order."
+                "</div>"
+            )
 
         emp_list = [str(emp) for emp in wo.employee.all()]
         html_string = f"""
         <div id="wo-preview-panel" style="margin-top: 10px; padding: 12px; background: #f8f9fa; border-left: 4px solid #79aec8; border-radius: 4px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.05); color: #333; max-width: 600px;">
             <strong style="color: #555; display: block; margin-bottom: 5px;">Blueprint Live Specifications:</strong>
             <div id="wo-preview-content" style="font-size: 13px; line-height: 1.6;">
-                <strong>Target Product:</strong> {wo.product.name} ({getattr(wo.product, 'sku', '')}) <br>
-                <strong>Expected Yield:</strong> {wo.quantity_produced or '0.00'}<br>
+                <strong>Target Product:</strong> {wo.product.name if wo.product else 'N/A'} ({getattr(wo.product, 'sku', '')}) <br>
+                <strong>Expected Yield:</strong> {wo.actual_quantity_produced or wo.quantity_produced or '0.00'}<br>
                 <strong>Assigned Team/Crew:</strong> {', '.join(emp_list) if emp_list else 'Unassigned'}<br>
                 <strong>Current Step Status:</strong> <span style='text-transform: uppercase; font-weight: bold; color: #264b5d;'>{wo.status}</span>
             </div>
@@ -552,7 +618,7 @@ class ProductAdmin(admin.ModelAdmin):
     def get_selling_price(self, obj):
         if obj.selling_price is not None:
             return f"${obj.selling_price:,.2f}"
-        return "-"  # Shows dash for Raw Materials & Intermediates
+        return "-"  # Shows dash for items without a selling price (e.g. Raw Materials)
 
 
 @admin.register(PurchaseOrder)
@@ -645,13 +711,20 @@ class DispatchRecordAdmin(admin.ModelAdmin):
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(admin.ModelAdmin):
-    list_display = ('work_order_code', 'work_order_id', 'product', 'display_employees', 'display_target_quantity', 'production_start_date', 'production_end_date', 'status', 'is_inventory_updated')
-    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date', 'parent_work_order']
+    form = WorkOrderForm
+    list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
+    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
-    list_filter = ['status', 'is_inventory_updated', 'production_start_date']
+    list_filter = ['category', 'status', 'is_inventory_updated', 'production_start_date']
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
+
+    class Media:
+        js = ('admin/js/work_order_category_toggle.js',)
+        css = {
+            'all': ('admin/css/work_order_admin.css',)
+        }
 
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly loads product, BOM, parent order, employees, and production runs."""
@@ -660,9 +733,11 @@ class WorkOrderAdmin(admin.ModelAdmin):
     fieldsets = (
         ('Order Specification', {
             'fields': (
+                'category',
                 'product',
                 'bill_of_material',
                 'quantity_produced',
+                'actual_quantity_produced',
                 'employee',
             )
         }),
@@ -711,9 +786,18 @@ class WorkOrderAdmin(admin.ModelAdmin):
         print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...", flush=True)
         super().save_related(request, form, formsets, change)
         
-        print("[ADMIN SAVE_RELATED] Inline material lines saved. Calling process_inventory()...", flush=True)
+        print("[ADMIN SAVE_RELATED] Inline material lines saved. Refreshing instance and calling process_inventory()...", flush=True)
         work_order = form.instance
+        work_order.refresh_from_db()
         work_order.process_inventory()
+
+    @admin.display(description='Category')
+    def category_badge(self, obj):
+        if obj.category == 'PRODUCTION':
+            return format_html('<span style="background-color: #2b6cb0; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">PRODUCTION</span>')
+        elif obj.category == 'PACKAGING':
+            return format_html('<span style="background-color: #805ad5; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">PACKAGING</span>')
+        return "-"
 
     @admin.display(description='Assigned Employees')
     def display_employees(self, obj):
@@ -732,6 +816,8 @@ class WorkOrderAdmin(admin.ModelAdmin):
             'COMPLETED': 'green',
             'IN_PROGRESS': '#3182ce',
             'CANCELLED': 'red',
+            'AWAITING_RESOLUTION': '#dd6b20',
+            'ON_HOLD_SHORTAGE': '#e53e3e',
         }
         color = colors.get(obj.status, 'gray')
         return format_html(
@@ -740,17 +826,210 @@ class WorkOrderAdmin(admin.ModelAdmin):
             obj.get_status_display()
         )
 
+    @admin.action(description="Shortage Resolution: Top-Up Parent Bulk Order")
+    def action_top_up_bulk(self, request, queryset):
+        count = 0
+        for wo in queryset:
+            try:
+                wo.resolve_bulk_shortage('TOP_UP_BULK')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Successfully executed Top-Up Bulk resolution for {count} order(s).", level=messages.SUCCESS)
+
+    @admin.action(description="Shortage Resolution: Downscale Target Batch")
+    def action_downscale_target(self, request, queryset):
+        count = 0
+        for wo in queryset:
+            try:
+                wo.resolve_bulk_shortage('DOWNSCALE_TARGET')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Successfully downscaled target batch for {count} order(s).", level=messages.SUCCESS)
+
+    @admin.action(description="Shortage Resolution: Hold for Existing Bulk Run")
+    def action_hold_for_existing(self, request, queryset):
+        count = 0
+        for wo in queryset:
+            try:
+                wo.resolve_bulk_shortage('HOLD_FOR_EXISTING')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Error resolving WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Successfully placed {count} order(s) on hold for bulk shortage.", level=messages.SUCCESS)
+
+    change_form_template = 'admin/core/workorder/change_form.html'
+
+    def change_view(self, request, object_id, form_url='', extra_context=None):
+        extra_context = extra_context or {}
+        try:
+            wo = self.get_object(request, object_id)
+            if wo:
+                metrics = wo.check_bulk_availability()
+                extra_context['shortage_metrics'] = metrics
+                inter_prod = metrics.get('intermediate_product')
+                if inter_prod:
+                    active_bulk_orders = WorkOrder.objects.filter(
+                        product=inter_prod,
+                        status='IN_PROGRESS'
+                    ).exclude(pk=wo.pk)
+                    extra_context['active_bulk_orders'] = active_bulk_orders
+                else:
+                    extra_context['active_bulk_orders'] = []
+                extra_context['parent_bulk_order'] = wo.parent_work_order
+        except Exception as e:
+            print(f"[WORKORDER ADMIN CHANGE_VIEW ERROR] {e}", flush=True)
+
+        return super().change_view(request, object_id, form_url, extra_context=extra_context)
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                '<int:object_id>/start-production/',
+                self.admin_site.admin_view(self.start_production_view),
+                name='workorder-start-production',
+            ),
+            path(
+                '<int:object_id>/top-up-bulk/',
+                self.admin_site.admin_view(self.top_up_bulk_view),
+                name='workorder-top-up-bulk',
+            ),
+            path(
+                '<int:object_id>/downscale-target/',
+                self.admin_site.admin_view(self.downscale_target_view),
+                name='workorder-downscale-target',
+            ),
+            path(
+                '<int:object_id>/hold-for-existing/',
+                self.admin_site.admin_view(self.hold_for_existing_view),
+                name='workorder-hold-for-existing',
+            ),
+            path(
+                '<int:object_id>/check-stock-resume/',
+                self.admin_site.admin_view(self.check_stock_resume_view),
+                name='workorder-check-stock-resume',
+            ),
+        ]
+        return custom_urls + urls
+
+    def start_production_view(self, request, object_id):
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+        try:
+            success, message = work_order.start_production()
+            if success:
+                self.message_user(request, message, level=messages.SUCCESS)
+            else:
+                self.message_user(request, message, level=messages.WARNING)
+        except ValidationError as e:
+            if hasattr(e, 'message_dict'):
+                for field, msgs in e.message_dict.items():
+                    for msg in msgs:
+                        field_label = field.replace('_', ' ').title() if field != '__all__' else 'Validation Error'
+                        self.message_user(request, f"{field_label}: {msg}", level=messages.ERROR)
+            elif hasattr(e, 'messages'):
+                for msg in e.messages:
+                    self.message_user(request, msg, level=messages.ERROR)
+            else:
+                self.message_user(request, str(e), level=messages.ERROR)
+        except Exception as e:
+            self.message_user(request, f"Failed to start work order: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
+    def _resolve_shortage_view(self, request, object_id, action_choice, existing_bulk_wo_id=None):
+        """Shared handler for all shortage resolution admin views."""
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+        try:
+            work_order.resolve_bulk_shortage(action_choice, existing_bulk_wo_id=existing_bulk_wo_id)
+            action_labels = {
+                'TOP_UP_BULK': 'Top-Up Bulk resolution',
+                'DOWNSCALE_TARGET': 'Downscale Target resolution',
+                'HOLD_FOR_EXISTING': 'Hold for Existing Bulk Run',
+            }
+            label = action_labels.get(action_choice, action_choice)
+            self.message_user(request, f"Successfully executed {label} for WO #{work_order.work_order_code}.", level=messages.SUCCESS)
+        except ValidationError as e:
+            if hasattr(e, 'messages'):
+                for msg in e.messages:
+                    self.message_user(request, msg, level=messages.ERROR)
+            else:
+                self.message_user(request, str(e), level=messages.ERROR)
+        except Exception as e:
+            self.message_user(request, f"Error resolving WO #{object_id}: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
+    def top_up_bulk_view(self, request, object_id):
+        return self._resolve_shortage_view(request, object_id, 'TOP_UP_BULK')
+
+    def downscale_target_view(self, request, object_id):
+        return self._resolve_shortage_view(request, object_id, 'DOWNSCALE_TARGET')
+
+    def hold_for_existing_view(self, request, object_id):
+        existing_bulk_wo_id = request.POST.get('bulk_wo_id') or request.GET.get('bulk_wo_id')
+        if existing_bulk_wo_id:
+            try:
+                existing_bulk_wo_id = int(existing_bulk_wo_id)
+            except (ValueError, TypeError):
+                existing_bulk_wo_id = None
+        return self._resolve_shortage_view(request, object_id, 'HOLD_FOR_EXISTING', existing_bulk_wo_id=existing_bulk_wo_id)
+
+    def check_stock_resume_view(self, request, object_id):
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+        try:
+            avail = work_order.check_bulk_availability()
+            if avail.get('has_shortfall'):
+                shortfall = avail.get('shortfall', Decimal('0.00'))
+                self.message_user(
+                    request,
+                    f"Intermediate bulk shortage still unresolved: Shortfall is {shortfall:.2f} units. Order remains {work_order.get_status_display()}.",
+                    level=messages.WARNING
+                )
+            else:
+                success, msg = work_order.start_production()
+                if success:
+                    self.message_user(request, f"Stock verified! {msg}", level=messages.SUCCESS)
+                else:
+                    self.message_user(request, msg, level=messages.WARNING)
+        except Exception as e:
+            self.message_user(request, f"Error re-evaluating stock: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
 @admin.register(MaterialVarianceRecord)
 class MaterialVarianceRecordAdmin(admin.ModelAdmin):
-    list_display = ('variance_code', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'get_classification_badge', 'recorded_at')
-    list_filter = ['variance_classification', 'recorded_at']
+    list_display = ('variance_code', 'work_order', 'get_production_run_type', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'get_classification_badge', 'recorded_at')
+    list_filter = ['work_order__category', 'variance_classification', 'recorded_at']
     search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
-    readonly_fields = ('variance_code', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
+    readonly_fields = ('variance_code', 'get_production_run_type', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
     actions = [export_as_csv]
 
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly joins WorkOrder, Product, and MaterialLine."""
         return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')
+
+    @admin.display(description='Run Type')
+    def get_production_run_type(self, obj):
+        run_type = obj.production_run_type
+        if run_type == 'PRODUCTION':
+            return format_html('<span style="background-color: #2b6cb0; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;">PRODUCTION</span>')
+        elif run_type == 'PACKAGING':
+            return format_html('<span style="background-color: #6b46c1; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;">PACKAGING</span>')
+        return format_html('<span style="color: #666;">{}</span>', run_type)
 
     @admin.display(description='Financial Impact')
     def get_financial_impact(self, obj):

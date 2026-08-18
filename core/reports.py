@@ -152,7 +152,7 @@ def get_production_yield_and_scrap_report(start_date=None, end_date=None):
 
     for wo in completed_wo.prefetch_related('production_runs'):
         total_target_qty += wo.target_quantity
-        total_produced_qty += wo.quantity_produced or Decimal('0.00')
+        total_produced_qty += (wo.actual_quantity_produced if wo.actual_quantity_produced is not None else wo.quantity_produced) or Decimal('0.00')
 
     yield_rate_pct = Decimal('100.00')
     if total_target_qty > Decimal('0.00'):

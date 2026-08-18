@@ -1,0 +1,34 @@
+{% extends 'core/index.html' %}
+{% block content %}
+<div class="container">
+    <h2>Add New Product</h2>
+    <form method="post" action="{% url 'product_form' %}">
+        {% csrf_token %}
+        <div class="form-group mb-3">
+            <label for="name">Product Name:</label>
+            <input type="text" class="form-control" id="name" name="name" required>
+        </div>
+        <div class="form-group mb-3">
+            <label for="product_type">Product Type:</label>
+            <select class="form-control" id="product_type" name="product_type">
+                <option value="FINISHED">Finished Good</option>
+                <option value="INTERMEDIATE">Intermediate / Sub-Assembly</option>
+                <option value="RAW">Raw Material</option>
+            </select>
+        </div>
+        <div class="form-group mb-3">
+            <label for="category">Category:</label>
+            <input type="text" class="form-control" id="category" name="category" value="General">
+        </div>
+        <div class="form-group mb-3">
+            <label for="unit_of_measurement">Unit of Measurement:</label>
+            <input type="text" class="form-control" id="unit_of_measurement" name="unit_of_measurement" value="pcs">
+        </div>
+        <div class="form-group mb-3">
+            <label for="selling_price">Selling Price ($):</label>
+            <input type="number" step="0.01" class="form-control" id="selling_price" name="selling_price">
+        </div>
+        <button type="submit" class="btn btn-primary">Save Product</button>
+    </form>
+</div>
+{% endblock %}

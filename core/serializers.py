@@ -1,5 +1,5 @@
 """
-CORE SERIALIZERS MODULE (core/serializers.py)
+CORE SERIALIZERS MODULE
 
 Provides object-to-dictionary serialization, data formatting, and input 
 validation/deserialization for core ERP domain models.
@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError
 from .models import (
     Product, Inventory, WorkOrder, WorkOrderMaterialLine, WorkOrderInstruction,
     ProductionOrder, SalesOrder, SalesOrderItem, ProcurementOrder, PurchaseOrder,
-    DispatchRecord, SalesInvoice, FinanceEntry, MaterialVarianceRecord, Supplier, Customer
+    DispatchRecord, SalesInvoice, FinanceEntry, MaterialVarianceRecord, StockTransaction, Supplier, Customer
 )
 
 
@@ -87,7 +87,7 @@ class ProductSerializer(BaseSerializer):
             "category": category or "General",
             "unit_of_measurement": unit_of_measurement or "pcs",
             "supplier_id": supplier_id if product_type == 'RAW' else None,
-            "selling_price": Decimal(str(selling_price)) if selling_price is not None else None
+            "selling_price": Decimal(str(selling_price)) if (selling_price is not None and product_type in ['FINISHED', 'INTERMEDIATE']) else None
         }
 
 
@@ -119,6 +119,7 @@ class WorkOrderSerializer(BaseSerializer):
         return {
             "work_order_id": obj.work_order_id,
             "work_order_code": obj.work_order_code,
+            "category": obj.category,
             "product_id": obj.product_id,
             "product_name": obj.product.name if obj.product else "",
             "product_sku": obj.product.sku if obj.product else "",
@@ -127,6 +128,7 @@ class WorkOrderSerializer(BaseSerializer):
             "status": obj.status,
             "target_quantity": float(obj.target_quantity),
             "quantity_produced": float(obj.quantity_produced) if obj.quantity_produced is not None else None,
+            "actual_quantity_produced": float(obj.actual_quantity_produced) if obj.actual_quantity_produced is not None else None,
             "production_start_date": str(obj.production_start_date) if obj.production_start_date else None,
             "production_end_date": obj.production_end_date.isoformat() if obj.production_end_date else None,
             "assigned_crew": [emp.employee_name for emp in obj.employee.all()],
@@ -153,7 +155,7 @@ class ProductionOrderSerializer(BaseSerializer):
             "product_id": obj.product_id,
             "product_name": obj.product.name if obj.product else "",
             "work_order_id": obj.work_order_id,
-            "work_order_code": obj.work_order.work_order_code if obj.work_order else "",
+            "work_order_code": obj.work_order.work_order_code if (obj.work_order_id and getattr(obj, 'work_order', None)) else "",
             "quantity": float(obj.quantity or 0.0),
             "unit_cost": float(obj.unit_cost or 0.0),
             "status": obj.status,
@@ -225,4 +227,51 @@ class DispatchRecordSerializer(BaseSerializer):
             "status": obj.status,
             "delivery_date": str(obj.delivery_date) if obj.delivery_date else None,
             "is_stock_deducted": obj.is_stock_deducted
+        }
+
+
+class MaterialVarianceRecordSerializer(BaseSerializer):
+    """Serializes Material Variance Records including production run type."""
+
+    @classmethod
+    def _serialize_instance(cls, obj: MaterialVarianceRecord):
+        return {
+            "variance_id": obj.variance_id,
+            "variance_code": obj.variance_code,
+            "production_run_type": obj.production_run_type,
+            "work_order_id": obj.work_order_id,
+            "work_order_code": obj.work_order.work_order_code if obj.work_order else "",
+            "product_id": obj.product_id,
+            "product_name": obj.product.name if obj.product else "",
+            "quantity_expected": float(obj.quantity_expected or 0.0),
+            "quantity_actual": float(obj.quantity_actual or 0.0),
+            "quantity_variance": float(obj.quantity_variance or 0.0),
+            "unit_cost": float(obj.unit_cost or 0.0),
+            "financial_impact": float(obj.financial_impact or 0.0),
+            "variance_percentage": float(obj.variance_percentage or 0.0),
+            "efficiency_rate": float(obj.efficiency_rate or 0.0),
+            "variance_classification": obj.variance_classification,
+            "recorded_at": obj.recorded_at.isoformat() if obj.recorded_at else None,
+            "notes": obj.notes or ""
+        }
+
+
+class StockTransactionSerializer(BaseSerializer):
+    """Serializes Inventory Stock Transactions including work order code."""
+
+    @classmethod
+    def _serialize_instance(cls, obj: StockTransaction):
+        return {
+            "transaction_id": obj.transaction_id,
+            "product_id": obj.product_id,
+            "product_sku": obj.product.sku if obj.product else "",
+            "product_name": obj.product.name if obj.product else "",
+            "work_order_id": obj.work_order_id,
+            "work_order_code": obj.work_order_code,
+            "dispatch_record_id": obj.dispatch_record_id,
+            "quantity": float(obj.quantity or 0.0),
+            "transaction_type": obj.transaction_type,
+            "transaction_type_display": obj.get_transaction_type_display(),
+            "notes": obj.notes or "",
+            "created_at": obj.created_at.isoformat() if obj.created_at else None
         }

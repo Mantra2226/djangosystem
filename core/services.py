@@ -292,7 +292,7 @@ def resolve_intermediate_partial_batch(production_order, max_producible_qty):
         production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
         production_order.save(update_fields=['quantity', 'status', 'notes'])
 
-        if production_order.work_order:
+        if production_order.work_order_id and getattr(production_order, 'work_order', None):
             production_order.work_order.quantity_produced = new_qty
             production_order.work_order.save(update_fields=['quantity_produced'])
 
