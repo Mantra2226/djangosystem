@@ -1058,61 +1058,99 @@ class WorkOrder(models.Model):
                 print("--------------------------------------------------", flush=True)
                 print("[PHASE 3: RECONCILIATION & FINISHED GOODS OUTPUT START]", flush=True)
 
-                # Release any unconsumed allocated stock back to available pool.
-                # IMPORTANT: We use deducted_quantity (not actual_consumed) to compute
-                # what portion of the original allocation has already been moved out of
-                # the allocation pool by Phase 2's incremental deductions. The remaining
-                # allocation to release = original_allocation - already_deducted.
-                if self.is_inventory_allocated and self.bill_of_material:
-                    for item in self.bill_of_material.items.all():
-                        line = self.material_lines.filter(component=item.component).first()
-                        already_deducted = (line.deducted_quantity or Decimal('0.00')) if line else Decimal('0.00')
-                        per_unit_req = item.quantity_required or Decimal('0.00')
-                        expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                with transaction.atomic():
+                    # --- Step 3a: Process any remaining consumption delta not yet deducted ---
+                    for line in self.material_lines.select_related('component').all():
+                        actual_qty = line.quantity_actual or Decimal('0.00')
+                        already_deducted = line.deducted_quantity or Decimal('0.00')
+                        delta = actual_qty - already_deducted
 
-                        # Remaining allocation = what was originally reserved minus what Phase 2 already consumed from the pool
-                        remaining_in_alloc = expected_allocated_qty - already_deducted
-                        if remaining_in_alloc > Decimal('0.00'):
-                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                                product=item.component,
-                                defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
-                            )
+                        if delta > Decimal('0.00'):
+                            raw_inv = Inventory.objects.select_for_update().filter(product=line.component).first()
+                            if not raw_inv:
+                                raw_inv = Inventory.objects.create(
+                                    product=line.component,
+                                    quantity_available=Decimal('0.00'),
+                                    quantity_allocated=Decimal('0.00'),
+                                )
+                                raw_inv = Inventory.objects.select_for_update().get(pk=raw_inv.pk)
+
                             old_alloc = raw_inv.quantity_allocated
                             old_avail = raw_inv.quantity_available
 
-                            released = min(remaining_in_alloc, raw_inv.quantity_allocated)
+                            if raw_inv.quantity_allocated >= delta:
+                                raw_inv.quantity_allocated -= delta
+                            else:
+                                excess = delta - raw_inv.quantity_allocated
+                                raw_inv.quantity_allocated = Decimal('0.00')
+                                raw_inv.quantity_available -= excess
+
+                            raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                            StockTransaction.objects.create(
+                                product=line.component,
+                                quantity=-delta,
+                                transaction_type='PRODUCTION_CONSUMPTION',
+                                work_order=self,
+                                notes=f"Phase 3 final deduction of {delta} units for Work Order #{self.pk} ({line.component.name})"
+                            )
+
+                            line.deducted_quantity = actual_qty
+                            line.save(update_fields=['deducted_quantity'])
+
+                            print(f"   [OK] [PHASE 3 FINAL DEDUCTION] Component: '{line.component.name}' | Delta={delta}", flush=True)
+                            print(f"      Inventory -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
+
+                    # --- Step 3b: Release any unconsumed allocated stock back to available pool ---
+                    for line in self.material_lines.select_related('component').all():
+                        already_deducted = line.deducted_quantity or Decimal('0.00')
+                        allocated_qty = line.quantity_allocated  # BOM-calculated allocation for this line
+
+                        residual_allocated = max(Decimal('0.00'), allocated_qty - already_deducted)
+
+                        if residual_allocated > Decimal('0.00'):
+                            raw_inv = Inventory.objects.select_for_update().filter(product=line.component).first()
+                            if not raw_inv:
+                                continue
+
+                            old_alloc = raw_inv.quantity_allocated
+                            old_avail = raw_inv.quantity_available
+
+                            released = min(residual_allocated, raw_inv.quantity_allocated)
                             raw_inv.quantity_allocated -= released
                             raw_inv.quantity_available += released
                             raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Original Allocated={expected_allocated_qty} | Already Deducted by Phase 2={already_deducted} | Remaining Released={released}", flush=True)
+                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{line.component.name}' | Original Allocated={allocated_qty} | Already Deducted by Phase 2={already_deducted} | Remaining Released={released}", flush=True)
                             print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
-                # Record Finished Goods Output
-                finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
-                if finished_qty > Decimal('0.00'):
-                    finished_inv = Inventory.objects.select_for_update().filter(product=self.product).first()
-                    if not finished_inv:
-                        finished_inv = Inventory.objects.create(
+                    # --- Step 3c: Record Finished Goods Output ---
+                    finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
+                    if finished_qty > Decimal('0.00'):
+                        finished_inv = Inventory.objects.select_for_update().filter(product=self.product).first()
+                        if not finished_inv:
+                            finished_inv = Inventory.objects.create(
+                                product=self.product,
+                                quantity_available=Decimal('0.00')
+                            )
+                            finished_inv = Inventory.objects.select_for_update().get(pk=finished_inv.pk)
+                        old_qty = finished_inv.quantity_available
+                        finished_inv.quantity_available += finished_qty
+                        finished_inv.save(update_fields=['quantity_available'])
+
+                        StockTransaction.objects.create(
                             product=self.product,
-                            quantity_available=Decimal('0.00')
+                            quantity=finished_qty,
+                            transaction_type='PRODUCTION_OUTPUT',
+                            work_order=self
                         )
-                    old_qty = finished_inv.quantity_available
-                    finished_inv.quantity_available += finished_qty
-                    finished_inv.save(update_fields=['quantity_available'])
+                        print(f"   [OK] [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
 
-                    StockTransaction.objects.create(
-                        product=self.product,
-                        quantity=finished_qty,
-                        transaction_type='PRODUCTION_OUTPUT',
-                        work_order=self
-                    )
-                    print(f"   [OK] [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
-
-                self.is_inventory_updated = True
-                super().save(update_fields=['is_inventory_updated', 'production_end_date'])
-                self.sync_child_packaging_expectations()
-                print("[SAFETY GATE] Flipped self.is_inventory_updated = True and synced child packaging expectations", flush=True)
+                    # --- Step 3d: Flip safety gate ONLY after all mutations succeed ---
+                    self.is_inventory_updated = True
+                    super().save(update_fields=['is_inventory_updated', 'production_end_date'])
+                    self.sync_child_packaging_expectations()
+                    print("[SAFETY GATE] Flipped self.is_inventory_updated = True and synced child packaging expectations", flush=True)
 
         print("[HYBRID INVENTORY ENGINE END]", flush=True)
         print("==================================================\n", flush=True)
@@ -1352,11 +1390,10 @@ class WorkOrderMaterialLine(models.Model):
 
     def clean(self):
         super().clean()
-        if self.work_order and self.work_order.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
-            if self.quantity_actual is not None and self.quantity_actual > Decimal('0.00'):
-                raise ValidationError({
-                    'quantity_actual': f"Actual material consumption cannot be entered while Work Order #{self.work_order.work_order_code or self.work_order.pk} is in '{self.work_order.status}' status. Start production first."
-                })
+        if self.quantity_actual is not None and self.quantity_actual < Decimal('0.00'):
+            raise ValidationError({
+                'quantity_actual': "Actual quantity consumed cannot be a negative number."
+            })
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)

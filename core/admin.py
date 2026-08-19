@@ -96,11 +96,6 @@ class WorkOrderMaterialLineInline(admin.TabularInline):
     fields = ('component', 'quantity_expected', 'quantity_actual')
     readonly_fields = ('quantity_expected',)
 
-    def get_readonly_fields(self, request, obj=None):
-        if obj is None or obj.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
-            return ('quantity_expected', 'quantity_actual')
-        return self.readonly_fields
-
 class ChildPackagingInline(admin.TabularInline):
     """
     Inline UI for auditing Stage 2 child packaging work orders linked to a Stage 1 parent bulk order.

@@ -314,11 +314,15 @@ class MRPEngineTestCase(TestCase):
         self.assertIsNotNone(inst)
         self.assertNotEqual(inst.status, "COMPLETED")
 
-        # 2. Attempting to enter actual consumption on DRAFT must raise ValidationError
+        # 2. Material line quantity_actual accepts positive manual inputs and rejects negative values
         mat_line.quantity_actual = Decimal("15.00")
-        with self.assertRaises(ValidationError) as ctx:
+        mat_line.full_clean()  # Should succeed
+
+        mat_line.quantity_actual = Decimal("-5.00")
+        with self.assertRaises(ValidationError) as ctx_neg:
             mat_line.full_clean()
-        self.assertIn('quantity_actual', ctx.exception.message_dict)
+        self.assertIn('quantity_actual', ctx_neg.exception.message_dict)
+        mat_line.quantity_actual = Decimal("15.00")
 
         # 3. Attempting to mark instruction COMPLETED on DRAFT must raise ValidationError
         inst.status = "COMPLETED"
@@ -326,7 +330,7 @@ class MRPEngineTestCase(TestCase):
             inst.full_clean()
         self.assertIn('status', ctx.exception.message_dict)
 
-        # 4. Verify Admin Inlines mark fields as readonly when WorkOrder is DRAFT
+        # 4. Verify Admin Inlines: instruction status is readonly on DRAFT, material quantity_actual is editable
         site = AdminSite()
         factory = RequestFactory()
         request = factory.get('/admin/')
@@ -337,9 +341,10 @@ class MRPEngineTestCase(TestCase):
 
         mat_inline = WorkOrderMaterialLineInline(WorkOrderMaterialLine, site)
         mat_readonly = mat_inline.get_readonly_fields(request, draft_wo)
-        self.assertIn('quantity_actual', mat_readonly)
+        self.assertIn('quantity_expected', mat_readonly)
+        self.assertNotIn('quantity_actual', mat_readonly)
 
-        # 5. Move to IN_PROGRESS -> now both are editable and valid
+        # 5. Move to IN_PROGRESS -> instruction status is editable and valid
         draft_wo.status = "IN_PROGRESS"
         draft_wo.save()
 
@@ -347,15 +352,8 @@ class MRPEngineTestCase(TestCase):
         inst.status = "COMPLETED"
         inst.full_clean()  # Should not raise
 
-        mat_line.refresh_from_db()
-        mat_line.quantity_actual = Decimal("15.00")
-        mat_line.full_clean()  # Should not raise
-
         inst_readonly_in_progress = inst_inline.get_readonly_fields(request, draft_wo)
         self.assertNotIn('status', inst_readonly_in_progress)
-
-        mat_readonly_in_progress = mat_inline.get_readonly_fields(request, draft_wo)
-        self.assertNotIn('quantity_actual', mat_readonly_in_progress)
 
     def test_production_order_code_auto_generation(self):
         wo = WorkOrder.objects.create(
