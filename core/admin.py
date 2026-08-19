@@ -893,6 +893,25 @@ class WorkOrderAdmin(admin.ModelAdmin):
         if count > 0:
             self.message_user(request, f"Successfully placed {count} order(s) on hold for bulk shortage.", level=messages.SUCCESS)
 
+    def get_readonly_fields(self, request, obj=None):
+        """
+        RBAC and Lifecycle Readonly Field Rules:
+        1. Completed Work Orders are completely immutable for all non-superusers.
+        2. Shop-Floor Operators have header/specification fields locked to prevent unapproved edits.
+        3. Otherwise fallback to standard modeladmin readonly fields.
+        """
+        if obj and obj.status == 'COMPLETED' and not request.user.is_superuser:
+            return [f.name for f in self.model._meta.fields]
+
+        if not request.user.is_superuser and request.user.groups.filter(name='Shop-Floor Operator').exists():
+            return ['order_code', 'product', 'target_quantity', 'status', 'category', 'parent_work_order', 'bill_of_material']
+
+        return super().get_readonly_fields(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        """Work orders may only be deleted by superusers to protect manufacturing audit trails."""
+        return bool(request.user and request.user.is_superuser)
+
     change_form_template = 'admin/core/workorder/change_form.html'
 
     def change_view(self, request, object_id, form_url='', extra_context=None):

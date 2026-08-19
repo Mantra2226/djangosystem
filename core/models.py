@@ -580,6 +580,11 @@ class WorkOrder(models.Model):
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='DRAFT', db_index=True, help_text="State machine status of the work order run.")
 
     @property
+    def order_code(self):
+        """Alias property for work_order_code."""
+        return self.work_order_code
+
+    @property
     def target_quantity(self):
         """
         Resolves planned production batch target quantity STRICTLY from the linked ProductionOrder.
