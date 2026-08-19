@@ -580,6 +580,11 @@ class WorkOrder(models.Model):
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='DRAFT', db_index=True, help_text="State machine status of the work order run.")
 
     @property
+    def order_code(self):
+        """Alias property for work_order_code."""
+        return self.work_order_code
+
+    @property
     def target_quantity(self):
         """
         Resolves planned production batch target quantity STRICTLY from the linked ProductionOrder.
@@ -693,6 +698,10 @@ class WorkOrder(models.Model):
                                and runs process_inventory().
           - HOLD_FOR_EXISTING: Attaches an active in-progress bulk order (by existing_bulk_wo_id) as
                                 parent_work_order and sets status to ON_HOLD_SHORTAGE.
+
+        CONCURRENCY HARDENING:
+        - All branches re-evaluate bulk availability from locked inventory rows inside the
+          atomic block to prevent TOCTOU races between check and mutation.
         """
         valid_choices = ['TOP_UP_BULK', 'DOWNSCALE_TARGET', 'HOLD_FOR_EXISTING']
         if action_choice not in valid_choices:
@@ -706,9 +715,38 @@ class WorkOrder(models.Model):
                 f"Resolution pathways can only be executed on orders in 'DRAFT' or 'AWAITING_RESOLUTION' status."
             )
 
-        metrics = self.check_bulk_availability()
-
         with transaction.atomic():
+            # Re-evaluate bulk availability INSIDE the atomic block.
+            # For DOWNSCALE_TARGET and TOP_UP_BULK, lock the intermediate inventory row
+            # to get a consistent snapshot before acting on it.
+            active_bom = self.bill_of_material or (self.product.boms.filter(is_active=True).first() if self.product else None)
+            intermediate_item = active_bom.items.filter(component__product_type='INTERMEDIATE').first() if active_bom else None
+
+            if intermediate_item:
+                from .models import Inventory
+                locked_bulk_inv = Inventory.objects.select_for_update().filter(
+                    product=intermediate_item.component
+                ).first()
+                locked_available = locked_bulk_inv.quantity_available if locked_bulk_inv else Decimal('0.00')
+            else:
+                locked_bulk_inv = None
+                locked_available = Decimal('0.00')
+
+            # Recalculate metrics from the locked row
+            metrics = self.check_bulk_availability()
+            # Override available_stock with the locked value for consistency
+            if intermediate_item:
+                qty_req_per_unit = intermediate_item.quantity_required or Decimal('0.00')
+                target_qty = self.target_quantity or Decimal('0.00')
+                required_qty = (target_qty * qty_req_per_unit).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                metrics['available_stock'] = locked_available
+                metrics['shortfall'] = max(Decimal('0.00'), required_qty - locked_available)
+                metrics['has_shortfall'] = metrics['shortfall'] > Decimal('0.00')
+                if qty_req_per_unit > Decimal('0.00'):
+                    metrics['max_achievable_units'] = (locked_available / qty_req_per_unit).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                else:
+                    metrics['max_achievable_units'] = target_qty
+
             if action_choice == 'TOP_UP_BULK':
                 shortfall = metrics['shortfall']
                 intermediate_product = metrics['intermediate_product']
@@ -871,6 +909,10 @@ class WorkOrder(models.Model):
         EXPLICIT STATE TRANSITION WORKFLOW: DRAFT / ON_HOLD_SHORTAGE -> IN_PROGRESS / AWAITING_RESOLUTION.
         Validates operational readiness, checks intermediate bulk material availability,
         and triggers hybrid stock allocation engine upon transition.
+
+        CONCURRENCY HARDENING:
+        - Bulk availability is checked inside the atomic block with locked inventory rows
+          to eliminate TOCTOU race conditions between shortage detection and allocation.
         """
         current_status = (self.status or '').upper().strip()
         if current_status not in ['DRAFT', 'ON_HOLD_SHORTAGE']:
@@ -888,18 +930,19 @@ class WorkOrder(models.Model):
         # Reset status back to old_status prior to shortage check and state save
         self.status = old_status
 
-        # Check for intermediate bulk shortage (packaging orders)
-        availability = self.check_bulk_availability()
-        if availability.get('has_shortfall'):
-            self.status = 'AWAITING_RESOLUTION'
-            super().save(update_fields=['status'])
-            from .models import ProductionOrder
-            for po in ProductionOrder.objects.filter(work_order=self):
-                po.status = 'ON_HOLD_SHORTAGE'
-                po.save(update_fields=['status'])
-            return (False, "Bulk shortage detected. Moved to Awaiting Resolution.")
-
         with transaction.atomic():
+            # Check for intermediate bulk shortage (packaging orders) INSIDE atomic block
+            # so the availability snapshot is consistent with the allocation that follows.
+            availability = self.check_bulk_availability()
+            if availability.get('has_shortfall'):
+                self.status = 'AWAITING_RESOLUTION'
+                super().save(update_fields=['status'])
+                from .models import ProductionOrder
+                for po in ProductionOrder.objects.filter(work_order=self):
+                    po.status = 'ON_HOLD_SHORTAGE'
+                    po.save(update_fields=['status'])
+                return (False, "Bulk shortage detected. Moved to Awaiting Resolution.")
+
             self.status = 'IN_PROGRESS'
             super().save(update_fields=['status'])
             from .models import ProductionOrder
@@ -957,42 +1000,86 @@ class WorkOrder(models.Model):
         with transaction.atomic():
             # =========================================================================
             # PHASE 1: STOCK ALLOCATION (Runs once when status moves to IN_PROGRESS)
+            #
+            # CONCURRENCY HARDENING:
+            # - Collects all BOM component product IDs and sorts them in ascending order
+            #   to acquire exclusive row locks in a deterministic sequence, preventing
+            #   database deadlocks when multiple WorkOrders allocate concurrently.
+            # - Pre-flight gate inspects ALL locked rows before mutating any, ensuring
+            #   either all allocations succeed atomically or none are applied.
             # =========================================================================
             if current_status == 'IN_PROGRESS' and not self.is_inventory_allocated and self.bill_of_material:
                 print("--------------------------------------------------", flush=True)
                 print("[PHASE 1: STOCK ALLOCATION RESERVATION START]", flush=True)
 
-                for item in self.bill_of_material.items.all():
+                # Step 1: Build allocation requirements map (component_id -> required_qty)
+                bom_items = list(self.bill_of_material.items.select_related('component').all())
+                allocation_plan = {}
+                for item in bom_items:
                     per_unit_req = item.quantity_required or Decimal('0.00')
                     expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    if expected_allocated_qty > Decimal('0.00'):
+                        allocation_plan[item.component.pk] = {
+                            'component': item.component,
+                            'per_unit_req': per_unit_req,
+                            'required_qty': expected_allocated_qty,
+                        }
 
-                    if expected_allocated_qty <= Decimal('0.00'):
-                        continue
+                if allocation_plan:
+                    # Step 2: Sort component IDs for deterministic lock ordering (prevents deadlocks)
+                    sorted_ids = sorted(allocation_plan.keys())
+                    print(f"   [LOCK ORDER] Acquiring row locks in deterministic order: {sorted_ids}", flush=True)
 
-                    raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                        product=item.component,
-                        defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                    # Step 3: Acquire exclusive locks on ALL required inventory rows in one query
+                    locked_inventories = {}
+                    existing_locked = Inventory.objects.select_for_update().filter(
+                        product_id__in=sorted_ids
                     )
+                    for inv in existing_locked:
+                        locked_inventories[inv.product_id] = inv
 
-                    # STOCK SUFFICIENCY CHECK: Prevent allocation that would drive inventory negative
-                    if raw_inv.quantity_available < expected_allocated_qty:
+                    # Create inventory records for any missing components (rare but safe)
+                    for comp_id in sorted_ids:
+                        if comp_id not in locked_inventories:
+                            new_inv = Inventory.objects.create(
+                                product_id=comp_id,
+                                quantity_available=Decimal('0.00'),
+                                quantity_allocated=Decimal('0.00'),
+                            )
+                            # Re-acquire with lock
+                            locked_inventories[comp_id] = Inventory.objects.select_for_update().get(pk=new_inv.pk)
+
+                    # Step 4: PRE-FLIGHT GATE - Check ALL components have sufficient stock
+                    #         before mutating any row. Prevents partial allocations.
+                    shortage_errors = []
+                    for comp_id in sorted_ids:
+                        plan = allocation_plan[comp_id]
+                        inv = locked_inventories[comp_id]
+                        if inv.quantity_available < plan['required_qty']:
+                            shortage_errors.append(
+                                f"Insufficient stock for '{plan['component'].name}': "
+                                f"Available={inv.quantity_available}, Required={plan['required_qty']}."
+                            )
+
+                    if shortage_errors:
                         raise ValidationError(
-                            f"Insufficient stock for '{item.component.name}': "
-                            f"Available={raw_inv.quantity_available}, Required={expected_allocated_qty}. "
-                            f"Please restock before starting production."
+                            " | ".join(shortage_errors) + " Please restock before starting production."
                         )
 
-                    old_avail = raw_inv.quantity_available
-                    old_alloc = raw_inv.quantity_allocated
+                    # Step 5: ATOMIC ALLOCATION - All pre-flight checks passed, mutate all rows
+                    for comp_id in sorted_ids:
+                        plan = allocation_plan[comp_id]
+                        inv = locked_inventories[comp_id]
+                        old_avail = inv.quantity_available
+                        old_alloc = inv.quantity_allocated
 
-                    # Shift expected_allocated_qty from quantity_available to quantity_allocated
-                    raw_inv.quantity_available -= expected_allocated_qty
-                    raw_inv.quantity_allocated += expected_allocated_qty
-                    raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+                        inv.quantity_available -= plan['required_qty']
+                        inv.quantity_allocated += plan['required_qty']
+                        inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                    print(f"   [OK] [RESERVED ALLOCATION] Component: '{item.component.name}'", flush=True)
-                    print(f"      Allocated Quantity for Line: {expected_allocated_qty} units (Formula: {per_unit_req} BOM Req/unit x {target_qty} Target Batch Qty)", flush=True)
-                    print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
+                        print(f"   [OK] [RESERVED ALLOCATION] Component: '{plan['component'].name}'", flush=True)
+                        print(f"      Allocated Quantity for Line: {plan['required_qty']} units (Formula: {plan['per_unit_req']} BOM Req/unit x {target_qty} Target Batch Qty)", flush=True)
+                        print(f"      Inventory Shift -> Available: {old_avail} => {inv.quantity_available} | Allocated: {old_alloc} => {inv.quantity_allocated}", flush=True)
 
                 self.is_inventory_allocated = True
                 super().save(update_fields=['is_inventory_allocated'])
@@ -1058,61 +1145,99 @@ class WorkOrder(models.Model):
                 print("--------------------------------------------------", flush=True)
                 print("[PHASE 3: RECONCILIATION & FINISHED GOODS OUTPUT START]", flush=True)
 
-                # Release any unconsumed allocated stock back to available pool.
-                # IMPORTANT: We use deducted_quantity (not actual_consumed) to compute
-                # what portion of the original allocation has already been moved out of
-                # the allocation pool by Phase 2's incremental deductions. The remaining
-                # allocation to release = original_allocation - already_deducted.
-                if self.is_inventory_allocated and self.bill_of_material:
-                    for item in self.bill_of_material.items.all():
-                        line = self.material_lines.filter(component=item.component).first()
-                        already_deducted = (line.deducted_quantity or Decimal('0.00')) if line else Decimal('0.00')
-                        per_unit_req = item.quantity_required or Decimal('0.00')
-                        expected_allocated_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                with transaction.atomic():
+                    # --- Step 3a: Process any remaining consumption delta not yet deducted ---
+                    for line in self.material_lines.select_related('component').all():
+                        actual_qty = line.quantity_actual or Decimal('0.00')
+                        already_deducted = line.deducted_quantity or Decimal('0.00')
+                        delta = actual_qty - already_deducted
 
-                        # Remaining allocation = what was originally reserved minus what Phase 2 already consumed from the pool
-                        remaining_in_alloc = expected_allocated_qty - already_deducted
-                        if remaining_in_alloc > Decimal('0.00'):
-                            raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
-                                product=item.component,
-                                defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
-                            )
+                        if delta > Decimal('0.00'):
+                            raw_inv = Inventory.objects.select_for_update().filter(product=line.component).first()
+                            if not raw_inv:
+                                raw_inv = Inventory.objects.create(
+                                    product=line.component,
+                                    quantity_available=Decimal('0.00'),
+                                    quantity_allocated=Decimal('0.00'),
+                                )
+                                raw_inv = Inventory.objects.select_for_update().get(pk=raw_inv.pk)
+
                             old_alloc = raw_inv.quantity_allocated
                             old_avail = raw_inv.quantity_available
 
-                            released = min(remaining_in_alloc, raw_inv.quantity_allocated)
+                            if raw_inv.quantity_allocated >= delta:
+                                raw_inv.quantity_allocated -= delta
+                            else:
+                                excess = delta - raw_inv.quantity_allocated
+                                raw_inv.quantity_allocated = Decimal('0.00')
+                                raw_inv.quantity_available -= excess
+
+                            raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                            StockTransaction.objects.create(
+                                product=line.component,
+                                quantity=-delta,
+                                transaction_type='PRODUCTION_CONSUMPTION',
+                                work_order=self,
+                                notes=f"Phase 3 final deduction of {delta} units for Work Order #{self.pk} ({line.component.name})"
+                            )
+
+                            line.deducted_quantity = actual_qty
+                            line.save(update_fields=['deducted_quantity'])
+
+                            print(f"   [OK] [PHASE 3 FINAL DEDUCTION] Component: '{line.component.name}' | Delta={delta}", flush=True)
+                            print(f"      Inventory -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
+
+                    # --- Step 3b: Release any unconsumed allocated stock back to available pool ---
+                    for line in self.material_lines.select_related('component').all():
+                        already_deducted = line.deducted_quantity or Decimal('0.00')
+                        allocated_qty = line.quantity_allocated  # BOM-calculated allocation for this line
+
+                        residual_allocated = max(Decimal('0.00'), allocated_qty - already_deducted)
+
+                        if residual_allocated > Decimal('0.00'):
+                            raw_inv = Inventory.objects.select_for_update().filter(product=line.component).first()
+                            if not raw_inv:
+                                continue
+
+                            old_alloc = raw_inv.quantity_allocated
+                            old_avail = raw_inv.quantity_available
+
+                            released = min(residual_allocated, raw_inv.quantity_allocated)
                             raw_inv.quantity_allocated -= released
                             raw_inv.quantity_available += released
                             raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{item.component.name}' | Original Allocated={expected_allocated_qty} | Already Deducted by Phase 2={already_deducted} | Remaining Released={released}", flush=True)
+                            print(f"   [OK] [RELEASED UNUSED ALLOCATION] Component: '{line.component.name}' | Original Allocated={allocated_qty} | Already Deducted by Phase 2={already_deducted} | Remaining Released={released}", flush=True)
                             print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
-                # Record Finished Goods Output
-                finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
-                if finished_qty > Decimal('0.00'):
-                    finished_inv = Inventory.objects.select_for_update().filter(product=self.product).first()
-                    if not finished_inv:
-                        finished_inv = Inventory.objects.create(
+                    # --- Step 3c: Record Finished Goods Output ---
+                    finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
+                    if finished_qty > Decimal('0.00'):
+                        finished_inv = Inventory.objects.select_for_update().filter(product=self.product).first()
+                        if not finished_inv:
+                            finished_inv = Inventory.objects.create(
+                                product=self.product,
+                                quantity_available=Decimal('0.00')
+                            )
+                            finished_inv = Inventory.objects.select_for_update().get(pk=finished_inv.pk)
+                        old_qty = finished_inv.quantity_available
+                        finished_inv.quantity_available += finished_qty
+                        finished_inv.save(update_fields=['quantity_available'])
+
+                        StockTransaction.objects.create(
                             product=self.product,
-                            quantity_available=Decimal('0.00')
+                            quantity=finished_qty,
+                            transaction_type='PRODUCTION_OUTPUT',
+                            work_order=self
                         )
-                    old_qty = finished_inv.quantity_available
-                    finished_inv.quantity_available += finished_qty
-                    finished_inv.save(update_fields=['quantity_available'])
+                        print(f"   [OK] [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
 
-                    StockTransaction.objects.create(
-                        product=self.product,
-                        quantity=finished_qty,
-                        transaction_type='PRODUCTION_OUTPUT',
-                        work_order=self
-                    )
-                    print(f"   [OK] [ADDED FINISHED GOODS] Product: '{self.product.name}' | Quantity: +{finished_qty} | Stock: {old_qty} => {finished_inv.quantity_available}", flush=True)
-
-                self.is_inventory_updated = True
-                super().save(update_fields=['is_inventory_updated', 'production_end_date'])
-                self.sync_child_packaging_expectations()
-                print("[SAFETY GATE] Flipped self.is_inventory_updated = True and synced child packaging expectations", flush=True)
+                    # --- Step 3d: Flip safety gate ONLY after all mutations succeed ---
+                    self.is_inventory_updated = True
+                    super().save(update_fields=['is_inventory_updated', 'production_end_date'])
+                    self.sync_child_packaging_expectations()
+                    print("[SAFETY GATE] Flipped self.is_inventory_updated = True and synced child packaging expectations", flush=True)
 
         print("[HYBRID INVENTORY ENGINE END]", flush=True)
         print("==================================================\n", flush=True)
@@ -1254,6 +1379,12 @@ class WorkOrder(models.Model):
         print("==================================================\n", flush=True)
                 
         
+    class Meta:
+        permissions = [
+            ('can_start_production', 'Can start production on work orders'),
+            ('can_resolve_shortage', 'Can resolve shortage on work orders'),
+        ]
+
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
@@ -1352,11 +1483,10 @@ class WorkOrderMaterialLine(models.Model):
 
     def clean(self):
         super().clean()
-        if self.work_order and self.work_order.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
-            if self.quantity_actual is not None and self.quantity_actual > Decimal('0.00'):
-                raise ValidationError({
-                    'quantity_actual': f"Actual material consumption cannot be entered while Work Order #{self.work_order.work_order_code or self.work_order.pk} is in '{self.work_order.status}' status. Start production first."
-                })
+        if self.quantity_actual is not None and self.quantity_actual < Decimal('0.00'):
+            raise ValidationError({
+                'quantity_actual': "Actual quantity consumed cannot be a negative number."
+            })
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
@@ -1840,6 +1970,38 @@ class SalesOrder(models.Model):
 
         if self.pk and self.status != 'cancelled':
             self.update_status(save=True)
+
+    def confirm_and_generate_invoice(self):
+        """
+        Confirms the Sales Order (transitions to 'approved' if currently 'draft')
+        and generates an associated SalesInvoice.
+        """
+        if self.status == 'cancelled':
+            raise ValidationError("Cannot confirm a cancelled Sales Order.")
+
+        if not self.items.exists():
+            raise ValidationError("Cannot confirm a Sales Order with no items.")
+
+        with transaction.atomic():
+            if self.status == 'draft':
+                self.status = 'approved'
+                SalesOrder.objects.filter(pk=self.pk).update(status='approved')
+
+            total_amount = sum(item.total_price for item in self.items.all())
+
+            invoice = SalesInvoice.objects.create(
+                customer=self.customer,
+                total_amount=total_amount,
+                invoice_date=timezone.now().date(),
+                status='Unpaid'
+            )
+
+        return invoice
+
+    class Meta:
+        permissions = [
+            ('can_confirm_sales_order', 'Can confirm sales orders and generate invoices'),
+        ]
 
     def __str__(self):
         return f"{self.order_number} - {self.customer.customer_name} ({self.get_status_display()})"
