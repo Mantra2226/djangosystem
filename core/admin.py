@@ -1,7 +1,7 @@
 from django.urls import path, reverse
 from django.shortcuts import get_object_or_404, redirect
 from django.http import HttpResponseRedirect
-from django.core.exceptions import ValidationError, ObjectDoesNotExist
+from django.core.exceptions import ValidationError, ObjectDoesNotExist, PermissionDenied
 from django.utils.safestring import mark_safe
 from django.contrib import admin, messages
 from django.utils.html import format_html
@@ -590,6 +590,42 @@ class SalesOrderAdmin(admin.ModelAdmin):
     def get_order_total(self, obj):
         total = sum(item.total_price for item in obj.items.all())
         return f"${total:,.2f}"
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                '<int:object_id>/confirm-order/',
+                self.admin_site.admin_view(self.confirm_order_view),
+                name='salesorder-confirm-order',
+            ),
+        ]
+        return custom_urls + urls
+
+    def confirm_order_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_confirm_sales_order')):
+            raise PermissionDenied("You do not have permission to confirm sales orders.")
+        order = get_object_or_404(SalesOrder, pk=object_id)
+        try:
+            invoice = order.confirm_and_generate_invoice()
+            self.message_user(
+                request,
+                f"Sales Order #{order.order_number} confirmed and Invoice #{invoice.invoice_number} generated successfully.",
+                level=messages.SUCCESS
+            )
+        except ValidationError as e:
+            if hasattr(e, 'messages'):
+                for msg in e.messages:
+                    self.message_user(request, msg, level=messages.ERROR)
+            else:
+                self.message_user(request, str(e), level=messages.ERROR)
+        except Exception as e:
+            self.message_user(request, f"Error confirming Sales Order #{object_id}: {str(e)}", level=messages.ERROR)
+
+        referer = request.META.get('HTTP_REFERER')
+        if referer:
+            return HttpResponseRedirect(referer)
+        return redirect(reverse('admin:core_salesorder_change', args=[object_id]))
 @admin.register(BillOfMaterial)
 class BillOfMaterialAdmin(admin.ModelAdmin):
     list_display = ('product', 'name', 'is_active', 'get_component_count', 'updated_at')
@@ -716,7 +752,7 @@ class WorkOrderAdmin(admin.ModelAdmin):
     actions = [export_as_csv, 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
 
     class Media:
-        js = ('admin/js/work_order_category_toggle.js',)
+        js = ('admin/js/workorder_toggle.js', 'admin/js/work_order_category_toggle.js')
         css = {
             'all': ('admin/css/work_order_admin.css',)
         }
@@ -890,6 +926,11 @@ class WorkOrderAdmin(admin.ModelAdmin):
                 name='workorder-start-production',
             ),
             path(
+                '<int:object_id>/resolve-shortage/<str:choice>/',
+                self.admin_site.admin_view(self.resolve_shortage_view),
+                name='workorder-resolve-shortage',
+            ),
+            path(
                 '<int:object_id>/top-up-bulk/',
                 self.admin_site.admin_view(self.top_up_bulk_view),
                 name='workorder-top-up-bulk',
@@ -912,7 +953,27 @@ class WorkOrderAdmin(admin.ModelAdmin):
         ]
         return custom_urls + urls
 
+    def resolve_shortage_view(self, request, object_id, choice):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_resolve_shortage')):
+            raise PermissionDenied("You do not have permission to resolve work order shortages.")
+        valid_choices = ['TOP_UP_BULK', 'HOLD_FOR_EXISTING', 'DOWNSCALE_TARGET']
+        if choice not in valid_choices:
+            self.message_user(request, f"Invalid resolution choice '{choice}'. Must be one of {valid_choices}.", level=messages.ERROR)
+            referer = request.META.get('HTTP_REFERER')
+            if referer:
+                return HttpResponseRedirect(referer)
+            return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+        existing_bulk_wo_id = request.POST.get('bulk_wo_id') or request.GET.get('bulk_wo_id')
+        if existing_bulk_wo_id:
+            try:
+                existing_bulk_wo_id = int(existing_bulk_wo_id)
+            except (ValueError, TypeError):
+                existing_bulk_wo_id = None
+        return self._resolve_shortage_view(request, object_id, choice, existing_bulk_wo_id=existing_bulk_wo_id)
+
     def start_production_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_start_production')):
+            raise PermissionDenied("You do not have permission to start production on work orders.")
         work_order = get_object_or_404(WorkOrder, pk=object_id)
         try:
             success, message = work_order.start_production()
@@ -966,12 +1027,18 @@ class WorkOrderAdmin(admin.ModelAdmin):
         return redirect(reverse('admin:core_workorder_change', args=[object_id]))
 
     def top_up_bulk_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_resolve_shortage')):
+            raise PermissionDenied("You do not have permission to resolve work order shortages.")
         return self._resolve_shortage_view(request, object_id, 'TOP_UP_BULK')
 
     def downscale_target_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_resolve_shortage')):
+            raise PermissionDenied("You do not have permission to resolve work order shortages.")
         return self._resolve_shortage_view(request, object_id, 'DOWNSCALE_TARGET')
 
     def hold_for_existing_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_resolve_shortage')):
+            raise PermissionDenied("You do not have permission to resolve work order shortages.")
         existing_bulk_wo_id = request.POST.get('bulk_wo_id') or request.GET.get('bulk_wo_id')
         if existing_bulk_wo_id:
             try:
@@ -981,6 +1048,8 @@ class WorkOrderAdmin(admin.ModelAdmin):
         return self._resolve_shortage_view(request, object_id, 'HOLD_FOR_EXISTING', existing_bulk_wo_id=existing_bulk_wo_id)
 
     def check_stock_resume_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_start_production')):
+            raise PermissionDenied("You do not have permission to start production on work orders.")
         work_order = get_object_or_404(WorkOrder, pk=object_id)
         try:
             avail = work_order.check_bulk_availability()

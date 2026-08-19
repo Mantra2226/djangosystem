@@ -1374,6 +1374,12 @@ class WorkOrder(models.Model):
         print("==================================================\n", flush=True)
                 
         
+    class Meta:
+        permissions = [
+            ('can_start_production', 'Can start production on work orders'),
+            ('can_resolve_shortage', 'Can resolve shortage on work orders'),
+        ]
+
     def __str__(self):
         return f"Work Order {self.work_order_id} — {self.product.name}"
 
@@ -1959,6 +1965,38 @@ class SalesOrder(models.Model):
 
         if self.pk and self.status != 'cancelled':
             self.update_status(save=True)
+
+    def confirm_and_generate_invoice(self):
+        """
+        Confirms the Sales Order (transitions to 'approved' if currently 'draft')
+        and generates an associated SalesInvoice.
+        """
+        if self.status == 'cancelled':
+            raise ValidationError("Cannot confirm a cancelled Sales Order.")
+
+        if not self.items.exists():
+            raise ValidationError("Cannot confirm a Sales Order with no items.")
+
+        with transaction.atomic():
+            if self.status == 'draft':
+                self.status = 'approved'
+                SalesOrder.objects.filter(pk=self.pk).update(status='approved')
+
+            total_amount = sum(item.total_price for item in self.items.all())
+
+            invoice = SalesInvoice.objects.create(
+                customer=self.customer,
+                total_amount=total_amount,
+                invoice_date=timezone.now().date(),
+                status='Unpaid'
+            )
+
+        return invoice
+
+    class Meta:
+        permissions = [
+            ('can_confirm_sales_order', 'Can confirm sales orders and generate invoices'),
+        ]
 
     def __str__(self):
         return f"{self.order_number} - {self.customer.customer_name} ({self.get_status_display()})"
