@@ -7,7 +7,7 @@ from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
     ProductionOrder, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, 
     Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder,
-    PurchaseOrder
+    PurchaseOrder, WorkOrderMaterialLine, StockTransaction, BillOfMaterial, BOMItem
 )
 
 def index(request):
@@ -433,5 +433,236 @@ def api_procurement_orders_list(request):
     qs = ProcurementOrder.objects.select_related('purchase_order', 'product', 'purchase_order__supplier').all()
     data = ProcurementOrderSerializer.serialize_queryset(qs)
     return JsonResponse({"status": "success", "data": data}, status=200)
+
+
+# =============================================================================
+# SHOP-FLOOR REAL-TIME DRF VIEWSETS
+# =============================================================================
+
+from decimal import Decimal
+from django.db import transaction
+from django.utils import timezone
+from rest_framework import viewsets, mixins, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from .permissions import (
+    IsProductionSupervisor,
+    IsShopFloorOperatorOrSupervisor,
+    IsWorkOrderActiveForLogging
+)
+from .serializers import (
+    MaterialLogSerializer,
+    MaterialLineDRFSerializer,
+    WorkOrderDetailDRFSerializer,
+    WorkOrderCompletionSerializer
+)
+
+
+class WorkOrderViewSet(mixins.ListModelMixin,
+                       mixins.RetrieveModelMixin,
+                       viewsets.GenericViewSet):
+    """
+    DRF ViewSet for Work Order management and real-time shop-floor operational logging.
+    """
+    serializer_class = WorkOrderDetailDRFSerializer
+
+    def get_queryset(self):
+        queryset = WorkOrder.objects.select_related(
+            'product', 'bill_of_material', 'parent_work_order'
+        ).prefetch_related('material_lines__component', 'employee')
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        category_param = self.request.query_params.get('category')
+        if category_param:
+            queryset = queryset.filter(category=category_param)
+        return queryset
+
+    def get_permissions(self):
+        """
+        Applies role-based permissions and lifecycle object guards based on action.
+        """
+        if self.action in ['start_production', 'resolve_shortage', 'complete_order']:
+            permission_classes = [IsProductionSupervisor]
+        elif self.action == 'log_material':
+            permission_classes = [IsShopFloorOperatorOrSupervisor, IsWorkOrderActiveForLogging]
+        else:
+            permission_classes = [IsShopFloorOperatorOrSupervisor]
+        return [permission() for permission in permission_classes]
+
+    @action(detail=True, methods=['post'], url_path='log-material')
+    def log_material(self, request, pk=None):
+        """
+        Shop-Floor Operator endpoint for logging actual consumed material on active Work Orders.
+        Executes Phase 2 incremental delta deductions against warehouse inventory under row locks.
+        """
+        work_order = self.get_object()  # Enforces IsWorkOrderActiveForLogging object permission
+        serializer = MaterialLogSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        component_id = serializer.validated_data['component_id']
+        quantity_actual = serializer.validated_data['quantity_actual']
+
+        with transaction.atomic():
+            line = WorkOrderMaterialLine.objects.select_for_update().filter(
+                work_order=work_order,
+                component_id=component_id
+            ).first()
+
+            if not line:
+                return Response(
+                    {"error": f"Material line for component ID {component_id} not found on Work Order #{work_order.pk}."},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            deducted = line.deducted_quantity or Decimal('0.00')
+            if quantity_actual < deducted:
+                is_supervisor = request.user.is_superuser or request.user.groups.filter(name='Production Supervisor').exists()
+                if not is_supervisor:
+                    return Response(
+                        {"detail": "Decreasing logged quantity below already deducted stock requires supervisor authorization."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            delta = quantity_actual - deducted
+
+            if delta != Decimal('0.00'):
+                raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
+                    product=line.component,
+                    defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
+                )
+
+                if delta > Decimal('0.00'):
+                    # Deduct from allocation pool first if available, otherwise from available pool
+                    if raw_inv.quantity_allocated >= delta:
+                        raw_inv.quantity_allocated -= delta
+                    else:
+                        excess = delta - raw_inv.quantity_allocated
+                        raw_inv.quantity_allocated = Decimal('0.00')
+                        raw_inv.quantity_available -= excess
+                    trans_type = 'PRODUCTION_CONSUMPTION'
+                    trans_qty = -delta
+                    notes = f"Shop-Floor API consumption: deducted {delta} units for Work Order #{work_order.pk} ({line.component.name})"
+                else:
+                    # Refund abs(delta) back to inventory.quantity_available
+                    refund = abs(delta)
+                    raw_inv.quantity_available += refund
+                    trans_type = 'ADJUSTMENT_IN'
+                    trans_qty = refund
+                    notes = f"Shop-Floor API consumption: refunded {refund} units for Work Order #{work_order.pk} ({line.component.name})"
+
+                raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+
+                StockTransaction.objects.create(
+                    product=line.component,
+                    quantity=trans_qty,
+                    transaction_type=trans_type,
+                    work_order=work_order,
+                    notes=notes
+                )
+
+                line.deducted_quantity = (line.deducted_quantity or Decimal('0.00')) + delta
+
+            line.quantity_actual = quantity_actual
+            line.save()
+
+        line.refresh_from_db()
+        return Response(MaterialLineDRFSerializer(line).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='start-production')
+    def start_production(self, request, pk=None):
+        """
+        Production Supervisor endpoint for moving DRAFT / ON_HOLD_SHORTAGE orders to IN_PROGRESS.
+        Validates BOM readiness and allocates warehouse stock.
+        """
+        work_order = self.get_object()
+        try:
+            success, message = work_order.start_production()
+            work_order.refresh_from_db()
+            response_data = {
+                'status': 'success' if success else 'shortage_detected',
+                'message': message,
+                'work_order': WorkOrderDetailDRFSerializer(work_order).data
+            }
+            return Response(response_data, status=status.HTTP_200_OK if success else status.HTTP_400_BAD_REQUEST)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='resolve-shortage')
+    def resolve_shortage(self, request, pk=None):
+        """
+        Production Supervisor endpoint for executing interactive shortage resolution pathways.
+        Supported choices: TOP_UP_BULK, DOWNSCALE_TARGET, HOLD_FOR_EXISTING.
+        """
+        work_order = self.get_object()
+        choice = request.data.get('choice')
+        valid_choices = ['TOP_UP_BULK', 'HOLD_FOR_EXISTING', 'DOWNSCALE_TARGET']
+        if choice not in valid_choices:
+            return Response(
+                {'error': f"Invalid resolution choice '{choice}'. Must be one of {valid_choices}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        existing_bulk_wo_id = request.data.get('existing_bulk_wo_id')
+        try:
+            work_order.resolve_bulk_shortage(choice, existing_bulk_wo_id=existing_bulk_wo_id)
+            work_order.refresh_from_db()
+            return Response({
+                'status': 'success',
+                'message': f"Successfully executed shortage resolution '{choice}' for Work Order #{work_order.work_order_code or work_order.pk}.",
+                'work_order': WorkOrderDetailDRFSerializer(work_order).data
+            }, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='complete-order')
+    def complete_order(self, request, pk=None):
+        """
+        Production Supervisor endpoint for completing an active Work Order.
+        Triggers Phase 3 stock reconciliation and releases unconsumed allocations.
+        """
+        work_order = self.get_object()
+        current_status = (work_order.status or '').upper().strip()
+        if current_status != 'IN_PROGRESS':
+            return Response(
+                {'error': f"Cannot complete Work Order #{work_order.pk}: current status is '{work_order.status}'. Only 'IN_PROGRESS' orders can be completed."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = WorkOrderCompletionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            with transaction.atomic():
+                work_order.instructions.filter(status='IN_PROGRESS').update(status='COMPLETED')
+                work_order.actual_quantity_produced = serializer.validated_data['actual_quantity_produced']
+                work_order.scrap_quantity = serializer.validated_data.get('scrap_quantity', Decimal('0.00'))
+                scrap_reason = serializer.validated_data.get('scrap_reason', '')
+                if scrap_reason:
+                    work_order.scrap_reason = scrap_reason
+                work_order.status = 'COMPLETED'
+                if not work_order.production_end_date:
+                    work_order.production_end_date = timezone.now()
+                work_order.save(update_fields=[
+                    'status', 'production_end_date', 'actual_quantity_produced',
+                    'scrap_quantity', 'scrap_reason'
+                ])
+                work_order.process_inventory()
+
+            work_order.refresh_from_db()
+            return Response({
+                'status': 'success',
+                'message': f"Work Order #{work_order.work_order_code or work_order.pk} completed successfully.",
+                'work_order': WorkOrderDetailDRFSerializer(work_order).data
+            }, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+
 
 

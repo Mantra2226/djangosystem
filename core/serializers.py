@@ -5,7 +5,7 @@ Provides object-to-dictionary serialization, data formatting, and input
 validation/deserialization for core ERP domain models.
 """
 
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
 from .models import (
     Product, Inventory, WorkOrder, WorkOrderMaterialLine, WorkOrderInstruction,
@@ -275,3 +275,99 @@ class StockTransactionSerializer(BaseSerializer):
             "notes": obj.notes or "",
             "created_at": obj.created_at.isoformat() if obj.created_at else None
         }
+
+
+# =============================================================================
+# DJANGO REST FRAMEWORK (DRF) SERIALIZERS
+# =============================================================================
+
+from rest_framework import serializers
+
+
+class MaterialLogSerializer(serializers.Serializer):
+    """
+    Validates shop-floor operator real-time material consumption logging payloads.
+    """
+    component_id = serializers.IntegerField(required=True)
+    quantity_actual = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=True,
+        min_value=Decimal('0.00')
+    )
+
+
+class WorkOrderCompletionSerializer(serializers.Serializer):
+    """
+    Validates work order completion and scrap logging payloads.
+    """
+    actual_quantity_produced = serializers.DecimalField(
+        required=True,
+        min_value=Decimal('0.00'),
+        max_digits=12,
+        decimal_places=2
+    )
+    scrap_quantity = serializers.DecimalField(
+        required=False,
+        default=Decimal('0.00'),
+        min_value=Decimal('0.00'),
+        max_digits=12,
+        decimal_places=2
+    )
+    scrap_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=255,
+        default=''
+    )
+
+
+class MaterialLineDRFSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for WorkOrderMaterialLine instances.
+    """
+    component = serializers.StringRelatedField(read_only=True)
+    component_id = serializers.IntegerField(read_only=True)
+    quantity_allocated = serializers.DecimalField(max_digits=12, decimal_places=4, read_only=True)
+    quantity_deducted = serializers.DecimalField(source='deducted_quantity', max_digits=10, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = WorkOrderMaterialLine
+        fields = [
+            'id', 'component', 'component_id', 'quantity_expected',
+            'quantity_actual', 'quantity_allocated', 'quantity_deducted'
+        ]
+
+
+class WorkOrderDetailDRFSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for WorkOrder instances with nested material lines.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product = serializers.StringRelatedField(read_only=True)
+    target_quantity = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    actual_quantity_produced = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    scrap_quantity = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    scrap_reason = serializers.CharField(read_only=True)
+    production_end_date = serializers.DateTimeField(read_only=True)
+    yield_percentage = serializers.SerializerMethodField()
+    material_lines = MaterialLineDRFSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = WorkOrder
+        fields = [
+            'id', 'work_order_code', 'category', 'product', 'status',
+            'target_quantity', 'actual_quantity_produced',
+            'scrap_quantity', 'scrap_reason', 'yield_percentage',
+            'production_start_date', 'production_end_date', 'material_lines'
+        ]
+
+    def get_yield_percentage(self, obj):
+        target = obj.target_quantity
+        actual = obj.actual_quantity_produced
+        if target and target > Decimal('0.00') and actual is not None:
+            pct = (actual / target) * Decimal('100.00')
+            return str(pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        return None
+
+

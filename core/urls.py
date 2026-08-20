@@ -1,7 +1,10 @@
 from django.urls import include, path
-from core import views
-from . import views
 from django.views.generic import RedirectView
+from rest_framework.routers import DefaultRouter
+from core import views
+
+router = DefaultRouter()
+router.register(r'shopfloor/work-orders', views.WorkOrderViewSet, basename='shopfloor-workorder')
 
 urlpatterns = [
     path('', RedirectView.as_view(url='login/')),
@@ -19,6 +22,13 @@ urlpatterns = [
     path('reports/', views.reports_dashboard_view, name='reports_dashboard'),
     path('admin/reports-dashboard/', views.reports_dashboard_view, name='admin_reports_dashboard'),
 
+    # Backward-compatible URL aliases
+    path('home/', views.index, name='home'),
+    path('home.html', views.index, name='home.html'),
+    path('base/', views.index, name='base'),
+    path('raw_material_form/', views.product_form, name='raw_material_form'),
+    path('financial_entry_form/', views.finance_entry_form, name='financial_entry_form'),
+
     # RESTful JSON API Endpoints
     path('api/products/', views.api_products_list_create, name='api_products_list_create'),
     path('api/work-orders/', views.api_work_orders_list, name='api_work_orders_list'),
@@ -26,7 +36,11 @@ urlpatterns = [
     path('api/production-orders/', views.api_production_orders_list, name='api_production_orders_list'),
     path('api/sales-orders/', views.api_sales_orders_list, name='api_sales_orders_list'),
     path('api/procurements/', views.api_procurement_orders_list, name='api_procurement_orders_list'),
-]   
+
+    # DRF Shop-Floor ViewSets
+    path('api/', include(router.urls)),
+]
+
 
 
 
