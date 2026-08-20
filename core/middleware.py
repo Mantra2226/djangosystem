@@ -7,6 +7,20 @@ occurring during JSON API requests and converts them into standardized JSON erro
 
 from django.http import JsonResponse
 from django.core.exceptions import ValidationError, PermissionDenied
+try:
+    from rest_framework.exceptions import (
+        APIException,
+        PermissionDenied as DRFPermissionDenied,
+        ValidationError as DRFValidationError,
+        NotAuthenticated,
+        AuthenticationFailed
+    )
+except ImportError:
+    APIException = None
+    DRFPermissionDenied = None
+    DRFValidationError = None
+    NotAuthenticated = None
+    AuthenticationFailed = None
 
 
 class ApiExceptionMiddleware:
@@ -26,19 +40,44 @@ class ApiExceptionMiddleware:
         is_ajax = request.headers.get('x-requested-with') == 'XMLHttpRequest'
 
         if is_api_route or is_ajax:
-            if isinstance(exception, ValidationError):
-                error_dict = exception.message_dict if hasattr(exception, 'message_dict') else {'detail': exception.messages}
+            # Check for permission denied
+            perm_types = (PermissionDenied,)
+            if DRFPermissionDenied:
+                perm_types = (PermissionDenied, DRFPermissionDenied)
+            if isinstance(exception, perm_types):
+                return JsonResponse({
+                    "status": "error",
+                    "message": "Permission Denied: Unauthorized Access"
+                }, status=403)
+
+            # Check for authentication failures
+            auth_types = ()
+            if NotAuthenticated:
+                auth_types = (NotAuthenticated, AuthenticationFailed)
+            if auth_types and isinstance(exception, auth_types):
+                return JsonResponse({
+                    "status": "error",
+                    "message": "Authentication Required"
+                }, status=401)
+
+            # Check for validation errors
+            val_types = (ValidationError,)
+            if DRFValidationError:
+                val_types = (ValidationError, DRFValidationError)
+            if isinstance(exception, val_types):
+                error_dict = exception.message_dict if hasattr(exception, 'message_dict') else {'detail': exception.messages if hasattr(exception, 'messages') else str(exception)}
                 return JsonResponse({
                     "status": "error",
                     "message": "Validation Failure",
                     "errors": error_dict
                 }, status=400)
 
-            if isinstance(exception, PermissionDenied):
+            # General DRF APIException
+            if APIException and isinstance(exception, APIException):
                 return JsonResponse({
                     "status": "error",
-                    "message": "Permission Denied: Unauthorized Access"
-                }, status=403)
+                    "message": str(exception.detail) if hasattr(exception, 'detail') else str(exception)
+                }, status=exception.status_code)
 
             return JsonResponse({
                 "status": "error",

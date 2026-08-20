@@ -10,7 +10,7 @@
 <body>
     <nav class="navbar navbar-expand-lg navbar-light bg-light">
         <div class="container-fluid">
-            <a class="navbar-brand" href="{% url 'home.html' %}">Manufacturing System</a>
+            <a class="navbar-brand" href="{% url 'index' %}">Manufacturing System</a>
             <div class="collapse navbar-collapse">
                 <ul class="navbar-nav">
                     <li class="nav-item">
@@ -20,7 +20,7 @@
                         <a class="nav-link" href="{% url 'customer_form' %}">Customers</a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link" href="{% url 'raw_material_form' %}">Raw Materials</a>
+                        <a class="nav-link" href="{% url 'product_form' %}">Products & Materials</a>
                     </li>
                     <li class="nav-item">
                         <a class="nav-link" href="{% url 'procurement_form' %}">Procurement</a>
@@ -35,7 +35,10 @@
                         <a class="nav-link" href="{% url 'loss_record_form' %}">Material Variance Records</a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link" href="{% url 'financial_entry_form' %}">Financial Entries</a>
+                        <a class="nav-link" href="{% url 'finance_entry_form' %}">Financial Entries</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{% url 'reports_dashboard' %}">Reports Dashboard</a>
                     </li>
                 </ul>
             </div>

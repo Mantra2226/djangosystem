@@ -12,7 +12,7 @@
         <h1>Dashboard</h1>
         <div class="row">
             <div class="col-md-3">
-                <a href="{% url 'raw_material_form' %}" class="btn btn-primary btn-block mb-3">Add Raw Material</a>
+                <a href="{% url 'product_form' %}" class="btn btn-primary btn-block mb-3">Add Product / Material</a>
             </div>
             <div class="col-md-3">
                 <a href="{% url 'procurement_form' %}" class="btn btn-primary btn-block mb-3">Add Procurement</a>
@@ -21,21 +21,21 @@
                 <a href="{% url 'dispatch_form' %}" class="btn btn-primary btn-block mb-3">Add Dispatch</a>
             </div>
             <div class="col-md-3">
-                <a href="{% url 'supplier_list' %}" class="btn btn-primary btn-block mb-3">View Suppliers</a>
+                <a href="{% url 'supplier_form' %}" class="btn btn-primary btn-block mb-3">Suppliers</a>
             </div>
-             </div>
-            <div class="row">
+        </div>
+        <div class="row">
             <div class="col-md-3">
                 <a href="{% url 'customer_form' %}" class="btn btn-primary btn-block mb-3">Add Customer</a>
             </div>
             <div class="col-md-3">
-                <a href="{% url 'invoice_list' %}" class="btn btn-primary btn-block mb-3">View Invoices</a>
+                <a href="{% url 'reports_dashboard' %}" class="btn btn-primary btn-block mb-3">Reports Dashboard</a>
             </div>
             <div class="col-md-3">
                 <a href="{% url 'loss_record_form' %}" class="btn btn-primary btn-block mb-3">Add Material Variance</a>
             </div>
             <div class="col-md-3">
-                <a href="{% url 'financial_entry_form' %}" class="btn btn-primary btn-block mb-3">Add Financial Entry</a>
+                <a href="{% url 'finance_entry_form' %}" class="btn btn-primary btn-block mb-3">Add Financial Entry</a>
             </div>
         </div>
     </div>

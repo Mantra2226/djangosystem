@@ -573,11 +573,18 @@ class WorkOrder(models.Model):
     employee = models.ManyToManyField('Employee', related_name='assigned_work_order', help_text="Employees assigned to this work order.")
     quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))])
     actual_quantity_produced = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0.00'))], help_text="Actual physical quantity produced in this Run (saved to inventory upon work order completion).")
+    scrap_quantity = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))])
+    scrap_reason = models.CharField(max_length=255, blank=True, default='')
     production_start_date = models.DateField(null=True, blank=True, db_index=True)
     production_end_date = models.DateTimeField(null=True, blank=True, editable=False, help_text="Automatically captured when work order status turns to Completed.")
     is_inventory_updated = models.BooleanField(default=False, editable=False)    
     is_inventory_allocated = models.BooleanField(default=False, help_text="Flag indicating BOM expected stock has been reserved on IN_PROGRESS.")
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='DRAFT', db_index=True, help_text="State machine status of the work order run.")
+
+    @property
+    def id(self):
+        """Alias property for primary key work_order_id."""
+        return self.pk
 
     @property
     def order_code(self):
@@ -1212,7 +1219,8 @@ class WorkOrder(models.Model):
                             print(f"      Inventory -> Allocated: {old_alloc} => {raw_inv.quantity_allocated} | Available: {old_avail} => {raw_inv.quantity_available}", flush=True)
 
                     # --- Step 3c: Record Finished Goods Output ---
-                    finished_qty = self.actual_quantity_produced if (self.actual_quantity_produced is not None and self.actual_quantity_produced > Decimal('0.00')) else target_qty
+                    effective_qty = self.actual_quantity_produced if self.actual_quantity_produced is not None else self.target_quantity
+                    finished_qty = effective_qty
                     if finished_qty > Decimal('0.00'):
                         finished_inv = Inventory.objects.select_for_update().filter(product=self.product).first()
                         if not finished_inv:
@@ -1459,6 +1467,15 @@ class WorkOrderMaterialLine(models.Model):
     quantity_actual = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), validators=[MinValueValidator(Decimal('0.00'))], help_text="The actual physical quantity consumed during this run.")   
     deducted_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), editable=False, help_text="Tracks quantity already deducted from inventory.")
     
+    @property
+    def quantity_deducted(self):
+        """Alias property for deducted_quantity."""
+        return self.deducted_quantity
+
+    @quantity_deducted.setter
+    def quantity_deducted(self, value):
+        self.deducted_quantity = value
+
     @property
     def quantity_allocated(self):
         """
