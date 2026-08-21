@@ -8,7 +8,12 @@ from django.utils.html import format_html
 import json
 from django.core.serializers.json import DjangoJSONEncoder
 from django import forms
-from .models import (PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory, StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction, BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine
+from .models import (
+    PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory,
+    StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
+    SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction,
+    BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine,
+    DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
 )
 from decimal import Decimal
 from .forms import WorkOrderForm
@@ -151,6 +156,21 @@ class SalesOrderItemInline(admin.TabularInline):
         if obj.total_price:
             return f"${obj.total_price:,.2f}"
         return "$0.00"
+
+    def has_add_permission(self, request, obj=None):
+        if obj and obj.status != 'draft' and not request.user.is_superuser:
+            return False
+        return super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        if obj and obj.status != 'draft' and not request.user.is_superuser:
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.status != 'draft' and not request.user.is_superuser:
+            return False
+        return super().has_delete_permission(request, obj)
 class PurchasePaymentInline(admin.TabularInline):
     model = PurchasePayment
     extra = 1
@@ -492,18 +512,48 @@ class ProductionOrderAdmin(admin.ModelAdmin):
     work_order_details_viewer.short_description = "Blueprint Live Specifications"
 
 
+class SalesInvoiceLineInline(admin.TabularInline):
+    model = SalesInvoiceLine
+    extra = 0
+    fields = ('product', 'quantity', 'unit_price', 'tax_rate', 'subtotal', 'tax_amount', 'total_price')
+    readonly_fields = ('subtotal', 'tax_amount', 'total_price')
+
+    def has_add_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_delete_permission(request, obj)
+
 @admin.register(SalesInvoice)
 class SalesInvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'customer', 'dispatch', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status')
+    list_display = ('invoice_number', 'customer', 'sales_order', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status')
     list_filter = ['status', 'invoice_date', 'customer']
-    search_fields = ('invoice_number', 'customer__customer_name', 'dispatch__dispatch_code')
-    inlines = [SalesInvoicePaymentsInline]
-    readonly_fields = ('invoice_number', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'status')
+    search_fields = ('invoice_number', 'customer__customer_name', 'sales_order__order_number', 'dispatch__dispatch_code')
+    inlines = [SalesInvoiceLineInline, SalesInvoicePaymentsInline]
+    readonly_fields = ('invoice_number', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance')
     actions = [export_as_csv]
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Customer, Dispatch, and Payments."""
-        return super().get_queryset(request).select_related('customer', 'dispatch').prefetch_related('sales_payments')
+        """N+1 Query Mitigation: Eagerly joins Customer, Dispatch, and SalesOrder."""
+        return super().get_queryset(request).select_related('customer', 'dispatch', 'sales_order').prefetch_related('sales_payments', 'lines__product')
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status in ['POSTED', 'PAID', 'PARTIALLY_PAID', 'CREDITED'] and not request.user.is_superuser:
+            fields = [f.name for f in self.model._meta.fields]
+            return fields + ['get_total_paid', 'get_remaining_balance']
+        return self.readonly_fields
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
 
     @admin.display(description='Total Paid')
     def get_total_paid(self, obj):
@@ -516,6 +566,52 @@ class SalesInvoiceAdmin(admin.ModelAdmin):
             formatted_bal = f"{bal:,.2f}"
             return format_html('<span style="color: #c53030; font-weight: bold;">${}</span>', formatted_bal)
         return "$0.00"
+
+class CreditNoteLineInline(admin.TabularInline):
+    model = CreditNoteLine
+    extra = 0
+    fields = ('product', 'quantity', 'unit_price', 'tax_rate', 'subtotal', 'tax_amount', 'total_price')
+    readonly_fields = ('subtotal', 'tax_amount', 'total_price')
+
+    def has_add_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_delete_permission(request, obj)
+
+@admin.register(CreditNote)
+class CreditNoteAdmin(admin.ModelAdmin):
+    list_display = ('credit_note_number', 'invoice', 'customer', 'subtotal', 'tax_amount', 'total_amount', 'issue_date', 'status')
+    list_filter = ['status', 'issue_date', 'customer']
+    search_fields = ('credit_note_number', 'invoice__invoice_number', 'customer__customer_name')
+    inlines = [CreditNoteLineInline]
+    readonly_fields = ('credit_note_number', 'subtotal', 'tax_amount', 'total_amount')
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('invoice', 'customer').prefetch_related('lines__product')
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status in ['POSTED', 'REFUNDED'] and not request.user.is_superuser:
+            return [f.name for f in self.model._meta.fields]
+        return self.readonly_fields
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+@admin.register(DocumentSequence)
+class DocumentSequenceAdmin(admin.ModelAdmin):
+    list_display = ('document_type', 'prefix', 'last_sequence')
+    readonly_fields = ('document_type', 'prefix', 'last_sequence')
 
 @admin.register(PurchaseInvoice)
 class PurchaseInvoiceAdmin(admin.ModelAdmin):
@@ -571,12 +667,20 @@ class CustomerAdmin(admin.ModelAdmin):
 
 @admin.register(SalesOrder)
 class SalesOrderAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'customer', 'status', 'created_at', 'updated_at', 'get_order_total')
-    list_filter = ('status', 'created_at')
+    list_display = ('order_number', 'customer', 'invoicing_policy', 'status', 'created_at', 'updated_at', 'get_order_total')
+    list_filter = ('status', 'invoicing_policy', 'created_at')
     search_fields = ('order_number', 'customer__customer_name')
     readonly_fields = ('order_number', 'status', 'created_at', 'updated_at')
     inlines = [SalesOrderItemInline]
     actions = [export_as_csv]
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status != 'draft' and not request.user.is_superuser:
+            return ['customer', 'order_number', 'status', 'invoicing_policy', 'created_at', 'updated_at']
+        return self.readonly_fields
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
 
     def get_queryset(self, request):
         """N+1 Query Mitigation: Eagerly joins Customer and prefetches SalesOrderItems with Product."""

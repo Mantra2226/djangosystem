@@ -10,7 +10,8 @@ from django.core.exceptions import ValidationError
 from .models import (
     Product, Inventory, WorkOrder, WorkOrderMaterialLine, WorkOrderInstruction,
     ProductionOrder, SalesOrder, SalesOrderItem, ProcurementOrder, PurchaseOrder,
-    DispatchRecord, SalesInvoice, FinanceEntry, MaterialVarianceRecord, StockTransaction, Supplier, Customer
+    DispatchRecord, SalesInvoice, FinanceEntry, MaterialVarianceRecord, StockTransaction,
+    Supplier, Customer, DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
 )
 
 
@@ -197,6 +198,7 @@ class SalesOrderSerializer(BaseSerializer):
             "order_number": obj.order_number,
             "customer_id": obj.customer_id,
             "customer_name": obj.customer.customer_name if obj.customer else "",
+            "invoicing_policy": obj.invoicing_policy,
             "status": obj.status,
             "created_at": obj.created_at.isoformat() if obj.created_at else None,
             "order_total": float(order_total),
@@ -206,6 +208,7 @@ class SalesOrderSerializer(BaseSerializer):
                     "product_id": item.product_id,
                     "product_name": item.product.name if item.product else "",
                     "quantity_ordered": float(item.quantity_ordered or 0.0),
+                    "unit_price": float(item.unit_price or 0.0),
                     "total_price": float(item.total_price or 0.0)
                 } for item in items
             ]
