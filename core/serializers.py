@@ -7,6 +7,7 @@ validation/deserialization for core ERP domain models.
 
 from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from .models import (
     Product, Inventory, WorkOrder, WorkOrderMaterialLine, WorkOrderInstruction,
     ProductionOrder, SalesOrder, SalesOrderItem, ProcurementOrder, PurchaseOrder,
@@ -186,7 +187,7 @@ class ProcurementOrderSerializer(BaseSerializer):
         }
 
 
-class SalesOrderSerializer(BaseSerializer):
+class LegacySalesOrderSerializer(BaseSerializer):
     """Serializes Customer Sales Orders and line items."""
 
     @classmethod
@@ -372,5 +373,191 @@ class WorkOrderDetailDRFSerializer(serializers.ModelSerializer):
             pct = (actual / target) * Decimal('100.00')
             return str(pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         return None
+
+
+# =============================================================================
+# SALES & BILLING SUBSYSTEM DRF SERIALIZERS (MILESTONE 3)
+# =============================================================================
+
+class SalesOrderItemSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesOrderItem lines.
+    Freezes unit_price from catalog if not explicitly specified.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    unit_price = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        min_value=Decimal('0.00')
+    )
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = SalesOrderItem
+        fields = [
+            'id', 'product', 'product_name', 'quantity_ordered',
+            'unit_price', 'total_price'
+        ]
+
+
+class SalesInvoiceLineSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesInvoiceLine items.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    tax_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    subtotal = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = SalesInvoiceLine
+        fields = [
+            'id', 'product', 'product_name', 'quantity', 'unit_price',
+            'tax_rate', 'tax_amount', 'subtotal', 'total_price'
+        ]
+
+
+class CreditNoteLineSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for CreditNoteLine items.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    tax_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    subtotal = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = CreditNoteLine
+        fields = [
+            'id', 'product', 'product_name', 'quantity', 'unit_price',
+            'tax_rate', 'tax_amount', 'subtotal', 'total_price'
+        ]
+
+
+class SalesInvoicePaymentPayloadSerializer(serializers.Serializer):
+    """
+    Validates payment collection payloads for sales invoices.
+    """
+    amount = serializers.DecimalField(
+        required=True,
+        min_value=Decimal('0.01'),
+        max_digits=12,
+        decimal_places=2
+    )
+    payment_method = serializers.ChoiceField(
+        choices=['CASH', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT_CARD', 'CARD', 'TRANSFER'],
+        default='BANK_TRANSFER'
+    )
+    reference = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=128,
+        default=''
+    )
+
+
+class CreditNoteCreatePayloadSerializer(serializers.Serializer):
+    """
+    Validates manual credit note creation payloads.
+    """
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=255,
+        default=''
+    )
+    lines = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list
+    )
+
+
+class SalesOrderSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesOrder instances with nested line items.
+    Supports atomic nested creation of lines with catalog price freezing.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    order_number = serializers.CharField(read_only=True)
+    customer_name = serializers.CharField(source='customer.customer_name', read_only=True)
+    order_date = serializers.SerializerMethodField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    total_amount = serializers.SerializerMethodField(read_only=True)
+    items = SalesOrderItemSerializer(many=True, required=False)
+
+    class Meta:
+        model = SalesOrder
+        fields = [
+            'id', 'order_number', 'customer', 'customer_name', 'order_date',
+            'status', 'invoicing_policy', 'total_amount', 'items'
+        ]
+
+    def get_order_date(self, obj):
+        return obj.created_at.date() if obj.created_at else None
+
+    def get_total_amount(self, obj):
+        items = obj.items.all()
+        return sum((item.total_price for item in items), Decimal('0.00'))
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        with transaction.atomic():
+            sales_order = SalesOrder.objects.create(**validated_data)
+            for item_data in items_data:
+                product = item_data.get('product')
+                quantity_ordered = item_data.get('quantity_ordered')
+                unit_price = item_data.get('unit_price')
+                if unit_price is None or unit_price == Decimal('0.00'):
+                    unit_price = product.selling_price if product and product.selling_price is not None else Decimal('0.00')
+                SalesOrderItem.objects.create(
+                    sales_order=sales_order,
+                    product=product,
+                    quantity_ordered=quantity_ordered,
+                    unit_price=unit_price
+                )
+            sales_order.update_status(save=True)
+        return sales_order
+
+
+class SalesInvoiceSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesInvoice instances with itemized lines.
+    """
+    id = serializers.IntegerField(source='invoice_id', read_only=True)
+    sales_order_number = serializers.CharField(source='sales_order.order_number', read_only=True, default='')
+    customer_name = serializers.CharField(source='customer.customer_name', read_only=True, default='')
+    lines = SalesInvoiceLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SalesInvoice
+        fields = [
+            'id', 'invoice_number', 'sales_order', 'sales_order_number',
+            'customer', 'customer_name', 'invoice_date', 'due_date',
+            'status', 'subtotal', 'tax_amount', 'total_amount', 'lines'
+        ]
+
+
+class CreditNoteSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for CreditNote instances with itemized lines.
+    """
+    id = serializers.IntegerField(source='credit_note_id', read_only=True)
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True, default='')
+    customer_name = serializers.CharField(source='customer.customer_name', read_only=True, default='')
+    lines = CreditNoteLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CreditNote
+        fields = [
+            'id', 'credit_note_number', 'invoice', 'invoice_number',
+            'customer', 'customer_name', 'issue_date', 'status',
+            'subtotal', 'tax_amount', 'total_amount', 'reason', 'lines'
+        ]
+
 
 

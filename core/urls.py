@@ -5,6 +5,9 @@ from core import views
 
 router = DefaultRouter()
 router.register(r'shopfloor/work-orders', views.WorkOrderViewSet, basename='shopfloor-workorder')
+router.register(r'sales/orders', views.SalesOrderViewSet, basename='sales-order')
+router.register(r'sales/invoices', views.SalesInvoiceViewSet, basename='sales-invoice')
+router.register(r'sales/credit-notes', views.CreditNoteViewSet, basename='credit-note')
 
 urlpatterns = [
     path('', RedirectView.as_view(url='login/')),
@@ -37,10 +40,6 @@ urlpatterns = [
     path('api/sales-orders/', views.api_sales_orders_list, name='api_sales_orders_list'),
     path('api/procurements/', views.api_procurement_orders_list, name='api_procurement_orders_list'),
 
-    # DRF Shop-Floor ViewSets
+    # DRF Shop-Floor & Sales/Billing ViewSets
     path('api/', include(router.urls)),
 ]
-
-
-
-
