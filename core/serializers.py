@@ -8,6 +8,7 @@ validation/deserialization for core ERP domain models.
 from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.utils import timezone
 from .models import (
     Product, Inventory, WorkOrder, WorkOrderMaterialLine, WorkOrderInstruction,
     ProductionOrder, SalesOrder, SalesOrderItem, ProcurementOrder, PurchaseOrder,
@@ -558,6 +559,95 @@ class CreditNoteSerializer(serializers.ModelSerializer):
             'customer', 'customer_name', 'issue_date', 'status',
             'subtotal', 'tax_amount', 'total_amount', 'reason', 'lines'
         ]
+
+
+class CustomerSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for Customer instances.
+    Exposes customer attributes and contact details.
+    """
+    id = serializers.IntegerField(source='customer_id', read_only=True)
+    name = serializers.CharField(source='customer_name', required=False)
+    email = serializers.SerializerMethodField()
+    phone_number = serializers.SerializerMethodField()
+    address = serializers.CharField(source='shipping_address', required=False)
+    created_at = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Customer
+        fields = [
+            'id', 'name', 'customer_name', 'email', 'phone_number',
+            'contact_info', 'address', 'shipping_address', 'created_at'
+        ]
+
+    def get_email(self, obj):
+        info = obj.contact_info or ''
+        if '@' in info:
+            return info
+        return ''
+
+    def get_phone_number(self, obj):
+        info = obj.contact_info or ''
+        if '@' not in info and info:
+            return info
+        return ''
+
+    def get_created_at(self, obj):
+        return None
+
+
+class BulkPaymentAllocationPayloadSerializer(serializers.Serializer):
+    """
+    Validates customer lump-sum bulk payment allocation request payloads.
+    """
+    amount = serializers.DecimalField(
+        required=True,
+        min_value=Decimal('0.01'),
+        max_digits=12,
+        decimal_places=2
+    )
+    payment_method = serializers.ChoiceField(
+        choices=['CASH', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT_CARD', 'CARD', 'TRANSFER'],
+        default='BANK_TRANSFER'
+    )
+    reference = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=128,
+        default=''
+    )
+    payment_date = serializers.DateField(
+        required=False,
+        default=timezone.now
+    )
+
+
+class InvoiceAllocationItemSerializer(serializers.Serializer):
+    """
+    Serializes individual invoice allocation slice in allocation preview and confirmation results.
+    """
+    invoice_id = serializers.IntegerField()
+    invoice_number = serializers.CharField()
+    invoice_date = serializers.DateField()
+    total_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    already_paid = serializers.DecimalField(max_digits=12, decimal_places=2)
+    balance_before = serializers.DecimalField(max_digits=12, decimal_places=2)
+    allocated_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    balance_after = serializers.DecimalField(max_digits=12, decimal_places=2)
+    projected_status = serializers.CharField()
+
+
+class BulkPaymentAllocationResponseSerializer(serializers.Serializer):
+    """
+    Serializes the aggregated response for customer bulk payment allocation (preview and atomic execution).
+    """
+    customer_id = serializers.IntegerField()
+    customer_name = serializers.CharField()
+    total_received = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_allocated = serializers.DecimalField(max_digits=12, decimal_places=2)
+    unallocated_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    allocations = InvoiceAllocationItemSerializer(many=True)
+
 
 
 

@@ -463,7 +463,11 @@ from .serializers import (
     SalesInvoiceSerializer,
     CreditNoteSerializer,
     SalesInvoicePaymentPayloadSerializer,
-    CreditNoteCreatePayloadSerializer
+    CreditNoteCreatePayloadSerializer,
+    CustomerSerializer,
+    BulkPaymentAllocationPayloadSerializer,
+    InvoiceAllocationItemSerializer,
+    BulkPaymentAllocationResponseSerializer
 )
 from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf
 
@@ -828,6 +832,162 @@ class CreditNoteViewSet(viewsets.ReadOnlyModelViewSet):
         response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
         response['Content-Disposition'] = f'inline; filename="CreditNote_{credit_note.credit_note_number}.pdf"'
         return response
+
+
+class CustomerViewSet(viewsets.ModelViewSet):
+    """
+    DRF ViewSet for Customer entities in the Sales & Billing subsystem.
+    Provides customer CRUD alongside FIFO bulk payment allocation preview and settlement.
+    """
+    queryset = Customer.objects.all().order_by('customer_id')
+    serializer_class = CustomerSerializer
+    permission_classes = [IsAuthenticated, IsSalesOrBillingStaff]
+
+    @action(detail=True, methods=['post'], url_path='preview-payment-allocation')
+    def preview_payment_allocation(self, request, pk=None):
+        """
+        Action A: Dry-run simulation of FIFO bulk payment distribution across open customer invoices.
+        Performs zero database mutations and returns projected allocations and statuses.
+        """
+        customer = self.get_object()
+        serializer = BulkPaymentAllocationPayloadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        total_received = serializer.validated_data['amount']
+        remaining_funds = total_received
+
+        open_invoices = customer.sales_invoices.filter(
+            status__in=['POSTED', 'PARTIALLY_PAID']
+        ).order_by('invoice_date', 'invoice_id')
+
+        allocations = []
+        total_allocated = Decimal('0.00')
+
+        for invoice in open_invoices:
+            already_paid = invoice.total_paid
+            balance_before = invoice.total_amount - already_paid
+            if balance_before <= Decimal('0.00'):
+                continue
+
+            allocated = min(remaining_funds, balance_before) if remaining_funds > Decimal('0.00') else Decimal('0.00')
+            if allocated > Decimal('0.00'):
+                balance_after = max(Decimal('0.00'), balance_before - allocated)
+                projected_status = 'PAID' if balance_after == Decimal('0.00') else 'PARTIALLY_PAID'
+                allocations.append({
+                    'invoice_id': invoice.invoice_id,
+                    'invoice_number': invoice.invoice_number,
+                    'invoice_date': invoice.invoice_date,
+                    'total_amount': invoice.total_amount,
+                    'already_paid': already_paid,
+                    'balance_before': balance_before,
+                    'allocated_amount': allocated,
+                    'balance_after': balance_after,
+                    'projected_status': projected_status,
+                })
+                total_allocated += allocated
+                remaining_funds -= allocated
+
+            if remaining_funds <= Decimal('0.00'):
+                break
+
+        unallocated_amount = max(Decimal('0.00'), total_received - total_allocated)
+        response_data = {
+            'customer_id': customer.customer_id,
+            'customer_name': customer.customer_name,
+            'total_received': total_received,
+            'total_allocated': total_allocated,
+            'unallocated_amount': unallocated_amount,
+            'allocations': allocations,
+        }
+        return Response(BulkPaymentAllocationResponseSerializer(response_data).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='allocate-payment')
+    def allocate_payment(self, request, pk=None):
+        """
+        Action B: Atomic execution of FIFO bulk payment distribution across open customer invoices.
+        Records SalesInvoicePayments, auto-updates invoice payment status, and posts GL revenue entries.
+        """
+        customer = self.get_object()
+        serializer = BulkPaymentAllocationPayloadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        total_received = serializer.validated_data['amount']
+        payment_method = serializer.validated_data.get('payment_method', 'BANK_TRANSFER')
+        reference = serializer.validated_data.get('reference', '')
+        remaining_funds = total_received
+
+        method_map = {
+            'BANK_TRANSFER': 'TRANSFER',
+            'CREDIT_CARD': 'CARD',
+            'CARD': 'CARD',
+            'TRANSFER': 'TRANSFER',
+            'CASH': 'CASH',
+            'CHEQUE': 'TRANSFER',
+        }
+        model_method = method_map.get(payment_method.upper(), payment_method)
+
+        allocations = []
+        total_allocated = Decimal('0.00')
+
+        try:
+            with transaction.atomic():
+                open_invoices = customer.sales_invoices.select_for_update().filter(
+                    status__in=['POSTED', 'PARTIALLY_PAID']
+                ).order_by('invoice_date', 'invoice_id')
+
+                for invoice in open_invoices:
+                    already_paid = invoice.total_paid
+                    balance_before = invoice.total_amount - already_paid
+                    if balance_before <= Decimal('0.00'):
+                        continue
+
+                    allocated = min(remaining_funds, balance_before)
+                    if allocated > Decimal('0.00'):
+                        ref = reference if reference else f"BULK-{invoice.invoice_number}"
+                        SalesInvoicePayments.objects.create(
+                            invoice=invoice,
+                            amount=allocated,
+                            payment_method=model_method,
+                            reference_number=ref
+                        )
+                        invoice.refresh_from_db()
+                        invoice.update_payment_status(save=True)
+                        balance_after = max(Decimal('0.00'), balance_before - allocated)
+                        allocations.append({
+                            'invoice_id': invoice.invoice_id,
+                            'invoice_number': invoice.invoice_number,
+                            'invoice_date': invoice.invoice_date,
+                            'total_amount': invoice.total_amount,
+                            'already_paid': already_paid,
+                            'balance_before': balance_before,
+                            'allocated_amount': allocated,
+                            'balance_after': balance_after,
+                            'projected_status': invoice.status,
+                        })
+                        total_allocated += allocated
+                        remaining_funds -= allocated
+
+                    if remaining_funds <= Decimal('0.00'):
+                        break
+
+            unallocated_amount = max(Decimal('0.00'), total_received - total_allocated)
+            response_data = {
+                'customer_id': customer.customer_id,
+                'customer_name': customer.customer_name,
+                'total_received': total_received,
+                'total_allocated': total_allocated,
+                'unallocated_amount': unallocated_amount,
+                'allocations': allocations,
+            }
+            return Response(BulkPaymentAllocationResponseSerializer(response_data).data, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 
 
 

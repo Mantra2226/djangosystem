@@ -1933,6 +1933,10 @@ class Customer(models.Model):
     contact_info = models.TextField()
     shipping_address = models.TextField()
 
+    @property
+    def invoices(self):
+        return self.sales_invoices
+
     def __str__(self):
         return self.customer_name
 
@@ -2436,6 +2440,10 @@ class SalesInvoice(models.Model):
                     'entry_date': entry_date
                 }
             )
+
+    @property
+    def payments(self):
+        return self.sales_payments
 
     @property
     def total_paid(self):

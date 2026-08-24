@@ -8,6 +8,7 @@ router.register(r'shopfloor/work-orders', views.WorkOrderViewSet, basename='shop
 router.register(r'sales/orders', views.SalesOrderViewSet, basename='sales-order')
 router.register(r'sales/invoices', views.SalesInvoiceViewSet, basename='sales-invoice')
 router.register(r'sales/credit-notes', views.CreditNoteViewSet, basename='credit-note')
+router.register(r'sales/customers', views.CustomerViewSet, basename='sales-customer')
 
 urlpatterns = [
     path('', RedirectView.as_view(url='login/')),
