@@ -1,55 +1,46 @@
-from django.urls import path, reverse
-from django.shortcuts import get_object_or_404, redirect
-from django.http import HttpResponseRedirect
-from django.core.exceptions import ValidationError, ObjectDoesNotExist, PermissionDenied
-from django.utils.safestring import mark_safe
-from django.contrib import admin, messages
-from django.utils.html import format_html
-import json
-from django.core.serializers.json import DjangoJSONEncoder
+"""
+DJANGO UNFOLD ADMIN CONFIGURATION (core/admin.py)
+
+Glass Putty Manufacturing ERP - Manufacturing Command Center
+Provides enterprise Tailwind-based administrative interface with real-time KPI integration,
+tabbed fieldset navigation, comprehensive autocomplete lookup graph, native action buttons,
+and role-based lifecycle immutability guards.
+"""
+
+from decimal import Decimal
+import io
+
 from django import forms
+from django.contrib import admin, messages
+from django.core.exceptions import ValidationError, ObjectDoesNotExist, PermissionDenied
+from django.http import HttpResponse, HttpResponseRedirect
+from django.shortcuts import get_object_or_404, redirect
+from django.urls import path, reverse
+from django.utils import timezone
+from django.utils.html import format_html
+from django.utils.safestring import mark_safe
+
+from unfold.admin import ModelAdmin, TabularInline, StackedInline
+from unfold.contrib.filters.admin import RangeDateFilter, RangeNumericFilter, SingleNumericFilter, MultipleRelatedDropdownFilter
+from unfold.decorators import display, action
+
 from .models import (
     PurchaseInvoice, Supplier, Product, PurchaseOrder, PurchaseOrderItem, ProcurementOrder, Inventory,
-    StockTransaction, Employee, ProductionOrder, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
+    StockTransaction, Employee, ProductionOrder, ProductionOrderItem, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
     SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction,
     BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine,
     DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
 )
-from decimal import Decimal
 from .forms import WorkOrderForm
+from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf
 
-admin.register(Supplier)
-admin.register(Product)
-admin.register(PurchaseOrder)
-admin.register(PurchaseOrderItem)
-admin.register(ProcurementOrder)
-admin.register(Inventory) 
-admin.register(StockTransaction)  
-admin.register(Employee)
-admin.register(ProductionOrder)
-admin.register(Customer)
-admin.register(SalesOrder)
-admin.register(SalesOrderItem)
-admin.register(DispatchRecord)
-admin.register(SalesInvoicePayments)
-admin.register(PurchaseInvoice) 
-admin.register(PurchasePayment)
-admin.register(Return)
-admin.register(FinanceEntry)
-admin.register(WorkOrder)
-admin.register(WorkOrderInstruction)
-admin.register(BillOfMaterial)
-admin.register(WorkOrderMaterialLine)
-admin.register(BOMItem)
 
 def export_as_csv(modeladmin, request, queryset):
     """
-    GENERIC ADMIN ACTION:
-    Exports selected records from any Django Admin changelist view into a downloadable CSV file.
-    Extracts model field values dynamically and sanitizes output formatting.
+    Exports selected records from any changelist view into a downloadable CSV file.
+    Extracts model field values dynamically.
     """
     import csv
-    from django.http import HttpResponse
 
     opts = modeladmin.model._meta
     response = HttpResponse(content_type='text/csv')
@@ -72,10 +63,15 @@ def export_as_csv(modeladmin, request, queryset):
         writer.writerow(row)
     return response
 
+
 export_as_csv.short_description = "Export Selected Records to CSV"
 
-# Register your models here.
-class WorkOrderInstructionInline(admin.TabularInline):
+
+# =============================================================================
+# INLINE ADMIN DEFINITIONS
+# =============================================================================
+
+class WorkOrderInstructionInline(TabularInline):
     model = WorkOrderInstruction
     extra = 0
     fields = ('step_number', 'step_name', 'machine', 'instruction_text', 'estimated_time_minutes', 'status')
@@ -83,29 +79,28 @@ class WorkOrderInstructionInline(admin.TabularInline):
     readonly_fields = ['step_number']
 
     def get_readonly_fields(self, request, obj=None):
-        if obj is None or obj.status in ['DRAFT', 'AWAITING_RESOLUTION', 'ON_HOLD_SHORTAGE']:
-            return ['step_number', 'status']
         return self.readonly_fields
 
-class BOMItemInline(admin.TabularInline):
+
+class BOMItemInline(TabularInline):
     model = BOMItem
-    extra = 1  
+    extra = 1
     fk_name = 'bom'
     fields = ['component', 'quantity_required']
-    # Use autocomplete if your product catalog contains hundreds of items
-    autocomplete_fields = ['component']    
+    autocomplete_fields = ['component']
 
-class WorkOrderMaterialLineInline(admin.TabularInline):
+
+class WorkOrderMaterialLineInline(TabularInline):
     model = WorkOrderMaterialLine
-    extra = 0  # Don't show empty lines by default
+    extra = 0
     fields = ('component', 'quantity_expected', 'quantity_actual')
     readonly_fields = ('quantity_expected',)
+    autocomplete_fields = ['component']
 
-class ChildPackagingInline(admin.TabularInline):
+
+class ChildPackagingInline(TabularInline):
     """
     Inline UI for auditing Stage 2 child packaging work orders linked to a Stage 1 parent bulk order.
-    Enables shop floor operators and managers to track downstream packaging runs without manually
-    altering system-calculated parent-child relationships.
     """
     model = WorkOrder
     fk_name = 'parent_work_order'
@@ -114,44 +109,45 @@ class ChildPackagingInline(admin.TabularInline):
     extra = 0
     can_delete = False
     fields = ('work_order_code', 'product', 'status', 'quantity_produced', 'production_start_date')
-    readonly_fields = ('work_order_code', 'product', 'status', 'quantity_produced', 'production_start_date')  
+    readonly_fields = ('work_order_code', 'product', 'status', 'quantity_produced', 'production_start_date')
+    autocomplete_fields = ['product']
 
-class SalesInvoicePaymentsInline(admin.TabularInline):
+
+class SalesInvoicePaymentsInline(TabularInline):
     model = SalesInvoicePayments
-    extra = 1  
-    fields = ('amount', 'payment_method', 'paid_at', 'reference_number')   
+    extra = 1
+    fields = ('amount', 'payment_method', 'paid_at', 'reference_number')
     readonly_fields = ['paid_at']
 
-class DispatchRecordInline(admin.TabularInline):
+
+class DispatchRecordInline(TabularInline):
     """
     Displays a read-only shipping history directly inside the Sales Order page.
-    This gives sales rep a view of order fulfillment!
     """
     model = DispatchRecord
     extra = 0
-    fields = ('dispatch_number',  'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date')
-    readonly_fields = ('dispatch_number', 'product', 'quantity_dispatched', 'dispatch_date')
-    can_delete = False  # Shipments shouldn't be casually deleted from the order screen
+    fields = ('dispatch_code', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date')
+    readonly_fields = ('dispatch_code', 'product', 'quantity_dispatched', 'dispatch_date')
+    can_delete = False
 
     def has_add_permission(self, request, obj=None):
-        # Dispatches can only be created on their own dedicated Dispatch page, not accidentally added from the Sales Order interface.
-        return False   
-     
-class SalesOrderItemInline(admin.TabularInline):
+        return False
+
+
+class SalesOrderItemInline(TabularInline):
     model = SalesOrderItem
-    inlines = [DispatchRecordInline]
     extra = 1
     fields = ('product', 'quantity_ordered', 'quantity_dispatched', 'get_unit_price', 'get_total_price')
-    search_fields = ['product__name']
     readonly_fields = ('quantity_dispatched', 'get_unit_price', 'get_total_price')
+    autocomplete_fields = ['product']
 
-    @admin.display(description='Catalog Unit Price')
+    @display(description='Catalog Unit Price')
     def get_unit_price(self, obj):
         if obj.unit_price is not None:
             return f"${obj.unit_price:,.2f}"
         return "$0.00"
 
-    @admin.display(description='Line Total')
+    @display(description='Line Total')
     def get_total_price(self, obj):
         if obj.total_price:
             return f"${obj.total_price:,.2f}"
@@ -171,100 +167,175 @@ class SalesOrderItemInline(admin.TabularInline):
         if obj and obj.status != 'draft' and not request.user.is_superuser:
             return False
         return super().has_delete_permission(request, obj)
-class PurchasePaymentInline(admin.TabularInline):
+
+
+class SalesInvoiceLineInline(TabularInline):
+    model = SalesInvoiceLine
+    extra = 0
+    fields = ('product', 'quantity', 'unit_price', 'tax_rate', 'subtotal', 'tax_amount', 'total_price')
+    readonly_fields = ('subtotal', 'tax_amount', 'total_price')
+    autocomplete_fields = ['product']
+
+    def has_add_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_delete_permission(request, obj)
+
+
+class CreditNoteLineInline(TabularInline):
+    model = CreditNoteLine
+    extra = 0
+    fields = ('product', 'quantity', 'unit_price', 'tax_rate', 'subtotal', 'tax_amount', 'total_price')
+    readonly_fields = ('subtotal', 'tax_amount', 'total_price')
+    autocomplete_fields = ['product']
+
+    def has_add_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
+            return False
+        return super().has_delete_permission(request, obj)
+
+
+class PurchasePaymentInline(TabularInline):
     model = PurchasePayment
     extra = 1
-    fields =  ('amount', 'payment_method', 'paid_at', 'reference_number') 
+    fields = ('amount', 'payment_method', 'paid_at', 'reference_number')
     readonly_fields = ['paid_at']
 
-class PurchaseOrderItemInline(admin.TabularInline):
+
+class PurchaseOrderItemInline(TabularInline):
     model = PurchaseOrderItem
-    extra = 1  # Shows one empty row by default to quickly add items
+    extra = 1
     fields = ('product', 'quantity_ordered', 'quantity_received', 'price_per_unit', 'get_total')
     readonly_fields = ('get_total', 'quantity_received', 'price_per_unit')
+    autocomplete_fields = ['product']
 
+    @display(description='Total Cost')
     def get_total(self, obj):
         if obj.pk:
             return f"${obj.total_price:.2f}"
         return "$0.00"
-    get_total.short_description = "Total Cost"    
 
-class ProcurementOrderForm(forms.ModelForm):
-    class Meta:
-        model = ProcurementOrder
-        fields = '__all__'
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+# =============================================================================
+# MODEL ADMIN DEFINITIONS (UNFOLD)
+# =============================================================================
 
-        # Check if a purchase order is selected in POST data or existing instance
-        po_id = None
-        if self.data and self.data.get('purchase_order'):
-            po_id = self.data.get('purchase_order')
-        elif self.instance and self.instance.purchase_order_id:
-            po_id = self.instance.purchase_order_id
-
-        # Filters the 'product' field choices to match the Purchase Order's items
-        if po_id:
-            po = PurchaseOrder.objects.filter(pk=po_id).first()
-            if po:
-                valid_product_ids = po.items.values_list('product_id', flat=True)
-                self.fields['product'].queryset = Product.objects.filter(pk__in=valid_product_ids)    
-  
 @admin.register(Supplier)
-class SupplierAdmin(admin.ModelAdmin):
+class SupplierAdmin(ModelAdmin):
     list_display = ('name', 'supplier_id', 'contact_info')
-    search_fields = ('name', 'supplier_id','contact_info')
+    search_fields = ('name', 'supplier_id', 'contact_info')
+
+
+@admin.register(Product)
+class ProductAdmin(ModelAdmin):
+    list_display = ('sku', 'name', 'product_type_badge', 'supplier', 'get_selling_price')
+    list_filter = ['product_type', 'supplier']
+    search_fields = ('sku', 'name', 'category', 'supplier__name')
+    readonly_fields = ('sku',)
+    autocomplete_fields = ['supplier']
+
+    @display(description='Product Type', label=True)
+    def product_type_badge(self, obj):
+        color_map = {
+            'FINISHED': 'success',
+            'RAW': 'info',
+            'PACKAGING': 'warning',
+            'INTERMEDIATE': 'primary',
+        }
+        color = color_map.get(obj.product_type, 'default')
+        return obj.get_product_type_display(), color
+
+    @display(description='Selling Price')
+    def get_selling_price(self, obj):
+        if obj.selling_price is not None:
+            return f"${obj.selling_price:,.2f}"
+        return "-"
+
 
 @admin.register(Inventory)
-class InventoryAdmin(admin.ModelAdmin):
+class InventoryAdmin(ModelAdmin):
     list_display = ('product', 'quantity_available', 'quantity_allocated', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
-    list_filter = ['location', 'last_updated', 'quantity_available', 'quantity_allocated']
+    list_filter = ['location', ('last_updated', RangeDateFilter), ('quantity_available', RangeNumericFilter)]
     search_fields = ('product__name', 'product__sku', 'location')
-    readonly_fields = ['get_total_valuation', 'quantity_allocated']  
-    autocomplete_fields = ['product']  # Enables searching products
+    readonly_fields = ['get_total_valuation', 'quantity_allocated']
+    autocomplete_fields = ['product']
     actions = [export_as_csv]
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Product and Product Supplier."""
         return super().get_queryset(request).select_related('product', 'product__supplier')
 
-    @admin.display(description='Avg Unit Cost')
+    @display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
         return f"${obj.unit_cost:,.2f}"
 
-    @admin.display(description='Total Valuation')
+    @display(description='Total Valuation')
     def get_total_valuation(self, obj):
         return f"${obj.total_valuation:,.2f}"
 
+
 @admin.register(StockTransaction)
-class StockTransactionAdmin(admin.ModelAdmin):
-    list_display = ('product', 'quantity', 'transaction_type', 'get_work_order_code', 'created_at')
-    list_filter = ('transaction_type', 'created_at')
+class StockTransactionAdmin(ModelAdmin):
+    list_display = ('product', 'quantity', 'transaction_type_badge', 'get_work_order_code', 'created_at')
+    list_filter = ['transaction_type', ('created_at', RangeDateFilter)]
     search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('created_at', 'work_order', 'get_work_order_code', 'dispatch_record')
+    autocomplete_fields = ['product', 'work_order', 'dispatch_record']
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Product and WorkOrder."""
         return super().get_queryset(request).select_related('product', 'work_order')
 
-    @admin.display(description='Work Order')
+    @display(description='Transaction Type', label=True)
+    def transaction_type_badge(self, obj):
+        color_map = {
+            'INITIAL_STOCK': 'info',
+            'PURCHASE_RECEIPT': 'success',
+            'PRODUCTION_CONSUMPTION': 'danger',
+            'PRODUCTION_OUTPUT': 'success',
+            'DISPATCH': 'warning',
+            'CUSTOMER_RETURN': 'info',
+            'ADJUSTMENT_IN': 'success',
+            'ADJUSTMENT_OUT': 'danger',
+        }
+        color = color_map.get(obj.transaction_type, 'default')
+        return obj.get_transaction_type_display(), color
+
+    @display(description='Work Order')
     def get_work_order_code(self, obj):
         if obj.work_order and obj.work_order.work_order_code:
             return obj.work_order.work_order_code
         elif obj.work_order_id:
             return f"WO-{obj.work_order_id}"
         return "-"
-    
-    # Prevents anyone from manually editing transaction logs to maintain audit integrity
+
     def has_add_permission(self, request):
-        return True # Allowed to add manual adjustments if needed
-        
+        return True
+
     def has_change_permission(self, request, obj=None):
-        return False # Locked!past records cannot be modified
-        
+        return False
+
     def has_delete_permission(self, request, obj=None):
-        return False # Locked    
+        return False
+
 
 class ProductionOrderAdminForm(forms.ModelForm):
     class Meta:
@@ -277,26 +348,192 @@ class ProductionOrderAdminForm(forms.ModelForm):
             self.fields['work_order'].required = False
             self.fields['work_order'].help_text = (
                 "Optional: Select the Work Order blueprint for this production run. "
-                "If unlinked, remember to link a Work Order later to enable recipe and material tracking."
+                "Only active (uncompleted) Work Orders can be linked to newly created production orders."
             )
-            # If editing an existing Production Order, filter the Work Order choices to only show those for this specific product.
+            base_qs = WorkOrder.objects.all()
             if self.instance and getattr(self.instance, 'product_id', None):
-                self.fields['work_order'].queryset = WorkOrder.objects.filter(
-                    product=self.instance.product
+                base_qs = base_qs.filter(product=self.instance.product)
+            self.fields['work_order'].queryset = base_qs
+
+    def clean_work_order(self):
+        wo = self.cleaned_data.get('work_order')
+        if wo:
+            is_new = not self.instance or not self.instance.pk
+            orig_wo_id = None
+            if not is_new and self.instance.pk:
+                orig_wo_id = ProductionOrder.objects.filter(pk=self.instance.pk).values_list('work_order_id', flat=True).first()
+
+            if (is_new or orig_wo_id != wo.pk) and (wo.status or '').upper().strip() == 'COMPLETED':
+                raise forms.ValidationError(
+                    f"Work Order '{wo.work_order_code or wo.pk}' cannot be linked because it is already COMPLETED. "
+                    f"Completed work orders cannot be linked to newly created or reassigned production orders "
+                    f"to prevent status mismatch between Blueprint Live Specifications and the production order."
                 )
+        return wo
+
+
+class ProductionOrderItemInline(TabularInline):
+    model = ProductionOrderItem
+    extra = 0
+    can_delete = False
+    fields = (
+        'raw_material',
+        'planned_quantity',
+        'shortage_quantity',
+        'resolution_status_badge',
+        'linked_po_link',
+        'resolution_notes',
+        'resolved_by',
+        'resolved_at',
+        'action_links',
+    )
+    readonly_fields = (
+        'raw_material',
+        'planned_quantity',
+        'shortage_quantity',
+        'resolution_status_badge',
+        'linked_po_link',
+        'resolution_notes',
+        'resolved_by',
+        'resolved_at',
+        'action_links',
+    )
+
+    @display(description='Resolution Status', label=True)
+    def resolution_status_badge(self, obj):
+        color_map = {
+            'NO_SHORTAGE': 'success',
+            'UNRESOLVED': 'danger',
+            'PO_DRAFTED': 'warning',
+            'OVERRIDDEN': 'info',
+            'DOWNSCALED': 'info',
+            'RESOLVED': 'success',
+        }
+        color = color_map.get(obj.resolution_status, 'default')
+        return obj.get_resolution_status_display(), color
+
+    @display(description='Linked PO')
+    def linked_po_link(self, obj):
+        if obj.linked_purchase_order:
+            po = obj.linked_purchase_order
+            url = reverse('admin:core_purchaseorder_change', args=[po.pk])
+            return format_html('<a href="{}" class="text-primary-600 font-semibold underline">{}</a>', url, po.po_number or f"PO #{po.pk}")
+        return "-"
+
+    @display(description='Resolution Actions')
+    def action_links(self, obj):
+        if not obj or not obj.pk:
+            return "-"
+        if obj.resolution_status == 'UNRESOLVED':
+            po_url = reverse('admin:core_productionorder_resolve_item_po', args=[obj.pk])
+            override_url = reverse('admin:core_productionorder_resolve_item_override', args=[obj.pk])
+            return format_html(
+                '<div style="display: flex; gap: 6px;">'
+                '<a href="{}" class="inline-flex items-center px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded shadow-sm">Draft PO</a>'
+                '<a href="{}" class="inline-flex items-center px-2 py-1 bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold rounded shadow-sm">Override</a>'
+                '</div>',
+                po_url,
+                override_url
+            )
+        return format_html('<span class="text-xs text-gray-500 font-medium">{}</span>', obj.get_resolution_status_display())
+
+
+@admin.register(ProductionOrderItem)
+class ProductionOrderItemAdmin(ModelAdmin):
+    list_display = ('raw_material', 'production_order', 'planned_quantity', 'shortage_quantity', 'resolution_status_badge', 'linked_purchase_order', 'resolved_at')
+    list_filter = ['resolution_status', 'created_at']
+    search_fields = ('raw_material__name', 'production_order__production_order_code', 'linked_purchase_order__po_number')
+    readonly_fields = ('raw_material', 'production_order', 'planned_quantity', 'shortage_quantity', 'resolution_status', 'linked_purchase_order', 'resolution_notes', 'resolved_by', 'resolved_at', 'created_at', 'updated_at')
+    actions = ['action_resolve_item_po', 'action_resolve_item_override']
+
+    @display(description='Status', label=True)
+    def resolution_status_badge(self, obj):
+        color_map = {
+            'NO_SHORTAGE': 'success',
+            'UNRESOLVED': 'danger',
+            'PO_DRAFTED': 'warning',
+            'OVERRIDDEN': 'info',
+            'DOWNSCALED': 'info',
+            'RESOLVED': 'success',
+        }
+        color = color_map.get(obj.resolution_status, 'default')
+        return obj.get_resolution_status_display(), color
+
+    @admin.action(description="Resolve Shortage: Auto-Draft PO")
+    def action_resolve_item_po(self, request, queryset):
+        count = 0
+        for item in queryset:
+            item.resolve_with_po()
+            count += 1
+        self.message_user(request, f"Successfully auto-drafted POs for {count} item(s).", level=messages.SUCCESS)
+
+    @admin.action(description="Resolve Shortage: Authorize Override")
+    def action_resolve_item_override(self, request, queryset):
+        count = 0
+        for item in queryset:
+            item.resolve_with_override(user=request.user, notes=f"Authorized override by {request.user.username}")
+            count += 1
+        self.message_user(request, f"Successfully authorized override for {count} item(s).", level=messages.SUCCESS)
+
 
 @admin.register(ProductionOrder)
-class ProductionOrderAdmin(admin.ModelAdmin):
+class ProductionOrderAdmin(ModelAdmin):
     form = ProductionOrderAdminForm
-    list_display = ('production_order_code', 'product', 'work_order', 'quantity', 'status', 'get_unit_cost', 'created_at')
-    list_filter = ['status', 'created_at']
-    search_fields = ('production_order_code', 'work_order__work_order_code', 'work_order__work_order_id', 'employee__employee_name', 'product__name')  
-    filter_horizontal = ('employee',)  # For ManyToManyField, use a horizontal filter widget 
-    readonly_fields = ['production_order_code', 'status', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
+    inlines = [ProductionOrderItemInline]
+    list_display = ('production_order_code', 'product', 'work_order', 'quantity', 'status_badge', 'mrp_status_badge', 'get_unit_cost', 'created_at')
+    list_filter = ['status', ('created_at', RangeDateFilter)]
+    search_fields = ('production_order_code', 'work_order__work_order_code', 'employee__employee_name', 'product__name')
+    filter_horizontal = ('employee',)
+    readonly_fields = ['production_order_code', 'status', 'is_mrp_resolved', 'resolution_applied', 'resolved_at', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
+    autocomplete_fields = ['product', 'work_order']
     actions = [export_as_csv, 'trigger_mrp_auto_resume']
+    actions_detail = ['action_trigger_mrp_resume', 'action_evaluate_mrp_button']
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path('resolve-item-po/<int:item_id>/', self.admin_site.admin_view(self.resolve_item_po_view), name='core_productionorder_resolve_item_po'),
+            path('resolve-item-override/<int:item_id>/', self.admin_site.admin_view(self.resolve_item_override_view), name='core_productionorder_resolve_item_override'),
+            path('evaluate-mrp/<int:object_id>/', self.admin_site.admin_view(self.evaluate_mrp_view), name='core_productionorder_evaluate_mrp'),
+        ]
+        return custom_urls + urls
+
+    def resolve_item_po_view(self, request, item_id):
+        item = get_object_or_404(ProductionOrderItem, pk=item_id)
+        po = item.production_order
+        item.resolve_with_po()
+        self.message_user(
+            request,
+            f"Auto-drafted Purchase Order #{item.linked_purchase_order.po_number or item.linked_purchase_order.pk} for {item.raw_material.name}.",
+            level=messages.SUCCESS
+        )
+        if item.linked_purchase_order:
+            return redirect(reverse('admin:core_purchaseorder_change', args=[item.linked_purchase_order.pk]))
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def resolve_item_override_view(self, request, item_id):
+        item = get_object_or_404(ProductionOrderItem, pk=item_id)
+        po = item.production_order
+        notes = request.GET.get('notes') or request.POST.get('notes') or f"Authorized override by {request.user.username}"
+        item.resolve_with_override(user=request.user, notes=notes)
+        self.message_user(
+            request,
+            f"Authorized shortage override for {item.raw_material.name}.",
+            level=messages.SUCCESS
+        )
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def evaluate_mrp_view(self, request, object_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        po.evaluate_mrp()
+        self.message_user(request, f"Evaluated MRP shortages for {po.production_order_code or po.pk}.", level=messages.SUCCESS)
+        return redirect(reverse('admin:core_productionorder_change', args=[object_id]))
+
+    @action(description="Evaluate Granular MRP Shortages", url_path="evaluate-mrp")
+    def action_evaluate_mrp_button(self, request, object_id):
+        return self.evaluate_mrp_view(request, object_id)
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly loads Product and WorkOrder."""
         return super().get_queryset(request).select_related('product', 'work_order')
 
     def save_model(self, request, obj, form, change):
@@ -304,9 +541,41 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         if not obj.work_order_id:
             messages.warning(
                 request,
-                f"Reminder: Production Order '{obj.production_order_code or obj.pk}' was saved without a linked Work Order. "
-                f"Please link a Work Order blueprint when ready to sync specifications and inventory tracking."
+                f"Reminder: Production Order '{obj.production_order_code or obj.pk}' was saved without a linked Work Order."
             )
+
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'DRAFT': 'default',
+            'IN_PROGRESS': 'info',
+            'COMPLETED': 'success',
+            'CANCELLED': 'danger',
+            'ON_HOLD_SHORTAGE': 'danger',
+            'PARTIALLY_RESOLVED': 'warning',
+            'MRP_RESOLVED': 'success',
+            'AWAITING_RESOLUTION': 'warning',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+    @display(description='MRP Resolution', label=True)
+    def mrp_status_badge(self, obj):
+        if obj.is_mrp_resolved or (obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']):
+            applied = obj.resolution_applied or "RESOLVED"
+            return f"LOCKED ({applied})", "success"
+        if obj.status == 'PARTIALLY_RESOLVED':
+            return "PARTIALLY RESOLVED", "warning"
+        if obj.status == 'MRP_RESOLVED':
+            return "RESOLVED / READY", "success"
+        return "PENDING EVALUATION", "warning"
+
+    @action(description="Check Stock & Auto-Resume Order", url_path="mrp-auto-resume")
+    def action_trigger_mrp_resume(self, request, object_id):
+        from .services import check_and_auto_resume_on_hold_orders
+        resumed = check_and_auto_resume_on_hold_orders()
+        self.message_user(request, f"MRP evaluation complete. Auto-resumed {len(resumed)} order(s).", level=messages.SUCCESS)
+        return redirect(reverse('admin:core_productionorder_change', args=[object_id]))
 
     @admin.action(description="Check Stock & Auto-Resume On-Hold Orders")
     def trigger_mrp_auto_resume(self, request, queryset):
@@ -314,20 +583,35 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         resumed = check_and_auto_resume_on_hold_orders()
         self.message_user(request, f"MRP evaluation complete. Auto-resumed {len(resumed)} order(s).")
 
-    @admin.display(description='Batch Unit Cost')
+    @display(description='Product')
+    def get_product(self, obj):
+        return obj.product.name if obj.product else 'N/A'
+
+    @display(description='Quantity')
+    def get_quantity(self, obj):
+        if obj.work_order_id:
+            try:
+                wo = obj.work_order
+                if wo:
+                    return getattr(wo, 'actual_quantity_produced', getattr(wo, 'quantity_produced', getattr(wo, 'quantity', '0.00')))
+            except ObjectDoesNotExist:
+                pass
+        return obj.quantity or "0.00"
+
+    @display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
         return f"${obj.unit_cost:,.2f}"
-    
+
     fieldsets = (
-       ('Order Information', {
+        ('Order Information', {
             'fields': ('production_order_code', 'product', 'work_order', 'quantity', 'status')
         }),
         ('MRP Shortage Resolution Pathways', {
-            'fields': ('mrp_resolution_pathways_viewer',),
+            'fields': ('is_mrp_resolved', 'resolution_applied', 'resolved_at', 'mrp_resolution_pathways_viewer'),
         }),
         ('System Details (Read Only)', {
+            'classes': ('collapse',),
             'fields': ('work_order_details_viewer', 'created_at', 'completed_at'),
-            'classes': ('collapse',), # Collapses this section by default to keep screen clean
         }),
     )
 
@@ -335,10 +619,22 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         if not obj or not obj.pk:
             return "Save record to evaluate MRP shortages."
 
+        if obj.is_mrp_resolved or (obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']):
+            resolved_time = obj.resolved_at.strftime('%Y-%m-%d %H:%M') if obj.resolved_at else "Run Commencement"
+            pathway_text = obj.resolution_applied or "INITIAL_STOCK_ALLOCATION"
+            return format_html(
+                "<div style='padding: 12px 16px; background: #f0fdf4; border-left: 4px solid #16a34a; color: #166534; border-radius: 4px;'>"
+                "<strong>MRP Resolution Locked:</strong> Pathway <code>{}</code> applied at {}. "
+                "Production run is active/completed and MRP shortage recalculation is frozen."
+                "</div>",
+                pathway_text,
+                resolved_time
+            )
+
         if not obj.work_order_id:
             return format_html(
                 "<div style='padding: 10px; background: #fff8e1; border-left: 4px solid #f57f17; color: #795548; border-radius: 4px;'>"
-                "ℹ <strong>No Work Order Linked:</strong> Link a Work Order to this Production Order to evaluate BOM recipe requirements and check inventory shortage pathways."
+                "<strong>No Work Order Linked:</strong> Link a Work Order to evaluate recipe requirements and shortage pathways."
                 "</div>"
             )
 
@@ -350,7 +646,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
 
         shortage_items = [r for r in report if r['has_shortage']]
         if not shortage_items:
-            return mark_safe("<div style='padding: 10px; background: #e8f8f5; border-left: 4px solid #2ecc71; color: #27ae60; border-radius: 4px;'><strong>✓ All Stock Satisfied:</strong> All component inventory levels meet or exceed batch requirements.</div>")
+            return mark_safe("<div style='padding: 10px; background: #e8f8f5; border-left: 4px solid #2ecc71; color: #27ae60; border-radius: 4px;'><strong>All Stock Satisfied:</strong> All component inventory levels meet or exceed batch requirements.</div>")
 
         cards_html = []
         for item in shortage_items:
@@ -368,33 +664,25 @@ class ProductionOrderAdmin(admin.ModelAdmin):
                     <strong style="color: #2b6cb0;">Tailored Resolution Pathways (Raw Material):</strong>
                     <div style="margin-top: 6px; display: grid; gap: 8px;">
                         <div style="background: #ebf8ff; padding: 8px; border-radius: 4px; border-left: 3px solid #3182ce;">
-                            <strong>Option 1: Auto-Draft PO</strong> — Append {shortfall:.2f} units to an open DRAFT Purchase Order for supplier <em>{supplier_name}</em>.
-                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
-                                <input type="hidden" name="production_order_id" value="{obj.pk}">
-                                <input type="hidden" name="component_id" value="{comp.pk}">
-                                <input type="hidden" name="shortfall_qty" value="{shortfall}">
-                                <input type="hidden" name="resolution_action" value="raw_autodraft_po">
-                                <button type="submit" style="background: #3182ce; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 1: Auto-Draft PO</button>
-                            </form>
+                            <div><strong>Option 1: Auto-Draft Purchase Order</strong> - Append {shortfall:.2f} units to an open DRAFT Purchase Order for supplier <em>{supplier_name}</em> and open for review.</div>
+                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&shortfall_qty={shortfall}&resolution_action=raw_autodraft_po"
+                               style="display: inline-block; margin-top: 6px; background: #2563eb; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
+                                Execute Option 1: Auto-Draft &amp; Open Purchase Order
+                            </a>
                         </div>
                         <div style="background: #feebc8; padding: 8px; border-radius: 4px; border-left: 3px solid #dd6b20;">
-                            <strong>Option 2: Direct Procurement</strong> — Spawn a Fast-Track Procurement Order (PENDING status).
-                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
-                                <input type="hidden" name="production_order_id" value="{obj.pk}">
-                                <input type="hidden" name="component_id" value="{comp.pk}">
-                                <input type="hidden" name="shortfall_qty" value="{shortfall}">
-                                <input type="hidden" name="resolution_action" value="raw_direct_procurement">
-                                <button type="submit" style="background: #dd6b20; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 2: Direct Procurement</button>
-                            </form>
+                            <div><strong>Option 2: Direct Procurement</strong> - Spawn a Fast-Track Procurement Order and open for review.</div>
+                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&shortfall_qty={shortfall}&resolution_action=raw_direct_procurement"
+                               style="display: inline-block; margin-top: 6px; background: #d97706; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
+                                Execute Option 2: Spawn &amp; Open Procurement Order
+                            </a>
                         </div>
                         <div style="background: #edf2f7; padding: 8px; border-radius: 4px; border-left: 3px solid #718096;">
-                            <strong>Option 3: Hold for Inbound Stock</strong> — Maintain ON_HOLD status to consume stock from in-transit POs (In-Transit Qty: {item['inbound_po_qty']:.2f}).
-                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
-                                <input type="hidden" name="production_order_id" value="{obj.pk}">
-                                <input type="hidden" name="component_id" value="{comp.pk}">
-                                <input type="hidden" name="resolution_action" value="raw_hold_inbound">
-                                <button type="submit" style="background: #718096; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: font-size: 11px;">Execute Option 3: Hold for Inbound POs</button>
-                            </form>
+                            <div><strong>Option 3: Hold for Inbound Stock</strong> - Maintain ON_HOLD status (In-Transit Qty: {item['inbound_po_qty']:.2f}).</div>
+                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&resolution_action=raw_hold_inbound"
+                               style="display: inline-block; margin-top: 6px; background: #4b5563; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
+                                Execute Option 3: Hold for Inbound POs
+                            </a>
                         </div>
                     </div>
                 </div>
@@ -406,33 +694,25 @@ class ProductionOrderAdmin(admin.ModelAdmin):
                     <strong style="color: #6b46c1;">Tailored Resolution Pathways (Sub-Assembly / Intermediate Good):</strong>
                     <div style="margin-top: 6px; display: grid; gap: 8px;">
                         <div style="background: #faf5ff; padding: 8px; border-radius: 4px; border-left: 3px solid #805ad5;">
-                            <strong>Option 1: Build Sub-Assembly</strong> — Spawn a child Work Order & Production Run for {shortfall:.2f} units of {comp.name}.
-                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
-                                <input type="hidden" name="production_order_id" value="{obj.pk}">
-                                <input type="hidden" name="component_id" value="{comp.pk}">
-                                <input type="hidden" name="shortfall_qty" value="{shortfall}">
-                                <input type="hidden" name="resolution_action" value="intermediate_build">
-                                <button type="submit" style="background: #805ad5; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 1: Build Sub-Assembly</button>
-                            </form>
+                            <div><strong>Option 1: Build Sub-Assembly</strong> - Spawn a child Work Order for {shortfall:.2f} units of {comp.name} and open it to review.</div>
+                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&shortfall_qty={shortfall}&resolution_action=intermediate_build"
+                               style="display: inline-block; margin-top: 6px; background: #7c3aed; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
+                                Execute Option 1: Build &amp; Open Sub-Assembly Work Order
+                            </a>
                         </div>
                         <div style="background: #ebf8ff; padding: 8px; border-radius: 4px; border-left: 3px solid #3182ce;">
-                            <strong>Option 2: Hold for Active Run</strong> — Link parent order to active shop floor runs (Active Run Qty: {item['active_run_qty']:.2f}).
-                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
-                                <input type="hidden" name="production_order_id" value="{obj.pk}">
-                                <input type="hidden" name="component_id" value="{comp.pk}">
-                                <input type="hidden" name="resolution_action" value="intermediate_hold_active">
-                                <button type="submit" style="background: #3182ce; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 2: Hold for Active Run</button>
-                            </form>
+                            <div><strong>Option 2: Hold for Active Run</strong> - Link parent order to active shop floor runs (Active Run Qty: {item['active_run_qty']:.2f}).</div>
+                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&resolution_action=intermediate_hold_active"
+                               style="display: inline-block; margin-top: 6px; background: #2563eb; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
+                                Execute Option 2: Hold for Active Run
+                            </a>
                         </div>
                         <div style="background: #f0fff4; padding: 8px; border-radius: 4px; border-left: 3px solid #38a169;">
-                            <strong>Option 3: Partial Batch Run</strong> — Down-scale parent batch target size to match available stock ({max_prod:.2f} units).
-                            <form method="POST" action="/mrp_resolve_action/" style="margin-top: 4px;">
-                                <input type="hidden" name="production_order_id" value="{obj.pk}">
-                                <input type="hidden" name="component_id" value="{comp.pk}">
-                                <input type="hidden" name="max_producible" value="{max_prod}">
-                                <input type="hidden" name="resolution_action" value="intermediate_partial_batch">
-                                <button type="submit" style="background: #38a169; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 11px;">Execute Option 3: Scale Batch to {max_prod:.2f} Units</button>
-                            </form>
+                            <div><strong>Option 3: Partial Batch Run</strong> - Down-scale parent batch target size to match available stock ({max_prod:.2f} units).</div>
+                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&max_producible={max_prod}&resolution_action=intermediate_partial_batch"
+                               style="display: inline-block; margin-top: 6px; background: #059669; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
+                                Execute Option 3: Scale Batch to {max_prod:.2f} Units
+                            </a>
                         </div>
                     </div>
                 </div>
@@ -441,7 +721,7 @@ class ProductionOrderAdmin(admin.ModelAdmin):
             card = f"""
             <div style="margin-bottom: 12px; padding: 12px; background: #fff5f5; border-left: 4px solid #e53e3e; border-radius: 4px; color: #2d3748;">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <strong style="color: #c53030; font-size: 14px;">⚠ Shortage: {comp.name} [{p_type}]</strong>
+                    <strong style="color: #c53030; font-size: 14px;">Shortage: {comp.name} [{p_type}]</strong>
                     <span style="font-size: 12px; background: #feb2b2; color: #9b2c2c; padding: 2px 8px; border-radius: 10px; font-weight: bold;">Shortfall: -{shortfall:.2f}</span>
                 </div>
                 <div style="font-size: 12px; margin-top: 4px; color: #4a5568;">
@@ -454,32 +734,11 @@ class ProductionOrderAdmin(admin.ModelAdmin):
 
         return mark_safe("".join(cards_html))
 
-    @admin.display(description='Product')
-    def get_product(self, obj):
-        return obj.product.name if obj.product else 'N/A'
-    
-    @admin.display(description='Quantity')
-    def get_quantity(self, obj):
-        if obj.work_order_id:
-            try:
-                wo = obj.work_order
-                if wo:
-                    return getattr(wo, 'actual_quantity_produced', getattr(wo, 'quantity_produced', getattr(wo, 'quantity', '0.00')))
-            except ObjectDoesNotExist:
-                pass
-        return obj.quantity or "0.00"
-
     def work_order_details_viewer(self, obj):
-        """
-        PERFORMANCE OPTIMIZATION:
-        Targeted preview lookup that serializes only the specific linked WorkOrder 
-        instead of executing full table scans across all historical WorkOrder records.
-        """
         if not obj or not obj.work_order_id:
             return format_html(
                 "<div style='padding: 8px 12px; background: #fff3cd; border-left: 4px solid #ffc107; color: #856404; border-radius: 4px;'>"
-                "ℹ <strong>Reminder:</strong> No Work Order linked to this Production Order. "
-                "Select a Work Order from the dropdown above to connect blueprint specifications and material tracking."
+                "<strong>Reminder:</strong> No Work Order linked to this Production Order."
                 "</div>"
             )
 
@@ -491,13 +750,13 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         if not wo:
             return format_html(
                 "<div style='padding: 8px 12px; background: #fff3cd; border-left: 4px solid #ffc107; color: #856404; border-radius: 4px;'>"
-                "ℹ <strong>Reminder:</strong> Linked Work Order could not be loaded. Please select a valid Work Order."
+                "Linked Work Order could not be loaded."
                 "</div>"
             )
 
         emp_list = [str(emp) for emp in wo.employee.all()]
         html_string = f"""
-        <div id="wo-preview-panel" style="margin-top: 10px; padding: 12px; background: #f8f9fa; border-left: 4px solid #79aec8; border-radius: 4px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.05); color: #333; max-width: 600px;">
+        <div id="wo-preview-panel" style="margin-top: 10px; padding: 12px; background: #f8f9fa; border-left: 4px solid #79aec8; border-radius: 4px; color: #333; max-width: 600px;">
             <strong style="color: #555; display: block; margin-bottom: 5px;">Blueprint Live Specifications:</strong>
             <div id="wo-preview-content" style="font-size: 13px; line-height: 1.6;">
                 <strong>Target Product:</strong> {wo.product.name if wo.product else 'N/A'} ({getattr(wo.product, 'sku', '')}) <br>
@@ -508,189 +767,463 @@ class ProductionOrderAdmin(admin.ModelAdmin):
         </div>
         """
         return format_html(html_string)
-    
+
     work_order_details_viewer.short_description = "Blueprint Live Specifications"
 
 
-class SalesInvoiceLineInline(admin.TabularInline):
-    model = SalesInvoiceLine
+class OpenSalesInvoiceInline(TabularInline):
+    model = SalesInvoice
     extra = 0
-    fields = ('product', 'quantity', 'unit_price', 'tax_rate', 'subtotal', 'tax_amount', 'total_price')
-    readonly_fields = ('subtotal', 'tax_amount', 'total_price')
-
-    def has_add_permission(self, request, obj=None):
-        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
-            return False
-        return super().has_add_permission(request, obj)
-
-    def has_change_permission(self, request, obj=None):
-        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
-            return False
-        return super().has_change_permission(request, obj)
-
-    def has_delete_permission(self, request, obj=None):
-        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
-            return False
-        return super().has_delete_permission(request, obj)
-
-@admin.register(SalesInvoice)
-class SalesInvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'customer', 'sales_order', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status')
-    list_filter = ['status', 'invoice_date', 'customer']
-    search_fields = ('invoice_number', 'customer__customer_name', 'sales_order__order_number', 'dispatch__dispatch_code')
-    inlines = [SalesInvoiceLineInline, SalesInvoicePaymentsInline]
-    readonly_fields = ('invoice_number', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance')
-    actions = [export_as_csv]
+    can_delete = False
+    fields = ('invoice_number', 'sales_order', 'invoice_date', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'status_badge')
+    readonly_fields = ('invoice_number', 'sales_order', 'invoice_date', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'status_badge')
+    show_change_link = True
+    verbose_name = "Open Sales Invoice"
+    verbose_name_plural = "Open Sales Invoices (Awaiting Payment)"
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Customer, Dispatch, and SalesOrder."""
-        return super().get_queryset(request).select_related('customer', 'dispatch', 'sales_order').prefetch_related('sales_payments', 'lines__product')
+        return super().get_queryset(request).filter(status__in=['POSTED', 'PARTIALLY_PAID']).order_by('invoice_date', 'invoice_id')
 
-    def get_readonly_fields(self, request, obj=None):
-        if obj and obj.status in ['POSTED', 'PAID', 'PARTIALLY_PAID', 'CREDITED'] and not request.user.is_superuser:
-            fields = [f.name for f in self.model._meta.fields]
-            return fields + ['get_total_paid', 'get_remaining_balance']
-        return self.readonly_fields
-
-    def has_delete_permission(self, request, obj=None):
-        return request.user.is_superuser
-
-    @admin.display(description='Total Paid')
+    @display(description='Total Paid')
     def get_total_paid(self, obj):
         return f"${obj.total_paid:,.2f}"
 
-    @admin.display(description='Remaining Balance')
+    @display(description='Outstanding Balance')
     def get_remaining_balance(self, obj):
-        bal = obj.remaining_balance
-        if bal > 0:
-            formatted_bal = f"{bal:,.2f}"
-            return format_html('<span style="color: #c53030; font-weight: bold;">${}</span>', formatted_bal)
-        return "$0.00"
+        return f"${obj.remaining_balance:,.2f}"
 
-class CreditNoteLineInline(admin.TabularInline):
-    model = CreditNoteLine
-    extra = 0
-    fields = ('product', 'quantity', 'unit_price', 'tax_rate', 'subtotal', 'tax_amount', 'total_price')
-    readonly_fields = ('subtotal', 'tax_amount', 'total_price')
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'POSTED': 'info',
+            'PARTIALLY_PAID': 'warning',
+            'PAID': 'success',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
 
-    def has_add_permission(self, request, obj=None):
-        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
-            return False
-        return super().has_add_permission(request, obj)
-
-    def has_change_permission(self, request, obj=None):
-        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
-            return False
-        return super().has_change_permission(request, obj)
-
-    def has_delete_permission(self, request, obj=None):
-        if obj and obj.status != 'DRAFT' and not request.user.is_superuser:
-            return False
-        return super().has_delete_permission(request, obj)
-
-@admin.register(CreditNote)
-class CreditNoteAdmin(admin.ModelAdmin):
-    list_display = ('credit_note_number', 'invoice', 'customer', 'subtotal', 'tax_amount', 'total_amount', 'issue_date', 'status')
-    list_filter = ['status', 'issue_date', 'customer']
-    search_fields = ('credit_note_number', 'invoice__invoice_number', 'customer__customer_name')
-    inlines = [CreditNoteLineInline]
-    readonly_fields = ('credit_note_number', 'subtotal', 'tax_amount', 'total_amount')
-    actions = [export_as_csv]
-
-    def get_queryset(self, request):
-        return super().get_queryset(request).select_related('invoice', 'customer').prefetch_related('lines__product')
-
-    def get_readonly_fields(self, request, obj=None):
-        if obj and obj.status in ['POSTED', 'REFUNDED'] and not request.user.is_superuser:
-            return [f.name for f in self.model._meta.fields]
-        return self.readonly_fields
-
-    def has_delete_permission(self, request, obj=None):
-        return request.user.is_superuser
-
-@admin.register(DocumentSequence)
-class DocumentSequenceAdmin(admin.ModelAdmin):
-    list_display = ('document_type', 'prefix', 'last_sequence')
-    readonly_fields = ('document_type', 'prefix', 'last_sequence')
-
-@admin.register(PurchaseInvoice)
-class PurchaseInvoiceAdmin(admin.ModelAdmin):
-    list_display = ('invoice_number', 'supplier', 'procurement_order', 'total_amount', 'invoice_date', 'status', 'paid_date', 'remaining_balance')
-    list_filter = ['status', 'invoice_date', 'supplier']
-    search_fields = ('invoice_number', 'supplier__name', 'procurement_order__procurement_order_id')
-    inlines = [PurchasePaymentInline]
-    readonly_fields = ['status', 'paid_date', 'remaining_balance', 'total_amount', 'created_at']
-    actions = [export_as_csv]
-
-    def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Supplier, ProcurementOrder, and Payments."""
-        return super().get_queryset(request).select_related('supplier', 'procurement_order').prefetch_related('payments')
-
-    def get_balance_status(self, obj):
-        balance = obj.remaining_balance
-        if balance < 0:
-            return f"Overpaid (Credit Due): ${abs(balance)}"
-        return f"${balance}"
-    
-    get_balance_status.short_description = 'Remaining Balance'
-
-@admin.register(Return)
-class ReturnAdmin(admin.ModelAdmin):
-    list_display = ('dispatch_id', 'customer', 'quantity_returned', 'reason_for_return', 'quality_control_status')
-    list_filter = ['quality_control_status']
-    search_fields = ('dispatch_id__dispatch_id', 'customer__customer_name')
-    actions = [export_as_csv]
-
-    def get_queryset(self, request):
-        return super().get_queryset(request).select_related('dispatch_id', 'customer')
-
-@admin.register(FinanceEntry)
-class FinanceEntryAdmin(admin.ModelAdmin):
-    list_display = ('finance_entry_id', 'entry_type', 'amount', 'entry_date', 'category')
-    list_filter = ['entry_type', 'category']
-    search_fields = ['category', 'sales_invoice__invoice_number', 'procurement_order__procurement_order_id']
-    actions = [export_as_csv]
-
-@admin.register(Employee)
-class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ( 'employee_code', 'employee_id', 'employee_name', 'role', 'phone_number', 'email')
-    search_fields = ('employee_id', 'employee_code', 'employee_name', 'role')    
-    readonly_fields = ['employee_code']
-    ordering=['employee_id']
-    actions = [export_as_csv]
 
 @admin.register(Customer)
-class CustomerAdmin(admin.ModelAdmin):
-    list_display = ('customer_name', 'contact_info', 'shipping_address')
-    search_fields = ('customer_name', 'contact_info')
+class CustomerAdmin(ModelAdmin):
+    list_display = ('customer_name', 'contact_info', 'shipping_address', 'get_total_receivables', 'get_available_credit', 'get_open_invoices_count')
+    search_fields = ('customer_name', 'contact_info', 'shipping_address')
+    readonly_fields = ('outstanding_debt_viewer',)
+    inlines = [OpenSalesInvoiceInline]
     actions = [export_as_csv]
+    actions_detail = ['action_receive_deposit', 'action_link_invoice']
+
+    fieldsets = (
+        ('Customer Profile', {
+            'fields': ('customer_name', 'contact_info', 'shipping_address')
+        }),
+        ('Accounts Receivable Summary', {
+            'fields': ('outstanding_debt_viewer',)
+        }),
+    )
+
+    @display(description='Outstanding Receivables')
+    def get_total_receivables(self, obj):
+        open_invoices = obj.sales_invoices.filter(status__in=['POSTED', 'PARTIALLY_PAID'])
+        total_debt = sum(inv.remaining_balance for inv in open_invoices)
+        if total_debt > 0:
+            formatted_debt = f"${total_debt:,.2f}"
+            return format_html("<span style='color: #dc2626; font-weight: bold;'>{}</span>", formatted_debt)
+        return "$0.00"
+
+    @display(description='Available Credit')
+    def get_available_credit(self, obj):
+        open_cns = obj.credit_notes.filter(status='POSTED')
+        total_credit = sum(cn.remaining_credit for cn in open_cns)
+        if total_credit > 0:
+            formatted_credit = f"${total_credit:,.2f}"
+            return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted_credit)
+        return "$0.00"
+
+    @display(description='Open Invoices')
+    def get_open_invoices_count(self, obj):
+        return obj.sales_invoices.filter(status__in=['POSTED', 'PARTIALLY_PAID']).count()
+
+    def outstanding_debt_viewer(self, obj):
+        if not obj or not obj.pk:
+            return "Save customer first to view accounts receivable."
+        open_invoices = obj.sales_invoices.filter(status__in=['POSTED', 'PARTIALLY_PAID']).order_by('invoice_date', 'invoice_id')
+        total_debt = sum(inv.remaining_balance for inv in open_invoices)
+        count = open_invoices.count()
+
+        open_cns = obj.credit_notes.filter(status='POSTED')
+        total_credit = sum(cn.remaining_credit for cn in open_cns)
+        deposit_url = reverse('admin:customer-receive-deposit', args=[obj.pk])
+        link_invoice_url = reverse('admin:customer-link-invoice', args=[obj.pk])
+
+        html_string = f"""
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-top: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div style="display: flex; gap: 32px; align-items: center;">
+                    <div>
+                        <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.5px;">Outstanding Debt Pool</div>
+                        <div style="font-size: 24px; font-weight: 800; color: {'#dc2626' if total_debt > 0 else '#16a34a'}; margin-top: 2px;">
+                            ${total_debt:,.2f}
+                        </div>
+                        <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
+                            <strong>{count}</strong> open invoice(s) awaiting settlement
+                        </div>
+                    </div>
+                    <div style="border-left: 1px solid #e2e8f0; padding-left: 32px;">
+                        <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.5px;">Available Credit Notes Pool</div>
+                        <div style="font-size: 24px; font-weight: 800; color: {'#16a34a' if total_credit > 0 else '#64748b'}; margin-top: 2px;">
+                            ${total_credit:,.2f}
+                        </div>
+                        <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
+                            <strong>{open_cns.count()}</strong> active credit note(s)
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <a href="{link_invoice_url}"
+                       style="display: inline-block; background: #059669; color: #ffffff; padding: 8px 14px; border-radius: 6px; font-weight: 600; font-size: 13px; text-decoration: none;">
+                        + Link Invoice by Number
+                    </a>
+                    <a href="{deposit_url}" 
+                       style="display: inline-block; background: #2563eb; color: #ffffff; padding: 8px 16px; border-radius: 6px; font-weight: 600; font-size: 13px; text-decoration: none;">
+                        Receive Customer Deposit (FIFO)
+                    </a>
+                </div>
+            </div>
+
+            <!-- Quick Link Open Invoice Bar -->
+            <div style="margin-top: 16px; padding-top: 14px; border-top: 1px dashed #cbd5e1; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+                <div>
+                    <div style="font-size: 12px; font-weight: 700; color: #334155;">
+                        Quick Link Invoice to Customer
+                    </div>
+                    <div style="font-size: 11px; color: #64748b; margin-top: 1px;">
+                        Attach an existing invoice that was not yet linked to this customer by entering its invoice number.
+                    </div>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <input type="text" name="link_invoice_number" id="id_link_invoice_number" placeholder="Enter Invoice # (e.g. SINV-202608-0001)"
+                           style="border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 12px; font-size: 12px; min-width: 240px; outline: none; background: #ffffff;" />
+                    <button type="submit" formaction="{link_invoice_url}" formmethod="POST"
+                            style="background: #059669; color: #ffffff; border: none; padding: 6px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer;">
+                        Link to Customer
+                    </button>
+                </div>
+            </div>
+        </div>
+        """
+        return format_html(html_string)
+
+    outstanding_debt_viewer.short_description = "Accounts Receivable & Debt"
+
+    @action(description="Receive Customer Deposit", url_path="receive-deposit-action")
+    def action_receive_deposit(self, request, object_id):
+        return redirect(reverse('admin:customer-receive-deposit', args=[object_id]))
+
+    @action(description="Link Invoice by Number", url_path="link-invoice-action")
+    def action_link_invoice(self, request, object_id):
+        return redirect(reverse('admin:customer-link-invoice', args=[object_id]))
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                '<int:object_id>/receive-deposit/',
+                self.admin_site.admin_view(self.receive_deposit_view),
+                name='customer-receive-deposit',
+            ),
+            path(
+                '<int:object_id>/link-invoice/',
+                self.admin_site.admin_view(self.link_invoice_view),
+                name='customer-link-invoice',
+            ),
+        ]
+        return custom_urls + urls
+
+    def link_invoice_view(self, request, object_id):
+        from django.template.response import TemplateResponse
+        from .services import apply_customer_credit_notes_to_invoice
+
+        customer = get_object_or_404(Customer, pk=object_id)
+        open_invoices = customer.sales_invoices.filter(status__in=['POSTED', 'PARTIALLY_PAID'])
+        total_debt = sum(inv.remaining_balance for inv in open_invoices)
+
+        if request.method == 'POST':
+            invoice_number = (
+                request.POST.get('link_invoice_number') or
+                request.POST.get('invoice_number') or
+                request.GET.get('invoice_number', '')
+            ).strip()
+
+            if not invoice_number:
+                self.message_user(request, "Please enter or select a valid Invoice Number to link.", level=messages.ERROR)
+                return redirect(reverse('admin:core_customer_change', args=[object_id]))
+
+            invoice = SalesInvoice.objects.filter(invoice_number__iexact=invoice_number).first()
+            if not invoice and invoice_number.isdigit():
+                invoice = SalesInvoice.objects.filter(pk=int(invoice_number)).first()
+
+            if not invoice:
+                self.message_user(request, f"Sales Invoice '{invoice_number}' could not be found in the system.", level=messages.ERROR)
+                return redirect(reverse('admin:core_customer_change', args=[object_id]))
+
+            old_customer = invoice.customer
+            if old_customer and old_customer.pk == customer.pk:
+                self.message_user(request, f"Invoice '{invoice.invoice_number}' is already attached to {customer.customer_name}.", level=messages.INFO)
+                return redirect(reverse('admin:core_customer_change', args=[object_id]))
+
+            # Reassign/assign invoice to this customer
+            invoice.customer = customer
+            invoice.save(update_fields=['customer'])
+
+            # Automatically apply open credit notes for this customer if available
+            applied = apply_customer_credit_notes_to_invoice(invoice)
+
+            reassigned_info = f" (reassigned from {old_customer.customer_name})" if old_customer else ""
+            credit_info = f" and automatically applied {len(applied)} open Credit Note(s)" if applied else ""
+            self.message_user(
+                request,
+                f"Successfully linked Invoice '{invoice.invoice_number}' (Balance: ${invoice.remaining_balance:,.2f}) to {customer.customer_name}{reassigned_info}{credit_info}.",
+                level=messages.SUCCESS
+            )
+            return redirect(reverse('admin:core_customer_change', args=[object_id]))
+
+        # GET request: render dedicated linker interface
+        unassigned_invoices = SalesInvoice.objects.filter(customer__isnull=True).order_by('-invoice_date', '-invoice_id')[:50]
+        context = {
+            **self.admin_site.each_context(request),
+            'customer': customer,
+            'total_debt': total_debt,
+            'current_invoices_count': open_invoices.count(),
+            'unassigned_invoices': unassigned_invoices,
+            'title': f"Link Invoice - {customer.customer_name}",
+        }
+        return TemplateResponse(request, 'admin/customer_link_invoice.html', context)
+
+    def receive_deposit_view(self, request, object_id):
+        from django.template.response import TemplateResponse
+        from .services import preview_customer_bulk_allocation, execute_customer_bulk_allocation
+
+        customer = get_object_or_404(Customer, pk=object_id)
+        open_invoices = list(customer.sales_invoices.filter(
+            status__in=['POSTED', 'PARTIALLY_PAID']
+        ).order_by('invoice_date', 'invoice_id'))
+        total_debt = sum(inv.remaining_balance for inv in open_invoices)
+
+        preview_data = None
+        form_amount = request.POST.get('amount', '')
+        form_payment_method = request.POST.get('payment_method', 'BANK_TRANSFER')
+        form_reference = request.POST.get('reference', '')
+        form_payment_date = request.POST.get('payment_date', timezone.now().strftime('%Y-%m-%d'))
+
+        if request.method == 'POST':
+            if not (request.user.is_superuser or request.user.has_perm('core.can_record_sales_payment') or request.user.is_staff):
+                raise PermissionDenied("You do not have permission to record customer deposit settlements.")
+
+            amount_str = request.POST.get('amount', '').strip()
+            try:
+                amount = Decimal(amount_str)
+                if amount <= Decimal('0.00'):
+                    raise ValueError("Deposit amount must be greater than 0.")
+            except Exception as e:
+                self.message_user(request, f"Invalid deposit amount: {str(e)}", level=messages.ERROR)
+                return TemplateResponse(request, 'admin/customer_receive_deposit.html', {
+                    **self.admin_site.each_context(request),
+                    'customer': customer,
+                    'open_invoices': open_invoices,
+                    'total_debt': total_debt,
+                    'form_amount': form_amount,
+                    'form_payment_method': form_payment_method,
+                    'form_reference': form_reference,
+                    'form_payment_date': form_payment_date,
+                    'today_date': timezone.now().strftime('%Y-%m-%d'),
+                    'title': f"Receive Deposit - {customer.customer_name}",
+                })
+
+            if 'action_preview' in request.POST:
+                preview_data = preview_customer_bulk_allocation(customer, amount)
+            elif 'action_settle' in request.POST:
+                try:
+                    result = execute_customer_bulk_allocation(
+                        customer=customer,
+                        total_received=amount,
+                        payment_method=form_payment_method,
+                        reference=form_reference,
+                        payment_date=form_payment_date or None
+                    )
+                    count_settled = len(result.get('allocations', []))
+                    unallocated = result.get('unallocated_amount', Decimal('0.00'))
+                    msg = f"Successfully executed bulk deposit of ${amount:,.2f} across {count_settled} invoice(s) for {customer.customer_name}."
+                    if unallocated > Decimal('0.00'):
+                        msg += f" Surplus credit balance: ${unallocated:,.2f}."
+                    self.message_user(request, msg, level=messages.SUCCESS)
+                    return redirect(reverse('admin:core_customer_change', args=[customer.pk]))
+                except Exception as e:
+                    self.message_user(request, f"Error executing bulk payment settlement: {str(e)}", level=messages.ERROR)
+
+        context = {
+            **self.admin_site.each_context(request),
+            'customer': customer,
+            'open_invoices': open_invoices,
+            'total_debt': total_debt,
+            'preview_data': preview_data,
+            'form_amount': form_amount,
+            'form_payment_method': form_payment_method,
+            'form_reference': form_reference,
+            'form_payment_date': form_payment_date,
+            'today_date': timezone.now().strftime('%Y-%m-%d'),
+            'title': f"Receive Deposit - {customer.customer_name}",
+        }
+        return TemplateResponse(request, 'admin/customer_receive_deposit.html', context)
+
 
 @admin.register(SalesOrder)
-class SalesOrderAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'customer', 'invoicing_policy', 'status', 'created_at', 'updated_at', 'get_order_total')
-    list_filter = ('status', 'invoicing_policy', 'created_at')
+class SalesOrderAdmin(ModelAdmin):
+    list_display = ('order_number', 'customer', 'invoicing_policy', 'status_badge', 'created_at', 'updated_at', 'get_order_total')
+    list_filter = ('status', 'invoicing_policy', ('created_at', RangeDateFilter))
     search_fields = ('order_number', 'customer__customer_name')
-    readonly_fields = ('order_number', 'status', 'created_at', 'updated_at')
+    readonly_fields = ('order_number', 'status', 'created_at', 'updated_at', 'invoices_viewer')
     inlines = [SalesOrderItemInline]
+    autocomplete_fields = ['customer']
     actions = [export_as_csv]
+    actions_detail = ['action_confirm_order']
+
+    fieldsets = (
+        ('Order Information', {
+            'fields': ('order_number', 'customer', 'invoicing_policy', 'status')
+        }),
+        ('Commercial Invoices (Accounting)', {
+            'fields': ('invoices_viewer',)
+        }),
+        ('Timestamps & Metrics', {
+            'fields': ('created_at', 'updated_at')
+        }),
+    )
+
+    @display(description='Commercial Invoices')
+    def invoices_viewer(self, obj):
+        if not obj or not obj.pk:
+            return format_html("<span style='color: #64748b; font-size: 12px;'>Save sales order first to view linked invoices.</span>")
+        invoices = obj.invoices.all().order_by('-invoice_date', '-invoice_id')
+        if not invoices.exists():
+            if obj.invoicing_policy == 'ORDER_BASED':
+                return format_html(
+                    "<div style='padding: 10px 14px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; color: #1e40af; font-size: 12px;'>"
+                    "<strong>Advance/Upfront Invoicing:</strong> Invoices are automatically generated and posted upon order confirmation."
+                    "</div>"
+                )
+            else:
+                return format_html(
+                    "<div style='padding: 10px 14px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; color: #64748b; font-size: 12px;'>"
+                    "<strong>Post-Shipment Invoicing:</strong> Invoices are generated automatically as goods are dispatched."
+                    "</div>"
+                )
+
+        rows_html = []
+        for inv in invoices:
+            url = reverse('admin:core_salesinvoice_change', args=[inv.pk])
+            status_color = {
+                'POSTED': '#0284c7',
+                'PARTIALLY_PAID': '#d97706',
+                'PAID': '#16a34a',
+                'CREDITED': '#6b7280',
+                'CANCELLED': '#dc2626'
+            }.get(inv.status, '#475569')
+            rows_html.append(f"""
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+                <td style="padding: 10px 12px; font-family: monospace; font-weight: 600;"><a href="{url}" style="color: #2563eb; text-decoration: underline;">{inv.invoice_number}</a></td>
+                <td style="padding: 10px 12px; color: #475569;">{inv.invoice_date}</td>
+                <td style="padding: 10px 12px; text-align: right; font-weight: 600;">${inv.total_amount:,.2f}</td>
+                <td style="padding: 10px 12px; text-align: right; color: #16a34a;">${inv.total_paid:,.2f}</td>
+                <td style="padding: 10px 12px; text-align: right; font-weight: 700; color: {'#dc2626' if inv.remaining_balance > 0 else '#16a34a'};">${inv.remaining_balance:,.2f}</td>
+                <td style="padding: 10px 12px; text-align: center;">
+                    <span style="background: {status_color}15; color: {status_color}; border: 1px solid {status_color}40; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; text-transform: uppercase;">
+                        {inv.get_status_display()}
+                    </span>
+                </td>
+                <td style="padding: 10px 12px; text-align: right;">
+                    <a href="{url}" style="display: inline-block; padding: 4px 10px; background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 11px; font-weight: 600; color: #334155; text-decoration: none;">View Invoice &rarr;</a>
+                </td>
+            </tr>
+            """)
+
+        table_html = f"""
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; margin-top: 4px;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; text-align: left; font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 700; letter-spacing: 0.5px;">
+                        <th style="padding: 8px 12px;">Invoice Number</th>
+                        <th style="padding: 8px 12px;">Invoice Date</th>
+                        <th style="padding: 8px 12px; text-align: right;">Total Amount</th>
+                        <th style="padding: 8px 12px; text-align: right;">Total Paid</th>
+                        <th style="padding: 8px 12px; text-align: right;">Balance</th>
+                        <th style="padding: 8px 12px; text-align: center;">Status</th>
+                        <th style="padding: 8px 12px; text-align: right;">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(rows_html)}
+                </tbody>
+            </table>
+        </div>
+        """
+        return mark_safe(table_html)
+
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'draft': 'default',
+            'approved': 'info',
+            'partially_dispatched': 'warning',
+            'completed': 'success',
+            'cancelled': 'danger',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+    @action(description="Confirm Order & Generate Invoice", url_path="confirm-order-action")
+    def action_confirm_order(self, request, object_id):
+        order = get_object_or_404(SalesOrder, pk=object_id)
+        if order.status == 'cancelled':
+            self.message_user(request, f"Sales Order #{order.order_number} is cancelled.", level=messages.ERROR)
+            return redirect(reverse('admin:core_salesorder_change', args=[object_id]))
+        try:
+            invoice = order.confirm_and_generate_invoice()
+            if invoice:
+                self.message_user(
+                    request,
+                    f"Sales Order #{order.order_number} confirmed and Invoice #{invoice.invoice_number} generated & posted to {order.customer.customer_name}.",
+                    level=messages.SUCCESS
+                )
+            else:
+                self.message_user(
+                    request,
+                    f"Sales Order #{order.order_number} confirmed (Deferred invoice policy: {order.get_invoicing_policy_display()}).",
+                    level=messages.INFO
+                )
+        except Exception as e:
+            self.message_user(request, f"Error confirming Sales Order: {str(e)}", level=messages.ERROR)
+        return redirect(reverse('admin:core_salesorder_change', args=[object_id]))
 
     def get_readonly_fields(self, request, obj=None):
         if obj and obj.status != 'draft' and not request.user.is_superuser:
-            return ['customer', 'order_number', 'status', 'invoicing_policy', 'created_at', 'updated_at']
+            return ['customer', 'order_number', 'status', 'invoicing_policy', 'created_at', 'updated_at', 'invoices_viewer']
         return self.readonly_fields
 
     def has_delete_permission(self, request, obj=None):
         return request.user.is_superuser
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Customer and prefetches SalesOrderItems with Product."""
         return super().get_queryset(request).select_related('customer').prefetch_related('items__product')
 
     def save_related(self, request, form, formsets, change):
         super().save_related(request, form, formsets, change)
-        form.instance.update_status(save=True)
+        order = form.instance
+        order.update_status(save=True)
+        if order.invoicing_policy == 'ORDER_BASED' and order.status in ['approved', 'partially_dispatched', 'completed']:
+            if order.items.exists() and not order.invoices.filter(status__in=['DRAFT', 'POSTED', 'PARTIALLY_PAID', 'PAID']).exists():
+                order.confirm_and_generate_invoice()
 
-    @admin.display(description='Order Total')
+    @display(description='Order Total')
     def get_order_total(self, obj):
         total = sum(item.total_price for item in obj.items.all())
         return f"${total:,.2f}"
@@ -714,7 +1247,7 @@ class SalesOrderAdmin(admin.ModelAdmin):
             invoice = order.confirm_and_generate_invoice()
             self.message_user(
                 request,
-                f"Sales Order #{order.order_number} confirmed and Invoice #{invoice.invoice_number} generated successfully.",
+                f"Sales Order #{order.order_number} confirmed and Invoice #{invoice.invoice_number if invoice else 'Deferred'} generated successfully.",
                 level=messages.SUCCESS
             )
         except ValidationError as e:
@@ -730,56 +1263,238 @@ class SalesOrderAdmin(admin.ModelAdmin):
         if referer:
             return HttpResponseRedirect(referer)
         return redirect(reverse('admin:core_salesorder_change', args=[object_id]))
+
+
+@admin.register(SalesInvoice)
+class SalesInvoiceAdmin(ModelAdmin):
+    list_display = ('invoice_number', 'customer', 'sales_order', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status_badge')
+    list_filter = ['status', ('invoice_date', RangeDateFilter), 'customer']
+    search_fields = ('invoice_number', 'customer__customer_name', 'sales_order__order_number', 'dispatch__dispatch_code')
+    inlines = [SalesInvoiceLineInline, SalesInvoicePaymentsInline]
+    autocomplete_fields = ['customer', 'sales_order', 'dispatch']
+    readonly_fields = ('invoice_number', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance')
+    actions = [export_as_csv]
+    actions_detail = ['action_download_pdf']
+
+    fieldsets = (
+        ('Invoice Details', {
+            'fields': ('invoice_number', 'customer', 'sales_order', 'dispatch', 'invoice_date', 'due_date', 'status')
+        }),
+        ('Financial Summary', {
+            'fields': ('subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance')
+        }),
+    )
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('customer', 'dispatch', 'sales_order').prefetch_related('sales_payments', 'lines__product')
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status in ['POSTED', 'PAID', 'PARTIALLY_PAID', 'CREDITED'] and not request.user.is_superuser:
+            fields = [f.name for f in self.model._meta.fields]
+            return fields + ['get_total_paid', 'get_remaining_balance']
+        return self.readonly_fields
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'DRAFT': 'default',
+            'POSTED': 'info',
+            'PARTIALLY_PAID': 'warning',
+            'PAID': 'success',
+            'CREDITED': 'primary',
+            'CANCELLED': 'danger',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+    @display(description='Total Paid')
+    def get_total_paid(self, obj):
+        return f"${obj.total_paid:,.2f}"
+
+    @display(description='Remaining Balance')
+    def get_remaining_balance(self, obj):
+        bal = obj.remaining_balance
+        if bal > 0:
+            return f"${bal:,.2f}"
+        return "$0.00"
+
+    @action(description="Download Commercial Invoice PDF", url_path="download-pdf")
+    def action_download_pdf(self, request, object_id):
+        invoice = get_object_or_404(SalesInvoice, pk=object_id)
+        pdf_buffer = generate_invoice_pdf(invoice)
+        response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="Invoice_{invoice.invoice_number}.pdf"'
+        return response
+
+
+@admin.register(CreditNote)
+class CreditNoteAdmin(ModelAdmin):
+    list_display = ('credit_note_number', 'invoice', 'customer', 'total_amount', 'get_applied_amount', 'get_remaining_credit', 'issue_date', 'status_badge')
+    list_filter = ['status', ('issue_date', RangeDateFilter), 'customer']
+    search_fields = ('credit_note_number', 'invoice__invoice_number', 'customer__customer_name')
+    inlines = [CreditNoteLineInline]
+    autocomplete_fields = ['invoice', 'customer']
+    readonly_fields = ('credit_note_number', 'subtotal', 'tax_amount', 'total_amount', 'applied_amount', 'get_remaining_credit')
+    actions = [export_as_csv]
+    actions_detail = ['action_download_pdf']
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('invoice', 'customer').prefetch_related('lines__product')
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.status in ['POSTED', 'REFUNDED'] and not request.user.is_superuser:
+            return [f.name for f in self.model._meta.fields]
+        return self.readonly_fields
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    @display(description='Applied Credit')
+    def get_applied_amount(self, obj):
+        applied = obj.applied_amount or Decimal('0.00')
+        return f"${applied:,.2f}"
+
+    @display(description='Remaining Credit')
+    def get_remaining_credit(self, obj):
+        rem = obj.remaining_credit
+        if rem > 0:
+            formatted = f"${rem:,.2f}"
+            return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted)
+        return "$0.00"
+
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'DRAFT': 'default',
+            'POSTED': 'warning',
+            'REFUNDED': 'success',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+    @action(description="Download Credit Note PDF", url_path="download-pdf")
+    def action_download_pdf(self, request, object_id):
+        credit_note = get_object_or_404(CreditNote, pk=object_id)
+        pdf_buffer = generate_credit_note_pdf(credit_note)
+        response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="CreditNote_{credit_note.credit_note_number}.pdf"'
+        return response
+
+
+@admin.register(DocumentSequence)
+class DocumentSequenceAdmin(ModelAdmin):
+    list_display = ('document_type', 'prefix', 'last_sequence')
+    readonly_fields = ('document_type', 'prefix', 'last_sequence')
+    search_fields = ('document_type', 'prefix')
+
+
+@admin.register(PurchaseInvoice)
+class PurchaseInvoiceAdmin(ModelAdmin):
+    list_display = ('invoice_number', 'supplier', 'procurement_order', 'total_amount', 'invoice_date', 'status_badge', 'paid_date', 'remaining_balance')
+    list_filter = ['status', ('invoice_date', RangeDateFilter), 'supplier']
+    search_fields = ('invoice_number', 'supplier__name', 'procurement_order__procurement_order_id')
+    inlines = [PurchasePaymentInline]
+    autocomplete_fields = ['supplier', 'procurement_order']
+    readonly_fields = ['status', 'paid_date', 'remaining_balance', 'total_amount', 'created_at']
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('supplier', 'procurement_order').prefetch_related('payments')
+
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'UNPAID': 'danger',
+            'PARTIAL': 'warning',
+            'PAID': 'success',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+
+@admin.register(Return)
+class ReturnAdmin(ModelAdmin):
+    list_display = ('dispatch', 'customer', 'quantity_returned', 'reason_for_return', 'qc_badge')
+    list_filter = ['quality_control_status']
+    search_fields = ('dispatch__dispatch_code', 'customer__customer_name')
+    autocomplete_fields = ['dispatch', 'customer']
+    actions = [export_as_csv]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('dispatch', 'customer')
+
+    @display(description='QC Status', label=True)
+    def qc_badge(self, obj):
+        color_map = {
+            'APPROVED': 'success',
+            'REJECTED': 'danger',
+            'PENDING': 'warning',
+        }
+        color = color_map.get(obj.quality_control_status, 'default')
+        return obj.get_quality_control_status_display(), color
+
+
+@admin.register(FinanceEntry)
+class FinanceEntryAdmin(ModelAdmin):
+    list_display = ('finance_entry_id', 'entry_type_badge', 'amount', 'entry_date', 'category')
+    list_filter = ['entry_type', 'category', ('entry_date', RangeDateFilter), ('amount', RangeNumericFilter)]
+    search_fields = ['category', 'sales_invoice__invoice_number', 'procurement_order__procurement_order_id']
+    actions = [export_as_csv]
+
+    @display(description='Entry Type', label=True)
+    def entry_type_badge(self, obj):
+        color = 'success' if obj.entry_type == 'REVENUE' else 'danger'
+        return obj.get_entry_type_display(), color
+
+
+@admin.register(Employee)
+class EmployeeAdmin(ModelAdmin):
+    list_display = ('employee_code', 'employee_id', 'employee_name', 'role', 'phone_number', 'email')
+    search_fields = ('employee_id', 'employee_code', 'employee_name', 'role')
+    readonly_fields = ['employee_code']
+    ordering = ['employee_id']
+    actions = [export_as_csv]
+
+
 @admin.register(BillOfMaterial)
-class BillOfMaterialAdmin(admin.ModelAdmin):
-    list_display = ('product', 'name', 'is_active', 'get_component_count', 'updated_at')
+class BillOfMaterialAdmin(ModelAdmin):
+    list_display = ('product', 'name', 'is_active_badge', 'get_component_count', 'updated_at')
     list_filter = ['is_active']
     search_fields = ('product__name', 'name', 'product__sku', 'items__component__name')
+    autocomplete_fields = ['product']
     inlines = [BOMItemInline]
 
-    @admin.display(description='Total Ingredients')
+    @display(description='Active Status', label=True)
+    def is_active_badge(self, obj):
+        return ("Active", "success") if obj.is_active else ("Inactive", "default")
+
+    @display(description='Total Ingredients')
     def get_component_count(self, obj):
-        return obj.items.count()    
-
-@admin.register(Product)
-class ProductAdmin(admin.ModelAdmin):
-    list_display = ('sku', 'name', 'product_type', 'supplier', 'get_selling_price')
-    list_filter = ['product_type', 'supplier']
-    search_fields = ('sku', 'name', 'supplier__name')
-    # 'sku' has editable=False on the model
-    readonly_fields = ('sku',)
-
-    @admin.display(description='Selling Price')
-    def get_selling_price(self, obj):
-        if obj.selling_price is not None:
-            return f"${obj.selling_price:,.2f}"
-        return "-"  # Shows dash for items without a selling price (e.g. Raw Materials)
+        return obj.items.count()
 
 
 @admin.register(PurchaseOrder)
-class PurchaseOrderAdmin(admin.ModelAdmin):
+class PurchaseOrderAdmin(ModelAdmin):
     list_display = ('po_number', 'supplier', 'order_date', 'status_badge')
-    list_filter = ('status', 'order_date', 'supplier')
+    list_filter = ('status', ('order_date', RangeDateFilter), 'supplier')
     search_fields = ('po_number', 'supplier__name')
+    autocomplete_fields = ['supplier']
     inlines = [PurchaseOrderItemInline]
     readonly_fields = ('po_number', 'order_date', 'status')
     actions = [export_as_csv]
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Supplier and prefetches items with Product."""
         return super().get_queryset(request).select_related('supplier').prefetch_related('items__product')
 
     fieldsets = (
         ('Order Details', {
             'fields': ('po_number', 'supplier', 'order_date', 'notes')
         }),
-        ('Status (Auto-Managed)', {
+        ('Status & Lifecycle', {
             'fields': ('status',),
-            'description': (
-                'Status is automatically updated by the system: '
-                'DRAFT → Sent (when items are added) → '
-                'Partially Received / Fully Received (driven by procurement deliveries).'
-            ),
         }),
     )
 
@@ -788,46 +1503,82 @@ class PurchaseOrderAdmin(admin.ModelAdmin):
             return [field.name for field in self.model._meta.fields]
         return self.readonly_fields
 
-    @admin.display(description='Status')
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        obj = form.instance
+        # When reviewing a DRAFT purchase order and clicking save, transition status to SENT if items exist
+        if change and obj.status == 'DRAFT' and obj.items.filter(quantity_ordered__gt=0).exists():
+            obj.status = 'SENT'
+            obj.save(update_fields=['status'])
+            messages.success(request, f"Purchase Order #{obj.po_number} reviewed, confirmed, and marked as 'Sent to Supplier'.")
+
+    @display(description='Status', label=True)
     def status_badge(self, obj):
-        colours = {
-            'DRAFT':      '#718096',   # grey
-            'SENT':       '#3182ce',   # blue
-            'PARTIAL':    '#d69e2e',   # amber
-            'RECEIVED':   '#38a169',   # green
-            'CANCELLED':  '#e53e3e',   # red
+        color_map = {
+            'DRAFT': 'default',
+            'SENT': 'info',
+            'PARTIAL': 'warning',
+            'RECEIVED': 'success',
+            'CANCELLED': 'danger',
         }
-        colour = colours.get(obj.status, '#718096')
-        return format_html(
-            '<b style="color: {};">{}</b>',
-            colour,
-            obj.get_status_display()
-        )
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+
+class ProcurementOrderForm(forms.ModelForm):
+    class Meta:
+        model = ProcurementOrder
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        po_id = None
+        if self.data and self.data.get('purchase_order'):
+            po_id = self.data.get('purchase_order')
+        elif self.instance and self.instance.purchase_order_id:
+            po_id = self.instance.purchase_order_id
+
+        if po_id:
+            po = PurchaseOrder.objects.filter(pk=po_id).first()
+            if po:
+                valid_product_ids = po.items.values_list('product_id', flat=True)
+                self.fields['product'].queryset = Product.objects.filter(pk__in=valid_product_ids)
+
 
 @admin.register(ProcurementOrder)
-class ProcurementOrderAdmin(admin.ModelAdmin):
+class ProcurementOrderAdmin(ModelAdmin):
     form = ProcurementOrderForm
-    autocomplete_fields = ['purchase_order']
-    list_display = ('procurement_order_id', 'purchase_order', 'product', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status')
-    list_filter = ['status', 'delivery_date', 'delivery_location']
+    autocomplete_fields = ['purchase_order', 'product']
+    list_display = ('procurement_order_id', 'purchase_order', 'product', 'quantity', 'price_per_unit', 'total_cost', 'delivery_date', 'status_badge')
+    list_filter = ['status', ('delivery_date', RangeDateFilter), 'delivery_location']
     search_fields = ('product__name', 'product__sku', 'purchase_order__po_number')
     readonly_fields = ['total_cost', 'delivery_date']
     actions = [export_as_csv]
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins PurchaseOrder, Product, and Supplier."""
         return super().get_queryset(request).select_related('purchase_order', 'product', 'purchase_order__supplier')
 
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'PENDING': 'warning',
+            'DELIVERED': 'success',
+            'CANCELLED': 'danger',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+
 @admin.register(DispatchRecord)
-class DispatchRecordAdmin(admin.ModelAdmin):
-    list_display = ['dispatch_code', 'dispatch_id', 'customer', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status', 'delivery_date']
-    list_filter = ['dispatch_date', 'status', 'delivery_date', 'customer']
+class DispatchRecordAdmin(ModelAdmin):
+    list_display = ['dispatch_code', 'dispatch_id', 'customer', 'sales_order_item', 'product', 'quantity_dispatched', 'dispatch_date', 'status_badge', 'delivery_date']
+    list_filter = [('dispatch_date', RangeDateFilter), 'status', ('delivery_date', RangeDateFilter), 'customer']
     search_fields = ['dispatch_code', 'sales_order_item__sales_order__order_number', 'customer__customer_name', 'product__sku', 'product__name']
+    autocomplete_fields = ['customer', 'product']
     readonly_fields = ('dispatch_code', 'delivery_date', 'is_stock_deducted')
     actions = [export_as_csv]
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins Customer, Product, and SalesOrderItem."""
         return super().get_queryset(request).select_related('customer', 'product', 'sales_order_item__sales_order')
 
     def get_readonly_fields(self, request, obj=None):
@@ -844,16 +1595,30 @@ class DispatchRecordAdmin(admin.ModelAdmin):
         }),
     )
 
+    @display(description='Status', label=True)
+    def status_badge(self, obj):
+        color_map = {
+            'pending': 'warning',
+            'shipped': 'info',
+            'delivered': 'success',
+            'cancelled': 'danger',
+        }
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+
 @admin.register(WorkOrder)
-class WorkOrderAdmin(admin.ModelAdmin):
+class WorkOrderAdmin(ModelAdmin):
     form = WorkOrderForm
     list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
     readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
-    list_filter = ['category', 'status', 'is_inventory_updated', 'production_start_date']
+    autocomplete_fields = ['product', 'bill_of_material', 'parent_work_order']
+    list_filter = ['category', 'status', 'is_inventory_updated', ('production_start_date', RangeDateFilter)]
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
-    actions = [export_as_csv, 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
+    actions = [export_as_csv, 'action_reconcile_production_stock', 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
+    actions_detail = ['action_start_production_button', 'action_check_stock_resume_button']
 
     class Media:
         js = ('admin/js/workorder_toggle.js', 'admin/js/work_order_category_toggle.js')
@@ -862,7 +1627,6 @@ class WorkOrderAdmin(admin.ModelAdmin):
         }
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly loads product, BOM, parent order, employees, and production runs."""
         return super().get_queryset(request).select_related('product', 'bill_of_material', 'parent_work_order').prefetch_related('employee', 'production_runs', 'material_lines')
 
     fieldsets = (
@@ -887,18 +1651,14 @@ class WorkOrderAdmin(admin.ModelAdmin):
         ('Automation & Audit Gates', {
             'classes': ('collapse',),
             'fields': (
+                'is_inventory_allocated',
                 'is_inventory_updated',
             ),
         }),
     )
 
     def save_formset(self, request, form, formset, change):
-        """
-        Prevents UNIQUE constraint crashes by merging Admin Inline edits 
-        with records auto-generated by WorkOrder.save().
-        """
         instances = formset.save(commit=False)
-        
         for instance in instances:
             if isinstance(instance, WorkOrderMaterialLine) and instance.component:
                 WorkOrderMaterialLine.objects.update_or_create(
@@ -911,55 +1671,75 @@ class WorkOrderAdmin(admin.ModelAdmin):
             else:
                 instance.work_order = form.instance
                 instance.save()
-        
         formset.save_m2m()
-        
         for obj in formset.deleted_objects:
             obj.delete()
 
     def save_related(self, request, form, formsets, change):
-        print("\n[ADMIN SAVE_RELATED] Saving inline material lines to DB first...", flush=True)
         super().save_related(request, form, formsets, change)
-        
-        print("[ADMIN SAVE_RELATED] Inline material lines saved. Refreshing instance and calling process_inventory()...", flush=True)
         work_order = form.instance
         work_order.refresh_from_db()
         work_order.process_inventory()
 
-    @admin.display(description='Category')
+    @display(description='Category', label=True)
     def category_badge(self, obj):
-        if obj.category == 'PRODUCTION':
-            return format_html('<span style="background-color: #2b6cb0; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">PRODUCTION</span>')
-        elif obj.category == 'PACKAGING':
-            return format_html('<span style="background-color: #805ad5; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">PACKAGING</span>')
-        return "-"
+        color = 'primary' if obj.category == 'PRODUCTION' else 'secondary'
+        return obj.get_category_display(), color
 
-    @admin.display(description='Assigned Employees')
+    @display(description='Assigned Employees')
     def display_employees(self, obj):
         employees = obj.employee.all()
         if employees.exists():
             return ", ".join([str(emp) for emp in employees])
         return "-"
 
-    @admin.display(description='Target Quantity')
+    @display(description='Target Quantity')
     def display_target_quantity(self, obj):
         return f"{obj.target_quantity:.2f}"
 
-    @admin.display(description='Status')
+    @display(description='Status', label=True)
     def status_badge(self, obj):
-        colors = {
-            'COMPLETED': 'green',
-            'IN_PROGRESS': '#3182ce',
-            'CANCELLED': 'red',
-            'AWAITING_RESOLUTION': '#dd6b20',
-            'ON_HOLD_SHORTAGE': '#e53e3e',
+        color_map = {
+            'DRAFT': 'default',
+            'IN_PROGRESS': 'info',
+            'COMPLETED': 'success',
+            'CANCELLED': 'danger',
+            'AWAITING_RESOLUTION': 'warning',
+            'ON_HOLD_SHORTAGE': 'danger',
         }
-        color = colors.get(obj.status, 'gray')
-        return format_html(
-            '<b style="color: {};">{}</b>', 
-            color, 
-            obj.get_status_display()
-        )
+        color = color_map.get(obj.status, 'default')
+        return obj.get_status_display(), color
+
+    @action(description="Start Production Run", url_path="start-prod")
+    def action_start_production_button(self, request, object_id):
+        return self.start_production_view(request, object_id)
+
+    @action(description="Re-Check Stock & Start", url_path="check-stock")
+    def action_check_stock_resume_button(self, request, object_id):
+        return self.check_stock_resume_view(request, object_id)
+
+    def get_actions_detail(self, request, object_id=None):
+        actions = super().get_actions_detail(request, object_id)
+        if object_id:
+            try:
+                wo = self.get_object(request, object_id)
+                if wo:
+                    status = (getattr(wo, 'status', '') or '').upper().strip()
+                    filtered = []
+                    for act in actions:
+                        act_name = getattr(act, 'action_name', '')
+                        if 'action_start_production_button' in act_name:
+                            if status in ['PENDING', 'DRAFT']:
+                                filtered.append(act)
+                        elif 'action_check_stock_resume_button' in act_name:
+                            if status in ['PENDING', 'DRAFT', 'ON_HOLD_SHORTAGE', 'AWAITING_RESOLUTION']:
+                                filtered.append(act)
+                        else:
+                            filtered.append(act)
+                    return filtered
+            except Exception:
+                pass
+        return actions
 
     @admin.action(description="Shortage Resolution: Top-Up Parent Bulk Order")
     def action_top_up_bulk(self, request, queryset):
@@ -997,13 +1777,29 @@ class WorkOrderAdmin(admin.ModelAdmin):
         if count > 0:
             self.message_user(request, f"Successfully placed {count} order(s) on hold for bulk shortage.", level=messages.SUCCESS)
 
+    @admin.action(description="Reconcile Production Stock & Post Output")
+    def action_reconcile_production_stock(self, request, queryset):
+        from core.services import ProductionReconciliationEngine, ProductionReconciliationError
+        success_count = 0
+        skipped_count = 0
+        for wo in queryset:
+            try:
+                result = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+                if result.get('skipped'):
+                    skipped_count += 1
+                else:
+                    success_count += 1
+            except ProductionReconciliationError as e:
+                self.message_user(request, f"Reconciliation Error for WO #{wo.pk} ({wo.work_order_code}): {str(e)}", level=messages.ERROR)
+            except Exception as e:
+                self.message_user(request, f"Unexpected Error for WO #{wo.pk}: {str(e)}", level=messages.ERROR)
+        
+        if success_count > 0:
+            self.message_user(request, f"Successfully reconciled and posted stock transactions for {success_count} Work Order(s).", level=messages.SUCCESS)
+        if skipped_count > 0:
+            self.message_user(request, f"{skipped_count} Work Order(s) were already reconciled and skipped safely.", level=messages.INFO)
+
     def get_readonly_fields(self, request, obj=None):
-        """
-        RBAC and Lifecycle Readonly Field Rules:
-        1. Completed Work Orders are completely immutable for all non-superusers.
-        2. Shop-Floor Operators have header/specification fields locked to prevent unapproved edits.
-        3. Otherwise fallback to standard modeladmin readonly fields.
-        """
         if obj and obj.status == 'COMPLETED' and not request.user.is_superuser:
             return [f.name for f in self.model._meta.fields]
 
@@ -1013,7 +1809,6 @@ class WorkOrderAdmin(admin.ModelAdmin):
         return super().get_readonly_fields(request, obj)
 
     def has_delete_permission(self, request, obj=None):
-        """Work orders may only be deleted by superusers to protect manufacturing audit trails."""
         return bool(request.user and request.user.is_superuser)
 
     change_form_template = 'admin/core/workorder/change_form.html'
@@ -1036,7 +1831,7 @@ class WorkOrderAdmin(admin.ModelAdmin):
                     extra_context['active_bulk_orders'] = []
                 extra_context['parent_bulk_order'] = wo.parent_work_order
         except Exception as e:
-            print(f"[WORKORDER ADMIN CHANGE_VIEW ERROR] {e}", flush=True)
+            pass
 
         return super().change_view(request, object_id, form_url, extra_context=extra_context)
 
@@ -1124,7 +1919,6 @@ class WorkOrderAdmin(admin.ModelAdmin):
         return redirect(reverse('admin:core_workorder_change', args=[object_id]))
 
     def _resolve_shortage_view(self, request, object_id, action_choice, existing_bulk_wo_id=None):
-        """Shared handler for all shortage resolution admin views."""
         work_order = get_object_or_404(WorkOrder, pk=object_id)
         try:
             work_order.resolve_bulk_shortage(action_choice, existing_bulk_wo_id=existing_bulk_wo_id)
@@ -1197,47 +1991,39 @@ class WorkOrderAdmin(admin.ModelAdmin):
             return HttpResponseRedirect(referer)
         return redirect(reverse('admin:core_workorder_change', args=[object_id]))
 
+
 @admin.register(MaterialVarianceRecord)
-class MaterialVarianceRecordAdmin(admin.ModelAdmin):
-    list_display = ('variance_code', 'work_order', 'get_production_run_type', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'get_classification_badge', 'recorded_at')
-    list_filter = ['work_order__category', 'variance_classification', 'recorded_at']
+class MaterialVarianceRecordAdmin(ModelAdmin):
+    list_display = ('variance_code', 'work_order', 'get_production_run_type', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'classification_badge', 'recorded_at')
+    list_filter = ['work_order__category', 'variance_classification', ('recorded_at', RangeDateFilter)]
     search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('variance_code', 'get_production_run_type', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
     actions = [export_as_csv]
 
     def get_queryset(self, request):
-        """N+1 Query Mitigation: Eagerly joins WorkOrder, Product, and MaterialLine."""
         return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')
 
-    @admin.display(description='Run Type')
+    @display(description='Run Type', label=True)
     def get_production_run_type(self, obj):
         run_type = obj.production_run_type
-        if run_type == 'PRODUCTION':
-            return format_html('<span style="background-color: #2b6cb0; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;">PRODUCTION</span>')
-        elif run_type == 'PACKAGING':
-            return format_html('<span style="background-color: #6b46c1; color: white; padding: 2px 6px; border-radius: 10px; font-size: 11px; font-weight: bold;">PACKAGING</span>')
-        return format_html('<span style="color: #666;">{}</span>', run_type)
+        color = 'primary' if run_type == 'PRODUCTION' else 'secondary'
+        return run_type, color
 
-    @admin.display(description='Financial Impact')
+    @display(description='Financial Impact')
     def get_financial_impact(self, obj):
         cost = obj.financial_impact or Decimal('0.00')
         if cost > 0:
-            formatted_cost = f"{cost:,.2f}"
-            return format_html('<span style="color: #c53030; font-weight: bold;">+${}</span>', formatted_cost)
+            return f"+${cost:,.2f}"
         elif cost < 0:
-            formatted_cost = f"{abs(cost):,.2f}"
-            return format_html('<span style="color: #27ae60; font-weight: bold;">-${}</span>', formatted_cost)
+            return f"-${abs(cost):,.2f}"
         return "$0.00"
 
-    @admin.display(description='Variance Classification')
-    def get_classification_badge(self, obj):
-        if obj.variance_classification == 'UNFAVOURABLE':
-            return format_html('<span style="color: #c53030; font-weight: bold; background: #fff5f5; padding: 2px 6px; border-radius: 4px;">Unfavourable (Scrap/Waste)</span>')
-        elif obj.variance_classification == 'FAVOURABLE':
-            return format_html('<span style="color: #27ae60; font-weight: bold; background: #e8f8f5; padding: 2px 6px; border-radius: 4px;">Favourable (Efficiency/Saved)</span>')
-        return format_html('<span style="color: #4a5568; font-weight: bold;">Exact Match</span>')
-
-
-
-
-   
+    @display(description='Classification', label=True)
+    def classification_badge(self, obj):
+        color_map = {
+            'UNFAVOURABLE': 'danger',
+            'FAVOURABLE': 'success',
+            'EXACT': 'default',
+        }
+        color = color_map.get(obj.variance_classification, 'default')
+        return obj.get_variance_classification_display(), color

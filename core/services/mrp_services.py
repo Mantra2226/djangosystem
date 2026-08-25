@@ -1,13 +1,19 @@
+"""
+MRP SERVICES MODULE (core/services/mrp_services.py)
+Handles BOM explosion, shortage evaluation, auto-drafting POs, and MRP state management.
+"""
+
 from collections import defaultdict
 from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
-from .models import (
+from core.models import (
     Product, BillOfMaterial, BOMItem, Inventory, ProductionOrder, 
     WorkOrder, PurchaseOrder, PurchaseOrderItem, ProcurementOrder
 )
+
 
 def explode_material_requirements(product, target_quantity=Decimal('1.0000'), visited=None):
     """
@@ -58,11 +64,18 @@ def evaluate_mrp_shortages(production_order):
     """
     Evaluates material line requirements for a ProductionOrder or WorkOrder.
     Returns a list of shortage analysis dicts per component line.
+    Skips recalculation if MRP resolution is locked or production run is active/completed.
     """
     if not production_order or not getattr(production_order, 'work_order', None):
         return []
 
+    if getattr(production_order, 'is_mrp_resolved', False):
+        return []
+
     work_order = production_order.work_order
+    if getattr(work_order, 'status', '').upper() in ['IN_PROGRESS', 'COMPLETED']:
+        return []
+
     bom = work_order.bill_of_material
     if not bom:
         return []
@@ -135,12 +148,13 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
     with transaction.atomic():
         po = PurchaseOrder.objects.filter(
             supplier=component.supplier,
-            status__in=['DRAFT', 'SENT']
+            status='DRAFT'
         ).first()
 
         if not po:
             po = PurchaseOrder.objects.create(
                 supplier=component.supplier,
+                status='DRAFT',
                 notes=f"Auto-drafted by MRP Trigger Engine for Production Order #{production_order.pk}."
             )
 
@@ -157,8 +171,13 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
             po_item.quantity_ordered += shortfall
             po_item.save()
 
+        # Guarantee PO status remains DRAFT
+        if po.status != 'DRAFT':
+            po.status = 'DRAFT'
+            po.save(update_fields=['status'])
+
         if production_order and production_order.pk:
-            note_msg = f"[MRP RESOLVED] Appended {shortfall} units of {component.name} to PO #{po.po_number}."
+            note_msg = f"[MRP RESOLVED] Appended {shortfall} units of {component.name} to Draft PO #{po.po_number}."
             production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
             production_order.save(update_fields=['notes'])
 

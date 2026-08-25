@@ -1,0 +1,211 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block breadcrumbs %}
+<div class="px-4 py-3 bg-gray-50 border-b border-gray-200 text-sm text-gray-600 flex items-center gap-2">
+    <a href="{% url 'admin:index' %}" class="hover:text-blue-600">Home</a>
+    <span>&rsaquo;</span>
+    <a href="{% url 'admin:core_customer_changelist' %}" class="hover:text-blue-600">Customers</a>
+    <span>&rsaquo;</span>
+    <a href="{% url 'admin:core_customer_change' customer.pk %}" class="hover:text-blue-600">{{ customer.customer_name }}</a>
+    <span>&rsaquo;</span>
+    <span class="text-gray-900 font-semibold">Receive Customer Deposit (FIFO Settlement)</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto p-6 space-y-6">
+
+    <!-- Header & AR Summary Banner -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+            <span class="text-xs font-bold uppercase tracking-wider text-blue-600 bg-blue-50 px-2.5 py-1 rounded">Accounts Receivable</span>
+            <h1 class="text-2xl font-bold text-gray-900 mt-2">{{ customer.customer_name }}</h1>
+            <p class="text-sm text-gray-500 mt-1">
+                Contact: {{ customer.contact_info|default:"N/A" }} &bull; Address: {{ customer.shipping_address|default:"N/A" }}
+            </p>
+        </div>
+        <div class="flex items-center gap-4 bg-gray-50 p-4 rounded-lg border border-gray-200">
+            <div class="text-right">
+                <span class="text-xs font-medium text-gray-500 uppercase">Total Outstanding Debt</span>
+                <div class="text-2xl font-bold text-red-600">${{ total_debt|floatformat:2 }}</div>
+            </div>
+            <div class="h-10 w-px bg-gray-300"></div>
+            <div class="text-right">
+                <span class="text-xs font-medium text-gray-500 uppercase">Open Invoices</span>
+                <div class="text-2xl font-bold text-gray-900">{{ open_invoices|length }}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chronological Open Invoices (FIFO Queue) -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+        <div class="px-6 py-4 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
+            <h2 class="text-base font-semibold text-gray-900">Open Invoices Queue (Chronological FIFO Order)</h2>
+            <span class="text-xs text-gray-500">Oldest invoices are settled first</span>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200 text-sm">
+                <thead class="bg-gray-50 text-gray-600 font-medium">
+                    <tr>
+                        <th class="px-6 py-3 text-left">Queue</th>
+                        <th class="px-6 py-3 text-left">Invoice #</th>
+                        <th class="px-6 py-3 text-left">Invoice Date</th>
+                        <th class="px-6 py-3 text-right">Total Amount</th>
+                        <th class="px-6 py-3 text-right">Paid to Date</th>
+                        <th class="px-6 py-3 text-right">Outstanding Balance</th>
+                        <th class="px-6 py-3 text-center">Current Status</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200 bg-white">
+                    {% for inv in open_invoices %}
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 font-bold text-gray-400">#{{ forloop.counter }}</td>
+                        <td class="px-6 py-4 font-semibold text-blue-600">
+                            <a href="{% url 'admin:core_salesinvoice_change' inv.pk %}" target="_blank" class="hover:underline">
+                                {{ inv.invoice_number }}
+                            </a>
+                        </td>
+                        <td class="px-6 py-4 text-gray-700">{{ inv.invoice_date }}</td>
+                        <td class="px-6 py-4 text-right font-medium text-gray-900">${{ inv.total_amount|floatformat:2 }}</td>
+                        <td class="px-6 py-4 text-right text-gray-600">${{ inv.total_paid|floatformat:2 }}</td>
+                        <td class="px-6 py-4 text-right font-bold text-red-600">${{ inv.remaining_balance|floatformat:2 }}</td>
+                        <td class="px-6 py-4 text-center">
+                            <span class="px-2.5 py-1 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-800">
+                                {{ inv.get_status_display }}
+                            </span>
+                        </td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="7" class="px-6 py-8 text-center text-gray-500">
+                            No open or partially paid invoices found for this customer. All accounts are settled!
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Deposit Input Form -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+        <h2 class="text-base font-semibold text-gray-900 mb-4">Record Lump-Sum Deposit</h2>
+        <form method="POST" action="">
+            {% csrf_token %}
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+                <div>
+                    <label for="amount" class="block text-xs font-semibold text-gray-700 uppercase mb-1">Deposit Amount ($) <span class="text-red-500">*</span></label>
+                    <input type="number" step="0.01" min="0.01" name="amount" id="amount" value="{{ form_amount|default:'' }}" required
+                           class="w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500 text-gray-900 font-semibold"
+                           placeholder="e.g. 50000.00">
+                </div>
+                <div>
+                    <label for="payment_method" class="block text-xs font-semibold text-gray-700 uppercase mb-1">Payment Method</label>
+                    <select name="payment_method" id="payment_method"
+                            class="w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500 text-gray-900">
+                        <option value="BANK_TRANSFER" {% if form_payment_method == 'BANK_TRANSFER' %}selected{% endif %}>Bank Transfer</option>
+                        <option value="CHEQUE" {% if form_payment_method == 'CHEQUE' %}selected{% endif %}>Cheque</option>
+                        <option value="CASH" {% if form_payment_method == 'CASH' %}selected{% endif %}>Cash</option>
+                        <option value="CARD" {% if form_payment_method == 'CARD' %}selected{% endif %}>Credit / Debit Card</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="reference" class="block text-xs font-semibold text-gray-700 uppercase mb-1">Reference / Cheque No.</label>
+                    <input type="text" name="reference" id="reference" value="{{ form_reference|default:'' }}"
+                           class="w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+                           placeholder="e.g. TXN-998811">
+                </div>
+                <div>
+                    <label for="payment_date" class="block text-xs font-semibold text-gray-700 uppercase mb-1">Payment Date</label>
+                    <input type="date" name="payment_date" id="payment_date" value="{{ form_payment_date|default:today_date }}"
+                           class="w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500 text-gray-900">
+                </div>
+            </div>
+
+            <div class="flex items-center gap-4 pt-4 border-t border-gray-200">
+                <button type="submit" name="action_preview" value="1"
+                        style="background: #2563eb; color: #ffffff; padding: 8px 18px; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer;">
+                    Preview FIFO Allocation (Dry Run)
+                </button>
+                <button type="submit" name="action_settle" value="1"
+                        onclick="return confirm('Are you sure you want to execute and settle this customer deposit? This will record payments and post revenue to General Ledger.');"
+                        style="background: #16a34a; color: #ffffff; padding: 8px 18px; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer;">
+                    Confirm &amp; Settle Invoices
+                </button>
+                <a href="{% url 'admin:core_customer_change' customer.pk %}"
+                   style="color: #4b5563; text-decoration: none; padding: 8px 16px; font-size: 14px;">
+                    Cancel
+                </a>
+            </div>
+        </form>
+    </div>
+
+    <!-- Projected FIFO Preview Table (If preview calculated) -->
+    {% if preview_data %}
+    <div class="bg-blue-50 rounded-xl shadow-sm border border-blue-200 p-6 space-y-4">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-2">
+            <div>
+                <span class="text-xs font-bold uppercase tracking-wider text-blue-800 bg-blue-100 px-2 py-0.5 rounded">Simulated Dry-Run</span>
+                <h3 class="text-lg font-bold text-blue-950 mt-1">Projected FIFO Allocation Breakdown</h3>
+            </div>
+            <div class="flex items-center gap-3 text-sm">
+                <div class="bg-white px-3 py-1.5 rounded border border-blue-200">
+                    <span class="text-gray-500">Deposit:</span> <strong>${{ preview_data.total_received|floatformat:2 }}</strong>
+                </div>
+                <div class="bg-white px-3 py-1.5 rounded border border-blue-200">
+                    <span class="text-gray-500">Allocated:</span> <strong class="text-green-700">${{ preview_data.total_allocated|floatformat:2 }}</strong>
+                </div>
+                <div class="bg-white px-3 py-1.5 rounded border border-blue-200">
+                    <span class="text-gray-500">Surplus Credit:</span> <strong class="text-blue-700">${{ preview_data.unallocated_amount|floatformat:2 }}</strong>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-lg border border-blue-200 overflow-hidden">
+            <table class="min-w-full divide-y divide-gray-200 text-sm">
+                <thead class="bg-gray-100 text-gray-700 font-medium">
+                    <tr>
+                        <th class="px-4 py-2.5 text-left">Invoice #</th>
+                        <th class="px-4 py-2.5 text-right">Balance Before</th>
+                        <th class="px-4 py-2.5 text-right">Allocated Amount</th>
+                        <th class="px-4 py-2.5 text-right">Balance After</th>
+                        <th class="px-4 py-2.5 text-center">Projected Status</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                    {% for alloc in preview_data.allocations %}
+                    <tr>
+                        <td class="px-4 py-3 font-semibold text-gray-900">{{ alloc.invoice_number }}</td>
+                        <td class="px-4 py-3 text-right text-gray-700">${{ alloc.balance_before|floatformat:2 }}</td>
+                        <td class="px-4 py-3 text-right font-bold text-green-700">+${{ alloc.allocated_amount|floatformat:2 }}</td>
+                        <td class="px-4 py-3 text-right font-bold {% if alloc.balance_after == 0 %}text-gray-400{% else %}text-red-600{% endif %}">
+                            ${{ alloc.balance_after|floatformat:2 }}
+                        </td>
+                        <td class="px-4 py-3 text-center">
+                            {% if alloc.projected_status == 'PAID' %}
+                            <span class="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-green-100 text-green-800">PAID</span>
+                            {% else %}
+                            <span class="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-800">PARTIALLY_PAID</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="5" class="px-4 py-4 text-center text-gray-500">No open invoices to allocate funds against.</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        {% if preview_data.unallocated_amount > 0 %}
+        <div class="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
+            <strong>Note on Overpayment:</strong> ${{ preview_data.unallocated_amount|floatformat:2 }} will remain as unallocated customer credit balance after all open invoices are settled.
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+</div>
+{% endblock %}

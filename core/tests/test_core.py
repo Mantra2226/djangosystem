@@ -102,9 +102,9 @@ class MRPEngineTestCase(TestCase):
             status="ON_HOLD_SHORTAGE"
         )
 
-        # Option 1: Auto-Draft PO
+        # Option 1: Auto-Draft PO (status defaults to DRAFT)
         draft_po = resolve_raw_autodraft_po(po, self.raw_mat.pk, Decimal("25.00"))
-        self.assertEqual(draft_po.status, "SENT")
+        self.assertEqual(draft_po.status, "DRAFT")
         self.assertEqual(draft_po.items.count(), 1)
         self.assertEqual(draft_po.items.first().quantity_ordered, Decimal("25.00"))
 
@@ -337,7 +337,7 @@ class MRPEngineTestCase(TestCase):
 
         inst_inline = WorkOrderInstructionInline(WorkOrderInstruction, site)
         inst_readonly = inst_inline.get_readonly_fields(request, draft_wo)
-        self.assertIn('status', inst_readonly)
+        self.assertNotIn('status', inst_readonly)
 
         mat_inline = WorkOrderMaterialLineInline(WorkOrderMaterialLine, site)
         mat_readonly = mat_inline.get_readonly_fields(request, draft_wo)
@@ -477,13 +477,15 @@ class MRPEngineTestCase(TestCase):
         po = PurchaseOrder.objects.create(supplier=self.supplier)
         self.assertEqual(po.status, "DRAFT")
 
-        # 2. Add line item -> status transitions to SENT
+        # 2. Add line item and send to supplier
         po_item = PurchaseOrderItem.objects.create(
             purchase_order=po,
             product=self.raw_mat,
             quantity_ordered=Decimal("100.00"),
             price_per_unit=Decimal("10.00")
         )
+        po.status = 'SENT'
+        po.save()
         po.refresh_from_db()
         self.assertEqual(po.status, "SENT")
 
@@ -1931,6 +1933,39 @@ class WorkOrderShortageResolutionEndToEndTestCase(TestCase):
         self.assertTrue(resp.context['shortage_metrics']['has_shortfall'])
         self.assertEqual(resp.context['shortage_metrics']['intermediate_product'], self.bulk_putty)
         self.assertIn(active_bulk, resp.context['active_bulk_orders'])
+
+    def test_concurrent_work_order_allocation_logging_breakdown(self):
+        """Verify that starting a second Work Order correctly itemizes prior active Work Orders holding allocated stock."""
+        raw_inv = Inventory.objects.get(product=self.raw_resin)
+        raw_inv.quantity_available = Decimal('500.00')
+        raw_inv.quantity_allocated = Decimal('0.00')
+        raw_inv.save()
+
+        # Start First Work Order (25 kg bulk putty x 0.8 kg resin = 20.00 kg resin)
+        wo1 = WorkOrder.objects.create(
+            product=self.bulk_putty,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("25.00"),
+            status='IN_PROGRESS'
+        )
+        wo1.process_inventory()
+
+        raw_inv.refresh_from_db()
+        self.assertEqual(raw_inv.quantity_allocated, Decimal('20.00'))
+        self.assertEqual(raw_inv.quantity_available, Decimal('480.00'))
+
+        # Start Second Work Order (requires another 20.00 kg resin)
+        wo2 = WorkOrder.objects.create(
+            product=self.bulk_putty,
+            bill_of_material=self.bulk_bom,
+            quantity_produced=Decimal("25.00"),
+            status='IN_PROGRESS'
+        )
+        wo2.process_inventory()
+
+        raw_inv.refresh_from_db()
+        self.assertEqual(raw_inv.quantity_allocated, Decimal('40.00'))
+        self.assertEqual(raw_inv.quantity_available, Decimal('460.00'))
 
 
 
