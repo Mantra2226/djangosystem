@@ -242,8 +242,10 @@ def get_ar_ap_aging_report():
     """
     today = timezone.now().date()
 
-    # Accounts Receivable (Sales Invoices unpaid/partial)
-    unpaid_sales_invoices = SalesInvoice.objects.filter(status__in=['Unpaid', 'Partial']).select_related('customer')
+    # Accounts Receivable (Sales Invoices unpaid/partial/draft/posted)
+    unpaid_sales_invoices = SalesInvoice.objects.filter(
+        status__in=['DRAFT', 'POSTED', 'PARTIALLY_PAID', 'Unpaid', 'Partial']
+    ).select_related('customer')
     
     ar_aging = {
         'current_30': Decimal('0.00'),

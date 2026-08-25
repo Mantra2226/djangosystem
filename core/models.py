@@ -1901,11 +1901,41 @@ class ProductionOrder(models.Model):
             except ObjectDoesNotExist:
                 wo_code = f"WO-{self.work_order_id}"
         return f"{code} ({self.get_status_display()}) - Blueprint: {wo_code}"            
+class DocumentSequence(models.Model):
+    document_type = models.CharField(max_length=32, unique=True, help_text="Unique key for the document type (e.g. 'SALES_INVOICE', 'CREDIT_NOTE', 'SALES_ORDER').")
+    prefix = models.CharField(max_length=16, help_text="Prefix used in generated codes (e.g. 'SINV', 'CN', 'SO').")
+    last_sequence = models.PositiveIntegerField(default=0, help_text="Monotonically increasing sequence counter.")
+
+    @classmethod
+    def get_next_number(cls, doc_type: str, default_prefix: str) -> str:
+        """
+        Uses select_for_update() inside an atomic transaction to increment and
+        return formatted sequential strings: f"{prefix}-{timezone.now().strftime('%Y%m')}-{seq:04d}".
+        """
+        with transaction.atomic():
+            seq_obj, _ = cls.objects.select_for_update().get_or_create(
+                document_type=doc_type,
+                defaults={'prefix': default_prefix, 'last_sequence': 0}
+            )
+            seq_obj.last_sequence += 1
+            seq_obj.save(update_fields=['last_sequence'])
+            
+            year_month = timezone.now().strftime('%Y%m')
+            prefix = seq_obj.prefix or default_prefix
+            return f"{prefix}-{year_month}-{seq_obj.last_sequence:04d}"
+
+    def __str__(self):
+        return f"Sequence: {self.document_type} ({self.prefix}) - Last: {self.last_sequence}"
+
 class Customer(models.Model):
     customer_id = models.AutoField(primary_key=True)    
     customer_name = models.CharField(max_length=255)
     contact_info = models.TextField()
     shipping_address = models.TextField()
+
+    @property
+    def invoices(self):
+        return self.sales_invoices
 
     def __str__(self):
         return self.customer_name
@@ -1918,9 +1948,19 @@ class SalesOrder(models.Model):
         ('completed', 'Completed'),
         ('cancelled', 'Cancelled'),
     ]
+    INVOICING_POLICY_CHOICES = [
+        ('ORDER_BASED', 'Invoice on Order Confirmation (Advance/Upfront)'),
+        ('DELIVERY_BASED', 'Invoice on Goods Dispatch (Post-Shipment)'),
+    ]
     
     order_number = models.CharField(max_length=50, unique=True, editable=False, blank=True)
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT)
+    invoicing_policy = models.CharField(
+        max_length=20,
+        choices=INVOICING_POLICY_CHOICES,
+        default='ORDER_BASED',
+        help_text="Controls whether invoices are generated upon order confirmation or upon physical dispatch."
+    )
     status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='draft', editable=False, db_index=True, help_text="Automated state machine based on items and dispatch progress.")
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1963,25 +2003,9 @@ class SalesOrder(models.Model):
         return new_status
 
     def save(self, *args, **kwargs):
-        # Auto-generate order number 
+        # Auto-generate order number atomically via DocumentSequence
         if not self.order_number:
-            year_month = timezone.now().strftime('%Y%m')
-            prefix = f"SO-{year_month}-"
-
-            latest_order = SalesOrder.objects.filter(
-                order_number__startswith=prefix
-            ).order_by('id').last()
-
-            if latest_order and latest_order.order_number:
-                try:
-                    last_sequence = int(latest_order.order_number.split('-')[-1])
-                    next_sequence = last_sequence + 1
-                except (ValueError, IndexError):
-                    next_sequence = 1
-            else:
-                next_sequence = 1
-
-            self.order_number = f"{prefix}{next_sequence:04d}"
+            self.order_number = DocumentSequence.get_next_number('SALES_ORDER', 'SO')
 
         super().save(*args, **kwargs)
 
@@ -1991,7 +2015,9 @@ class SalesOrder(models.Model):
     def confirm_and_generate_invoice(self):
         """
         Confirms the Sales Order (transitions to 'approved' if currently 'draft')
-        and generates an associated SalesInvoice.
+        and generates an associated SalesInvoice with itemized lines if invoicing_policy is 'ORDER_BASED'.
+        If 'DELIVERY_BASED', confirms the order without generating an upfront invoice.
+        Idempotent: Re-calling on an already invoiced order returns the existing invoice without duplicate creations.
         """
         if self.status == 'cancelled':
             raise ValidationError("Cannot confirm a cancelled Sales Order.")
@@ -2000,18 +2026,47 @@ class SalesOrder(models.Model):
             raise ValidationError("Cannot confirm a Sales Order with no items.")
 
         with transaction.atomic():
+            SalesOrder.objects.select_for_update().get(pk=self.pk)
+
+            # Idempotency Guard: Return existing active invoice if already created
+            existing_invoice = self.invoices.filter(
+                status__in=['DRAFT', 'POSTED', 'PARTIALLY_PAID', 'PAID']
+            ).first()
+            if existing_invoice:
+                if self.status != 'approved':
+                    self.status = 'approved'
+                    SalesOrder.objects.filter(pk=self.pk).update(status='approved')
+                return existing_invoice
+
             if self.status == 'draft':
                 self.status = 'approved'
                 SalesOrder.objects.filter(pk=self.pk).update(status='approved')
 
-            total_amount = sum(item.total_price for item in self.items.all())
+            if self.invoicing_policy == 'DELIVERY_BASED':
+                return None
 
             invoice = SalesInvoice.objects.create(
+                sales_order=self,
                 customer=self.customer,
-                total_amount=total_amount,
                 invoice_date=timezone.now().date(),
-                status='Unpaid'
+                status='POSTED'
             )
+
+            for item in self.items.all():
+                SalesInvoiceLine.objects.create(
+                    invoice=invoice,
+                    sales_order_item=item,
+                    product=item.product,
+                    quantity=item.quantity_ordered,
+                    unit_price=item.unit_price,
+                    tax_rate=Decimal('0.00'),
+                    tax_amount=Decimal('0.00'),
+                    subtotal=item.total_price,
+                    total_price=item.total_price
+                )
+
+            invoice.recalculate_totals(save=True)
+            invoice._sync_finance_entry()
 
         return invoice
 
@@ -2027,18 +2082,24 @@ class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey('Product', on_delete=models.PROTECT, limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})  
     quantity_ordered = models.DecimalField(max_digits=10, decimal_places=2)
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        validators=[MinValueValidator(Decimal('0.00'))],
+        help_text="Frozen transaction unit price at order creation. Does not mutate with catalog price updates."
+    )
     quantity_dispatched = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
 
     @property
-    def unit_price(self):
-        if self.product and self.product.selling_price is not None:
-            return self.product.selling_price
-        return Decimal('0.00')
+    def quantity(self):
+        return self.quantity_ordered
 
     @property
     def total_price(self):
         qty = Decimal(str(self.quantity_ordered or '0.00'))
-        return qty * self.unit_price
+        price = Decimal(str(self.unit_price or '0.00'))
+        return (qty * price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     def update_dispatched_quantity(self):
         """Recalculates the exact sum of all related shipped/delivered dispatches from the ground truth."""
@@ -2051,6 +2112,10 @@ class SalesOrderItem(models.Model):
             self.save(update_fields=['quantity_dispatched'])
 
     def save(self, *args, **kwargs):
+        # Auto-freeze unit_price from catalog selling price on creation if not explicitly set
+        if (self.unit_price == Decimal('0.00') or self.unit_price is None) and self.product and self.product.selling_price is not None:
+            self.unit_price = self.product.selling_price
+
         super().save(*args, **kwargs)
         if self.sales_order_id:
             self.sales_order.update_status(save=True)
@@ -2062,7 +2127,7 @@ class SalesOrderItem(models.Model):
             so.update_status(save=True)
 
     def __str__(self):
-        return f"Item: {self.product.name} ({self.quantity_dispatched}/{self.quantity_ordered} Dispatched)"
+        return f"Item: {self.product.name} ({self.quantity_dispatched}/{self.quantity_ordered} Dispatched @ ${self.unit_price})"
 
 class DispatchRecord(models.Model):
     STATUS_CHOICES = [
@@ -2197,6 +2262,33 @@ class DispatchRecord(models.Model):
 
             self._sync_parent_order_status()
 
+            # Delivery-Based Invoicing on Dispatch Fulfillment
+            if is_deducting_now and self.sales_order_item and self.sales_order_item.sales_order:
+                so = self.sales_order_item.sales_order
+                if so.invoicing_policy == 'DELIVERY_BASED':
+                    existing_inv = SalesInvoice.objects.filter(dispatch=self).first()
+                    if not existing_inv:
+                        invoice = SalesInvoice.objects.create(
+                            sales_order=so,
+                            dispatch=self,
+                            customer=self.customer or so.customer,
+                            invoice_date=timezone.now().date(),
+                            status='POSTED'
+                        )
+                        SalesInvoiceLine.objects.create(
+                            invoice=invoice,
+                            sales_order_item=self.sales_order_item,
+                            product=self.product,
+                            quantity=self.quantity_dispatched,
+                            unit_price=self.sales_order_item.unit_price,
+                            tax_rate=Decimal('0.00'),
+                            tax_amount=Decimal('0.00'),
+                            subtotal=self.quantity_dispatched * self.sales_order_item.unit_price,
+                            total_price=self.quantity_dispatched * self.sales_order_item.unit_price
+                        )
+                        invoice.recalculate_totals(save=True)
+                        invoice._sync_finance_entry()
+
             # Refresh original tracked values for instance reuse
             self._orig_quantity = self.quantity_dispatched
             self._orig_status = self.status
@@ -2258,22 +2350,40 @@ class DispatchRecord(models.Model):
         status_str = f" [{self.get_status_display()}]"
         date_str = f" delivered {self.delivery_date}" if self.delivery_date else ""
         return f"{code}{status_str} — {self.quantity_dispatched}x {self.product.name}{date_str}"
+
 class SalesInvoice(models.Model):
-    ENTRY_TYPE_CHOICES = [
-        ('Paid', 'Paid'),
-        ('Partial', 'Partial Payment'),
-        ('Unpaid', 'Unpaid'),
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('POSTED', 'Posted/Issued'),
+        ('PARTIALLY_PAID', 'Partially Paid'),
+        ('PAID', 'Paid'),
+        ('CREDITED', 'Credited'),
+        ('CANCELLED', 'Cancelled'),
     ]
     invoice_id = models.AutoField(primary_key=True)
     invoice_number = models.CharField(max_length=255, unique=True, editable=False, blank=True, help_text="Unique identifier for the invoice. Auto-generated.")
+    sales_order = models.ForeignKey(SalesOrder, on_delete=models.PROTECT, null=True, blank=True, related_name='invoices', help_text="Originating sales order.")
     customer = models.ForeignKey('Customer', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
     dispatch = models.ForeignKey('DispatchRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='sales_invoices')
     invoice_date = models.DateField(default=timezone.now, db_index=True)
-    total_amount = models.DecimalField(max_digits=10, decimal_places=2, editable=False, default=Decimal('0.00'))
-    status = models.CharField(max_length=255, choices=ENTRY_TYPE_CHOICES, default='Unpaid', db_index=True)
+    due_date = models.DateField(null=True, blank=True, help_text="Payment due date.")
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'), help_text="Net invoice amount before taxes.")
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'), help_text="Total tax assessed on this invoice.")
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, editable=False, default=Decimal('0.00'), help_text="Grand total (Subtotal + Tax).")
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='DRAFT', db_index=True)
 
     def clean(self):  
         super().clean()     
+        if self.subtotal is not None:
+            self.subtotal = Decimal(str(self.subtotal)).quantize(
+                Decimal('0.01'), 
+                rounding=ROUND_HALF_UP
+            )
+        if self.tax_amount is not None:
+            self.tax_amount = Decimal(str(self.tax_amount)).quantize(
+                Decimal('0.01'), 
+                rounding=ROUND_HALF_UP
+            )
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
@@ -2283,15 +2393,26 @@ class SalesInvoice(models.Model):
             raise ValidationError({'invoice_date': 'Invoice date cannot be earlier than the physical dispatch date.'}) 
 
     def save(self, *args, **kwargs):
-        # Auto-calculate total amount based on dispatch volume and selling price
-        if self.dispatch and self.dispatch.product:
+        # Auto-calculate total amount based on dispatch volume and selling price if dispatch present and no lines exist
+        if self.dispatch and self.dispatch.product and not self.pk:
             price = self.dispatch.product.selling_price or Decimal('0.00')
             if price == Decimal('0.00') and hasattr(self.dispatch.product, 'stock'):
                 inv = self.dispatch.product.stock.first()
                 if inv and inv.unit_cost:
                     price = inv.unit_cost
-            self.total_amount = (self.dispatch.quantity_dispatched or Decimal('0.00')) * price
+            self.subtotal = (self.dispatch.quantity_dispatched or Decimal('0.00')) * price
+            self.total_amount = self.subtotal
 
+        if self.subtotal is not None:
+            self.subtotal = Decimal(str(self.subtotal)).quantize(
+                Decimal('0.01'), 
+                rounding=ROUND_HALF_UP
+            )
+        if self.tax_amount is not None:
+            self.tax_amount = Decimal(str(self.tax_amount)).quantize(
+                Decimal('0.01'), 
+                rounding=ROUND_HALF_UP
+            )
         if self.total_amount is not None:
             self.total_amount = Decimal(str(self.total_amount)).quantize(
                 Decimal('0.01'), 
@@ -2299,25 +2420,30 @@ class SalesInvoice(models.Model):
             )
        
         if not self.invoice_number:
-            year_month = timezone.now().strftime('%Y%m')
-            prefix = f"SINV-{year_month}-"
-            latest = SalesInvoice.objects.filter(
-                invoice_number__startswith=prefix
-            ).order_by('-invoice_number').first()
-
-            if latest and latest.invoice_number:
-                try:
-                    last_seq = int(latest.invoice_number.split('-')[-1])
-                    next_seq = last_seq + 1
-                except (ValueError, IndexError):
-                    next_seq = 1
-            else:
-                next_seq = 1
-
-            self.invoice_number = f"{prefix}{next_seq:04d}"
+            self.invoice_number = DocumentSequence.get_next_number('SALES_INVOICE', 'SINV')
 
         self.full_clean()    
         super().save(*args, **kwargs)
+        if self.pk:
+            self._sync_finance_entry()
+
+    def _sync_finance_entry(self):
+        """Auto-posts/updates revenue entry in General Ledger (FinanceEntry) for posted invoices."""
+        if self.status in ['POSTED', 'PAID', 'PARTIALLY_PAID'] and self.total_amount and self.total_amount > Decimal('0.00'):
+            entry_date = self.invoice_date or timezone.now().date()
+            FinanceEntry.objects.update_or_create(
+                sales_invoice=self,
+                category='SALES',
+                entry_type='REVENUE',
+                defaults={
+                    'amount': self.total_amount,
+                    'entry_date': entry_date
+                }
+            )
+
+    @property
+    def payments(self):
+        return self.sales_payments
 
     @property
     def total_paid(self):
@@ -2338,11 +2464,11 @@ class SalesInvoice(models.Model):
         total = self.total_amount or Decimal('0.00')
         
         if paid >= total and total > Decimal('0.00'):
-            new_status = 'Paid'
+            new_status = 'PAID'
         elif paid > Decimal('0.00'):
-            new_status = 'Partial'
+            new_status = 'PARTIALLY_PAID'
         else:
-            new_status = 'Unpaid'
+            new_status = 'DRAFT' if self.status in ['DRAFT', 'Unpaid', 'POSTED'] else self.status
 
         if self.status != new_status:
             self.status = new_status
@@ -2350,8 +2476,140 @@ class SalesInvoice(models.Model):
                 SalesInvoice.objects.filter(pk=self.pk).update(status=new_status)
         return new_status
 
+    def recalculate_totals(self, save=True):
+        """Recalculates subtotal, tax_amount, and total_amount based on child SalesInvoiceLine items."""
+        lines = list(self.lines.all())
+        if lines:
+            self.subtotal = sum(Decimal(str(l.subtotal or '0.00')) for l in lines).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            self.tax_amount = sum(Decimal(str(l.tax_amount or '0.00')) for l in lines).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            self.total_amount = sum(Decimal(str(l.total_price or '0.00')) for l in lines).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if save and self.pk:
+            SalesInvoice.objects.filter(pk=self.pk).update(
+                subtotal=self.subtotal,
+                tax_amount=self.tax_amount,
+                total_amount=self.total_amount
+            )
+            self._sync_finance_entry()
+
     def __str__(self):
-        return f"Sales Invoice #{self.invoice_number} — ${self.total_amount:.2f} ({self.customer.customer_name if self.customer else 'N/A'})"
+        return f"Sales Invoice #{self.invoice_number} — ${self.total_amount:.2f} ({self.customer.customer_name if self.customer else 'N/A'}) [{self.get_status_display()}]"
+
+class SalesInvoiceLine(models.Model):
+    invoice = models.ForeignKey(SalesInvoice, on_delete=models.CASCADE, related_name='lines')
+    sales_order_item = models.ForeignKey(SalesOrderItem, on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice_lines')
+    product = models.ForeignKey('Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))])
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0.00'), help_text="Tax percentage (e.g. 16.00 for 16% VAT).")
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    total_price = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+
+    def save(self, *args, **kwargs):
+        qty = Decimal(str(self.quantity or '0.00'))
+        price = Decimal(str(self.unit_price or '0.00'))
+        rate = Decimal(str(self.tax_rate or '0.00'))
+
+        self.subtotal = (qty * price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        self.tax_amount = (self.subtotal * (rate / Decimal('100.00'))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        self.total_price = (self.subtotal + self.tax_amount).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        self.full_clean()
+        super().save(*args, **kwargs)
+        if self.invoice_id:
+            self.invoice.recalculate_totals(save=True)
+
+    def __str__(self):
+        return f"Invoice Line: {self.product.name} ({self.quantity} @ ${self.unit_price})"
+
+class CreditNote(models.Model):
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('POSTED', 'Posted'),
+        ('REFUNDED', 'Refunded'),
+    ]
+    credit_note_id = models.AutoField(primary_key=True)
+    credit_note_number = models.CharField(max_length=64, unique=True, editable=False, blank=True)
+    invoice = models.ForeignKey(SalesInvoice, on_delete=models.PROTECT, related_name='credit_notes')
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name='credit_notes', null=True, blank=True)
+    issue_date = models.DateField(default=timezone.now, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT', db_index=True)
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    reason = models.CharField(max_length=255, blank=True, default='')
+
+    def save(self, *args, **kwargs):
+        if not self.credit_note_number:
+            self.credit_note_number = DocumentSequence.get_next_number('CREDIT_NOTE', 'CN')
+        if not self.customer and self.invoice and self.invoice.customer:
+            self.customer = self.invoice.customer
+        self.full_clean()
+        super().save(*args, **kwargs)
+        if self.pk:
+            self._sync_finance_entry()
+
+    def _sync_finance_entry(self):
+        """Auto-posts/updates refund expense entry in General Ledger (FinanceEntry) for posted credit notes."""
+        if self.status in ['POSTED', 'REFUNDED'] and self.total_amount and self.total_amount > Decimal('0.00') and self.invoice_id:
+            entry_date = self.issue_date or timezone.now().date()
+            FinanceEntry.objects.update_or_create(
+                sales_invoice=self.invoice,
+                category='CUSTOMER_REFUND',
+                entry_type='EXPENSE',
+                defaults={
+                    'amount': self.total_amount,
+                    'entry_date': entry_date
+                }
+            )
+
+    def recalculate_totals(self, save=True):
+        lines = list(self.lines.all())
+        if lines:
+            self.subtotal = sum(Decimal(str(l.subtotal or '0.00')) for l in lines).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            self.tax_amount = sum(Decimal(str(l.tax_amount or '0.00')) for l in lines).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            self.total_amount = sum(Decimal(str(l.total_price or '0.00')) for l in lines).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            self.subtotal = Decimal('0.00')
+            self.tax_amount = Decimal('0.00')
+            self.total_amount = Decimal('0.00')
+        if save and self.pk:
+            CreditNote.objects.filter(pk=self.pk).update(
+                subtotal=self.subtotal,
+                tax_amount=self.tax_amount,
+                total_amount=self.total_amount
+            )
+            self._sync_finance_entry()
+
+    def __str__(self):
+        return f"Credit Note #{self.credit_note_number} — ${self.total_amount:.2f} ({self.get_status_display()})"
+
+class CreditNoteLine(models.Model):
+    credit_note = models.ForeignKey(CreditNote, on_delete=models.CASCADE, related_name='lines')
+    product = models.ForeignKey('Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))])
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0.00'), help_text="Tax percentage.")
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    total_price = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+
+    def save(self, *args, **kwargs):
+        qty = Decimal(str(self.quantity or '0.00'))
+        price = Decimal(str(self.unit_price or '0.00'))
+        rate = Decimal(str(self.tax_rate or '0.00'))
+
+        self.subtotal = (qty * price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        self.tax_amount = (self.subtotal * (rate / Decimal('100.00'))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        self.total_price = (self.subtotal + self.tax_amount).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        self.full_clean()
+        super().save(*args, **kwargs)
+        if self.credit_note_id:
+            self.credit_note.recalculate_totals(save=True)
+
+    def __str__(self):
+        return f"CN Line: {self.product.name} ({self.quantity} @ ${self.unit_price})"
 
 class SalesInvoicePayments(models.Model):
     invoice = models.ForeignKey('SalesInvoice', on_delete=models.CASCADE, related_name='sales_payments')
@@ -2377,6 +2635,15 @@ class SalesInvoicePayments(models.Model):
             super().save(*args, **kwargs)
             if self.invoice:
                 self.invoice.update_payment_status(save=True)
+                # Auto-post payment finance entry
+                payment_date = self.paid_at.date() if (self.paid_at and hasattr(self.paid_at, 'date')) else timezone.now().date()
+                FinanceEntry.objects.create(
+                    sales_invoice=self.invoice,
+                    entry_type='REVENUE',
+                    category='SALES',
+                    amount=self.amount,
+                    entry_date=payment_date
+                )
 
     def delete(self, *args, **kwargs):
         inv = self.invoice
@@ -2536,58 +2803,75 @@ class Return(models.Model):
     return_warehouse_location = models.CharField(max_length=255, default='Main Warehouse')
 
     def save(self, *args, **kwargs):
-        # 1. Secure our references (handles whether production_order is a direct field or accessed via dispatch)
-        prod_order = getattr(self, 'production_order', None) or (self.dispatch.production_order if self.dispatch else None)
-
-        # 2. Quantize internal financial fields BEFORE running any validation checks
-        if prod_order and self.quantity_returned:
-            raw_amount = self.quantity_returned * prod_order.product.cost_per_unit
-            
-            if hasattr(self, 'total_amount'):
-                self.total_amount = raw_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            if hasattr(self, 'refund_amount'):
-                self.refund_amount = raw_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        else:
-            if hasattr(self, 'total_amount') and not self.total_amount:
-                self.total_amount = Decimal('0.00')
-            if hasattr(self, 'refund_amount') and not self.refund_amount:
-                self.refund_amount = Decimal('0.00')
-
-        # Run model clean data validations now that our numbers are perfectly formatted
+        # 1. Run model clean data validations
         self.full_clean()
 
-        # 3. Detect historical state to prevent duplicate stock updates on multiple edits
+        # 2. Detect historical state to prevent duplicate stock updates on multiple edits
         previously_approved = False
         if self.pk:
             previously_approved = Return.objects.filter(pk=self.pk, quality_control_status='APPROVED').exists()
 
-        # 4. Execute database operations in a single, safe atomic pass
+        # 3. Execute database operations in a single, safe atomic pass
         with transaction.atomic():
-            # Run the primary database save exactly ONCE
             super().save(*args, **kwargs)
 
-            # If return is approved, adjust inventory and credit the customer's invoice balance
+            # If return is approved, adjust inventory and issue CreditNote
             if self.quality_control_status == 'APPROVED' and not previously_approved:
-                
-                # Step A: Return the physical items back into warehouse inventory logs
-                if prod_order:
+                product = self.dispatch.product if self.dispatch else None
+
+                # Locate the originating billed SalesInvoice
+                invoice_record = None
+                if self.dispatch:
+                    invoice_record = SalesInvoice.objects.filter(dispatch=self.dispatch).first()
+                    if not invoice_record and self.dispatch.sales_order_item and self.dispatch.sales_order_item.sales_order:
+                        invoice_record = self.dispatch.sales_order_item.sales_order.invoices.first()
+
+                # Determine unit price billed (customer selling price snapshot, not factory cost)
+                unit_price_billed = Decimal('0.00')
+                if self.dispatch and self.dispatch.sales_order_item and self.dispatch.sales_order_item.unit_price:
+                    unit_price_billed = self.dispatch.sales_order_item.unit_price
+                elif product and product.selling_price:
+                    unit_price_billed = product.selling_price
+
+                # Step A: Issue CreditNote and CreditNoteLine
+                if invoice_record and product:
+                    credit_note = CreditNote.objects.create(
+                        invoice=invoice_record,
+                        customer=self.customer or invoice_record.customer,
+                        issue_date=timezone.now().date(),
+                        status='POSTED',
+                        reason=self.reason_for_return or 'Customer RMA Return'
+                    )
+                    CreditNoteLine.objects.create(
+                        credit_note=credit_note,
+                        product=product,
+                        quantity=self.quantity_returned,
+                        unit_price=unit_price_billed,
+                        tax_rate=Decimal('0.00'),
+                        tax_amount=Decimal('0.00'),
+                        subtotal=self.quantity_returned * unit_price_billed,
+                        total_price=self.quantity_returned * unit_price_billed
+                    )
+                    credit_note.recalculate_totals(save=True)
+                    credit_note._sync_finance_entry()
+
+                # Step B: Return physical items back into warehouse inventory and log transaction
+                if product:
                     inventory_item, created = Inventory.objects.get_or_create(
-                        product=prod_order.product,
-                        location=self.return_warehouse_location,
+                        product=product,
+                        location=self.return_warehouse_location or 'Main Warehouse',
                         defaults={'quantity_available': Decimal('0.00')}
                     )
                     inventory_item.quantity_available += self.quantity_returned
-                    inventory_item.save()
+                    inventory_item.save(update_fields=['quantity_available'])
 
-                # Step B: Safely deduct returned items cost from the associated SalesInvoice row
-                invoice_record = SalesInvoice.objects.filter(dispatch=self.dispatch).first()
-                if invoice_record and invoice_record.total_amount and prod_order:
-                    raw_return_value = self.quantity_returned * prod_order.product.cost_per_unit
-                    return_value = raw_return_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    invoice_record.total_amount -= return_value
-                    # Extra safety shield: ensure the final invoice total is cleanly quantized too
-                    invoice_record.total_amount = invoice_record.total_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                    invoice_record.save()
+                    StockTransaction.objects.create(
+                        product=product,
+                        dispatch_record=self.dispatch,
+                        quantity=self.quantity_returned,
+                        transaction_type='ADJUSTMENT',
+                        notes=f"RMA Return #{self.return_id} Restock: {self.reason_for_return}"
+                    )
 
     def __str__(self):
         return f"Return #{self.return_id} — {self.quantity_returned} units from Dispatch #{self.dispatch.dispatch_id} ({self.quality_control_status})"        

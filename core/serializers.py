@@ -7,10 +7,13 @@ validation/deserialization for core ERP domain models.
 
 from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.utils import timezone
 from .models import (
     Product, Inventory, WorkOrder, WorkOrderMaterialLine, WorkOrderInstruction,
     ProductionOrder, SalesOrder, SalesOrderItem, ProcurementOrder, PurchaseOrder,
-    DispatchRecord, SalesInvoice, FinanceEntry, MaterialVarianceRecord, StockTransaction, Supplier, Customer
+    DispatchRecord, SalesInvoice, FinanceEntry, MaterialVarianceRecord, StockTransaction,
+    Supplier, Customer, DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
 )
 
 
@@ -185,7 +188,7 @@ class ProcurementOrderSerializer(BaseSerializer):
         }
 
 
-class SalesOrderSerializer(BaseSerializer):
+class LegacySalesOrderSerializer(BaseSerializer):
     """Serializes Customer Sales Orders and line items."""
 
     @classmethod
@@ -197,6 +200,7 @@ class SalesOrderSerializer(BaseSerializer):
             "order_number": obj.order_number,
             "customer_id": obj.customer_id,
             "customer_name": obj.customer.customer_name if obj.customer else "",
+            "invoicing_policy": obj.invoicing_policy,
             "status": obj.status,
             "created_at": obj.created_at.isoformat() if obj.created_at else None,
             "order_total": float(order_total),
@@ -206,6 +210,7 @@ class SalesOrderSerializer(BaseSerializer):
                     "product_id": item.product_id,
                     "product_name": item.product.name if item.product else "",
                     "quantity_ordered": float(item.quantity_ordered or 0.0),
+                    "unit_price": float(item.unit_price or 0.0),
                     "total_price": float(item.total_price or 0.0)
                 } for item in items
             ]
@@ -369,5 +374,280 @@ class WorkOrderDetailDRFSerializer(serializers.ModelSerializer):
             pct = (actual / target) * Decimal('100.00')
             return str(pct.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         return None
+
+
+# =============================================================================
+# SALES & BILLING SUBSYSTEM DRF SERIALIZERS (MILESTONE 3)
+# =============================================================================
+
+class SalesOrderItemSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesOrderItem lines.
+    Freezes unit_price from catalog if not explicitly specified.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    unit_price = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        min_value=Decimal('0.00')
+    )
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = SalesOrderItem
+        fields = [
+            'id', 'product', 'product_name', 'quantity_ordered',
+            'unit_price', 'total_price'
+        ]
+
+
+class SalesInvoiceLineSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesInvoiceLine items.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    tax_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    subtotal = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = SalesInvoiceLine
+        fields = [
+            'id', 'product', 'product_name', 'quantity', 'unit_price',
+            'tax_rate', 'tax_amount', 'subtotal', 'total_price'
+        ]
+
+
+class CreditNoteLineSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for CreditNoteLine items.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    tax_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    subtotal = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = CreditNoteLine
+        fields = [
+            'id', 'product', 'product_name', 'quantity', 'unit_price',
+            'tax_rate', 'tax_amount', 'subtotal', 'total_price'
+        ]
+
+
+class SalesInvoicePaymentPayloadSerializer(serializers.Serializer):
+    """
+    Validates payment collection payloads for sales invoices.
+    """
+    amount = serializers.DecimalField(
+        required=True,
+        min_value=Decimal('0.01'),
+        max_digits=12,
+        decimal_places=2
+    )
+    payment_method = serializers.ChoiceField(
+        choices=['CASH', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT_CARD', 'CARD', 'TRANSFER'],
+        default='BANK_TRANSFER'
+    )
+    reference = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=128,
+        default=''
+    )
+
+
+class CreditNoteCreatePayloadSerializer(serializers.Serializer):
+    """
+    Validates manual credit note creation payloads.
+    """
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=255,
+        default=''
+    )
+    lines = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list
+    )
+
+
+class SalesOrderSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesOrder instances with nested line items.
+    Supports atomic nested creation of lines with catalog price freezing.
+    """
+    id = serializers.IntegerField(source='pk', read_only=True)
+    order_number = serializers.CharField(read_only=True)
+    customer_name = serializers.CharField(source='customer.customer_name', read_only=True)
+    order_date = serializers.SerializerMethodField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    total_amount = serializers.SerializerMethodField(read_only=True)
+    items = SalesOrderItemSerializer(many=True, required=False)
+
+    class Meta:
+        model = SalesOrder
+        fields = [
+            'id', 'order_number', 'customer', 'customer_name', 'order_date',
+            'status', 'invoicing_policy', 'total_amount', 'items'
+        ]
+
+    def get_order_date(self, obj):
+        return obj.created_at.date() if obj.created_at else None
+
+    def get_total_amount(self, obj):
+        items = obj.items.all()
+        return sum((item.total_price for item in items), Decimal('0.00'))
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        with transaction.atomic():
+            sales_order = SalesOrder.objects.create(**validated_data)
+            for item_data in items_data:
+                product = item_data.get('product')
+                quantity_ordered = item_data.get('quantity_ordered')
+                unit_price = item_data.get('unit_price')
+                if unit_price is None or unit_price == Decimal('0.00'):
+                    unit_price = product.selling_price if product and product.selling_price is not None else Decimal('0.00')
+                SalesOrderItem.objects.create(
+                    sales_order=sales_order,
+                    product=product,
+                    quantity_ordered=quantity_ordered,
+                    unit_price=unit_price
+                )
+            sales_order.update_status(save=True)
+        return sales_order
+
+
+class SalesInvoiceSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for SalesInvoice instances with itemized lines.
+    """
+    id = serializers.IntegerField(source='invoice_id', read_only=True)
+    sales_order_number = serializers.CharField(source='sales_order.order_number', read_only=True, default='')
+    customer_name = serializers.CharField(source='customer.customer_name', read_only=True, default='')
+    lines = SalesInvoiceLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SalesInvoice
+        fields = [
+            'id', 'invoice_number', 'sales_order', 'sales_order_number',
+            'customer', 'customer_name', 'invoice_date', 'due_date',
+            'status', 'subtotal', 'tax_amount', 'total_amount', 'lines'
+        ]
+
+
+class CreditNoteSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for CreditNote instances with itemized lines.
+    """
+    id = serializers.IntegerField(source='credit_note_id', read_only=True)
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True, default='')
+    customer_name = serializers.CharField(source='customer.customer_name', read_only=True, default='')
+    lines = CreditNoteLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CreditNote
+        fields = [
+            'id', 'credit_note_number', 'invoice', 'invoice_number',
+            'customer', 'customer_name', 'issue_date', 'status',
+            'subtotal', 'tax_amount', 'total_amount', 'reason', 'lines'
+        ]
+
+
+class CustomerSerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for Customer instances.
+    Exposes customer attributes and contact details.
+    """
+    id = serializers.IntegerField(source='customer_id', read_only=True)
+    name = serializers.CharField(source='customer_name', required=False)
+    email = serializers.SerializerMethodField()
+    phone_number = serializers.SerializerMethodField()
+    address = serializers.CharField(source='shipping_address', required=False)
+    created_at = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Customer
+        fields = [
+            'id', 'name', 'customer_name', 'email', 'phone_number',
+            'contact_info', 'address', 'shipping_address', 'created_at'
+        ]
+
+    def get_email(self, obj):
+        info = obj.contact_info or ''
+        if '@' in info:
+            return info
+        return ''
+
+    def get_phone_number(self, obj):
+        info = obj.contact_info or ''
+        if '@' not in info and info:
+            return info
+        return ''
+
+    def get_created_at(self, obj):
+        return None
+
+
+class BulkPaymentAllocationPayloadSerializer(serializers.Serializer):
+    """
+    Validates customer lump-sum bulk payment allocation request payloads.
+    """
+    amount = serializers.DecimalField(
+        required=True,
+        min_value=Decimal('0.01'),
+        max_digits=12,
+        decimal_places=2
+    )
+    payment_method = serializers.ChoiceField(
+        choices=['CASH', 'BANK_TRANSFER', 'CHEQUE', 'CREDIT_CARD', 'CARD', 'TRANSFER'],
+        default='BANK_TRANSFER'
+    )
+    reference = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=128,
+        default=''
+    )
+    payment_date = serializers.DateField(
+        required=False,
+        default=timezone.now
+    )
+
+
+class InvoiceAllocationItemSerializer(serializers.Serializer):
+    """
+    Serializes individual invoice allocation slice in allocation preview and confirmation results.
+    """
+    invoice_id = serializers.IntegerField()
+    invoice_number = serializers.CharField()
+    invoice_date = serializers.DateField()
+    total_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    already_paid = serializers.DecimalField(max_digits=12, decimal_places=2)
+    balance_before = serializers.DecimalField(max_digits=12, decimal_places=2)
+    allocated_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    balance_after = serializers.DecimalField(max_digits=12, decimal_places=2)
+    projected_status = serializers.CharField()
+
+
+class BulkPaymentAllocationResponseSerializer(serializers.Serializer):
+    """
+    Serializes the aggregated response for customer bulk payment allocation (preview and atomic execution).
+    """
+    customer_id = serializers.IntegerField()
+    customer_name = serializers.CharField()
+    total_received = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_allocated = serializers.DecimalField(max_digits=12, decimal_places=2)
+    unallocated_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    allocations = InvoiceAllocationItemSerializer(many=True)
+
+
 
 

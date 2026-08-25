@@ -268,7 +268,7 @@ class WorkOrderAdminActionViewsTestCase(TestCase):
         invoice = SalesInvoice.objects.filter(customer=customer).first()
         self.assertIsNotNone(invoice)
         self.assertEqual(invoice.total_amount, Decimal('1000.00'))
-        self.assertEqual(invoice.status, 'Unpaid')
+        self.assertEqual(invoice.status, 'POSTED')
 
     def test_admin_change_form_renders_action_buttons(self):
         """Verifies change_form.html renders Start Production button on DRAFT and shortage pathways on AWAITING_RESOLUTION."""

@@ -1,13 +1,15 @@
 from django.shortcuts import render, redirect
 from django.contrib import messages
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
+from django.core.exceptions import ValidationError
 from django.contrib.admin.views.decorators import staff_member_required
 from django.views.decorators.csrf import csrf_exempt
 from .models import (
     DispatchRecord, ProcurementOrder, Product, Supplier, Inventory, 
     ProductionOrder, SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, 
     Employee, Customer, WorkOrder, WorkOrderInstruction, SalesOrder,
-    PurchaseOrder, WorkOrderMaterialLine, StockTransaction, BillOfMaterial, BOMItem
+    PurchaseOrder, WorkOrderMaterialLine, StockTransaction, BillOfMaterial, BOMItem,
+    CreditNote, CreditNoteLine, SalesInvoiceLine, SalesInvoicePayments
 )
 
 def index(request):
@@ -367,7 +369,7 @@ import json
 from django.views.decorators.csrf import csrf_protect
 from .serializers import (
     ProductSerializer, InventorySerializer, WorkOrderSerializer,
-    ProductionOrderSerializer, ProcurementOrderSerializer, SalesOrderSerializer
+    ProductionOrderSerializer, ProcurementOrderSerializer, LegacySalesOrderSerializer
 )
 
 @csrf_exempt
@@ -424,7 +426,7 @@ def api_production_orders_list(request):
 def api_sales_orders_list(request):
     """GET /api/sales-orders/ - Returns list of serialized Customer Sales Orders."""
     qs = SalesOrder.objects.select_related('customer').prefetch_related('items__product').all()
-    data = SalesOrderSerializer.serialize_queryset(qs)
+    data = LegacySalesOrderSerializer.serialize_queryset(qs)
     return JsonResponse({"status": "success", "data": data}, status=200)
 
 
@@ -443,19 +445,31 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import viewsets, mixins, status
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .permissions import (
     IsProductionSupervisor,
     IsShopFloorOperatorOrSupervisor,
-    IsWorkOrderActiveForLogging
+    IsWorkOrderActiveForLogging,
+    IsSalesOrBillingStaff
 )
 from .serializers import (
     MaterialLogSerializer,
     MaterialLineDRFSerializer,
     WorkOrderDetailDRFSerializer,
-    WorkOrderCompletionSerializer
+    WorkOrderCompletionSerializer,
+    SalesOrderSerializer,
+    SalesInvoiceSerializer,
+    CreditNoteSerializer,
+    SalesInvoicePaymentPayloadSerializer,
+    CreditNoteCreatePayloadSerializer,
+    CustomerSerializer,
+    BulkPaymentAllocationPayloadSerializer,
+    InvoiceAllocationItemSerializer,
+    BulkPaymentAllocationResponseSerializer
 )
+from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf
 
 
 class WorkOrderViewSet(mixins.ListModelMixin,
@@ -662,6 +676,319 @@ class WorkOrderViewSet(mixins.ListModelMixin,
         except ValidationError as e:
             error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
             return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# =============================================================================
+# ORDER-TO-CASH (O2C) / BILLING SUBSYSTEM DRF VIEWSETS (MILESTONE 3)
+# =============================================================================
+
+class SalesOrderViewSet(viewsets.ModelViewSet):
+    """
+    DRF ViewSet for Sales Orders in the Order-to-Cash lifecycle.
+    """
+    serializer_class = SalesOrderSerializer
+    permission_classes = [IsAuthenticated, IsSalesOrBillingStaff]
+
+    def get_queryset(self):
+        queryset = SalesOrder.objects.select_related('customer').prefetch_related('items__product').order_by('-id')
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        customer_param = self.request.query_params.get('customer')
+        if customer_param:
+            queryset = queryset.filter(customer_id=customer_param)
+        invoicing_policy_param = self.request.query_params.get('invoicing_policy')
+        if invoicing_policy_param:
+            queryset = queryset.filter(invoicing_policy=invoicing_policy_param)
+        return queryset
+
+    @action(detail=True, methods=['post'], url_path='confirm')
+    def confirm(self, request, pk=None):
+        """
+        Confirms the Sales Order and creates an upfront commercial invoice if ORDER_BASED.
+        """
+        sales_order = self.get_object()
+        try:
+            invoice = sales_order.confirm_and_generate_invoice()
+            sales_order.refresh_from_db()
+            response_data = {
+                'sales_order': SalesOrderSerializer(sales_order).data,
+                'invoice': SalesInvoiceSerializer(invoice).data if invoice else None
+            }
+            return Response(response_data, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SalesInvoiceViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    DRF ViewSet for Commercial Sales Invoices.
+    """
+    serializer_class = SalesInvoiceSerializer
+    permission_classes = [IsAuthenticated, IsSalesOrBillingStaff]
+
+    def get_queryset(self):
+        queryset = SalesInvoice.objects.select_related(
+            'customer', 'sales_order', 'dispatch'
+        ).prefetch_related('lines__product', 'sales_payments').order_by('-invoice_id')
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        customer_param = self.request.query_params.get('customer')
+        if customer_param:
+            queryset = queryset.filter(customer_id=customer_param)
+        sales_order_param = self.request.query_params.get('sales_order')
+        if sales_order_param:
+            queryset = queryset.filter(sales_order_id=sales_order_param)
+        return queryset
+
+    @action(detail=True, methods=['post'], url_path='record-payment')
+    def record_payment(self, request, pk=None):
+        """
+        Records a customer payment against the sales invoice.
+        Updates payment status and writes General Ledger revenue entry.
+        """
+        invoice = self.get_object()
+        serializer = SalesInvoicePaymentPayloadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        amount = serializer.validated_data['amount']
+        payment_method = serializer.validated_data.get('payment_method', 'BANK_TRANSFER')
+        reference = serializer.validated_data.get('reference', '')
+
+        # Map API choices to model choices ('CASH', 'CARD', 'TRANSFER')
+        method_map = {
+            'BANK_TRANSFER': 'TRANSFER',
+            'CREDIT_CARD': 'CARD',
+            'CARD': 'CARD',
+            'TRANSFER': 'TRANSFER',
+            'CASH': 'CASH',
+            'CHEQUE': 'TRANSFER',
+        }
+        model_method = method_map.get(payment_method.upper(), payment_method)
+
+        try:
+            with transaction.atomic():
+                SalesInvoicePayments.objects.create(
+                    invoice=invoice,
+                    amount=amount,
+                    payment_method=model_method,
+                    reference_number=reference
+                )
+                invoice.refresh_from_db()
+
+            return Response(SalesInvoiceSerializer(invoice).data, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['get'], url_path='pdf')
+    def pdf(self, request, pk=None):
+        """
+        Generates and returns the commercial invoice PDF document.
+        """
+        invoice = self.get_object()
+        pdf_buffer = generate_invoice_pdf(invoice)
+        response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="Invoice_{invoice.invoice_number}.pdf"'
+        return response
+
+
+class CreditNoteViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    DRF ViewSet for Credit Notes / Adjustment Memos.
+    """
+    serializer_class = CreditNoteSerializer
+    permission_classes = [IsAuthenticated, IsSalesOrBillingStaff]
+
+    def get_queryset(self):
+        queryset = CreditNote.objects.select_related(
+            'customer', 'invoice'
+        ).prefetch_related('lines__product').order_by('-credit_note_id')
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        customer_param = self.request.query_params.get('customer')
+        if customer_param:
+            queryset = queryset.filter(customer_id=customer_param)
+        invoice_param = self.request.query_params.get('invoice')
+        if invoice_param:
+            queryset = queryset.filter(invoice_id=invoice_param)
+        return queryset
+
+    @action(detail=True, methods=['get'], url_path='pdf')
+    def pdf(self, request, pk=None):
+        """
+        Generates and returns the credit note PDF document.
+        """
+        credit_note = self.get_object()
+        pdf_buffer = generate_credit_note_pdf(credit_note)
+        response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="CreditNote_{credit_note.credit_note_number}.pdf"'
+        return response
+
+
+class CustomerViewSet(viewsets.ModelViewSet):
+    """
+    DRF ViewSet for Customer entities in the Sales & Billing subsystem.
+    Provides customer CRUD alongside FIFO bulk payment allocation preview and settlement.
+    """
+    queryset = Customer.objects.all().order_by('customer_id')
+    serializer_class = CustomerSerializer
+    permission_classes = [IsAuthenticated, IsSalesOrBillingStaff]
+
+    @action(detail=True, methods=['post'], url_path='preview-payment-allocation')
+    def preview_payment_allocation(self, request, pk=None):
+        """
+        Action A: Dry-run simulation of FIFO bulk payment distribution across open customer invoices.
+        Performs zero database mutations and returns projected allocations and statuses.
+        """
+        customer = self.get_object()
+        serializer = BulkPaymentAllocationPayloadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        total_received = serializer.validated_data['amount']
+        remaining_funds = total_received
+
+        open_invoices = customer.sales_invoices.filter(
+            status__in=['POSTED', 'PARTIALLY_PAID']
+        ).order_by('invoice_date', 'invoice_id')
+
+        allocations = []
+        total_allocated = Decimal('0.00')
+
+        for invoice in open_invoices:
+            already_paid = invoice.total_paid
+            balance_before = invoice.total_amount - already_paid
+            if balance_before <= Decimal('0.00'):
+                continue
+
+            allocated = min(remaining_funds, balance_before) if remaining_funds > Decimal('0.00') else Decimal('0.00')
+            if allocated > Decimal('0.00'):
+                balance_after = max(Decimal('0.00'), balance_before - allocated)
+                projected_status = 'PAID' if balance_after == Decimal('0.00') else 'PARTIALLY_PAID'
+                allocations.append({
+                    'invoice_id': invoice.invoice_id,
+                    'invoice_number': invoice.invoice_number,
+                    'invoice_date': invoice.invoice_date,
+                    'total_amount': invoice.total_amount,
+                    'already_paid': already_paid,
+                    'balance_before': balance_before,
+                    'allocated_amount': allocated,
+                    'balance_after': balance_after,
+                    'projected_status': projected_status,
+                })
+                total_allocated += allocated
+                remaining_funds -= allocated
+
+            if remaining_funds <= Decimal('0.00'):
+                break
+
+        unallocated_amount = max(Decimal('0.00'), total_received - total_allocated)
+        response_data = {
+            'customer_id': customer.customer_id,
+            'customer_name': customer.customer_name,
+            'total_received': total_received,
+            'total_allocated': total_allocated,
+            'unallocated_amount': unallocated_amount,
+            'allocations': allocations,
+        }
+        return Response(BulkPaymentAllocationResponseSerializer(response_data).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='allocate-payment')
+    def allocate_payment(self, request, pk=None):
+        """
+        Action B: Atomic execution of FIFO bulk payment distribution across open customer invoices.
+        Records SalesInvoicePayments, auto-updates invoice payment status, and posts GL revenue entries.
+        """
+        customer = self.get_object()
+        serializer = BulkPaymentAllocationPayloadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        total_received = serializer.validated_data['amount']
+        payment_method = serializer.validated_data.get('payment_method', 'BANK_TRANSFER')
+        reference = serializer.validated_data.get('reference', '')
+        remaining_funds = total_received
+
+        method_map = {
+            'BANK_TRANSFER': 'TRANSFER',
+            'CREDIT_CARD': 'CARD',
+            'CARD': 'CARD',
+            'TRANSFER': 'TRANSFER',
+            'CASH': 'CASH',
+            'CHEQUE': 'TRANSFER',
+        }
+        model_method = method_map.get(payment_method.upper(), payment_method)
+
+        allocations = []
+        total_allocated = Decimal('0.00')
+
+        try:
+            with transaction.atomic():
+                open_invoices = customer.sales_invoices.select_for_update().filter(
+                    status__in=['POSTED', 'PARTIALLY_PAID']
+                ).order_by('invoice_date', 'invoice_id')
+
+                for invoice in open_invoices:
+                    already_paid = invoice.total_paid
+                    balance_before = invoice.total_amount - already_paid
+                    if balance_before <= Decimal('0.00'):
+                        continue
+
+                    allocated = min(remaining_funds, balance_before)
+                    if allocated > Decimal('0.00'):
+                        ref = reference if reference else f"BULK-{invoice.invoice_number}"
+                        SalesInvoicePayments.objects.create(
+                            invoice=invoice,
+                            amount=allocated,
+                            payment_method=model_method,
+                            reference_number=ref
+                        )
+                        invoice.refresh_from_db()
+                        invoice.update_payment_status(save=True)
+                        balance_after = max(Decimal('0.00'), balance_before - allocated)
+                        allocations.append({
+                            'invoice_id': invoice.invoice_id,
+                            'invoice_number': invoice.invoice_number,
+                            'invoice_date': invoice.invoice_date,
+                            'total_amount': invoice.total_amount,
+                            'already_paid': already_paid,
+                            'balance_before': balance_before,
+                            'allocated_amount': allocated,
+                            'balance_after': balance_after,
+                            'projected_status': invoice.status,
+                        })
+                        total_allocated += allocated
+                        remaining_funds -= allocated
+
+                    if remaining_funds <= Decimal('0.00'):
+                        break
+
+            unallocated_amount = max(Decimal('0.00'), total_received - total_allocated)
+            response_data = {
+                'customer_id': customer.customer_id,
+                'customer_name': customer.customer_name,
+                'total_received': total_received,
+                'total_allocated': total_allocated,
+                'unallocated_amount': unallocated_amount,
+                'allocations': allocations,
+            }
+            return Response(BulkPaymentAllocationResponseSerializer(response_data).data, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))
+            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
 
 
 

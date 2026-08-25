@@ -625,7 +625,7 @@ class MRPEngineTestCase(TestCase):
         )
         # 1. Non-editable auto-generated invoice number
         self.assertTrue(inv.invoice_number.startswith("SINV-"))
-        self.assertEqual(inv.status, "Unpaid")
+        self.assertEqual(inv.status, "DRAFT")
         self.assertEqual(inv.total_paid, Decimal("0.00"))
         self.assertEqual(inv.remaining_balance, Decimal("1000.00"))
 
@@ -637,7 +637,7 @@ class MRPEngineTestCase(TestCase):
             reference_number="REF-001"
         )
         inv.refresh_from_db()
-        self.assertEqual(inv.status, "Partial")
+        self.assertEqual(inv.status, "PARTIALLY_PAID")
         self.assertEqual(inv.total_paid, Decimal("400.00"))
         self.assertEqual(inv.remaining_balance, Decimal("600.00"))
 
@@ -648,7 +648,7 @@ class MRPEngineTestCase(TestCase):
             payment_method="CASH"
         )
         inv.refresh_from_db()
-        self.assertEqual(inv.status, "Paid")
+        self.assertEqual(inv.status, "PAID")
         self.assertEqual(inv.total_paid, Decimal("1000.00"))
         self.assertEqual(inv.remaining_balance, Decimal("0.00"))
 
@@ -1388,7 +1388,7 @@ class ReportingAndOptimizationTestCase(TestCase):
             customer=self.customer,
             dispatch=self.dispatch,
             total_amount=Decimal("1000.00"),
-            status="Unpaid",
+            status="DRAFT",
             invoice_date=timezone.now().date()
         )
 
