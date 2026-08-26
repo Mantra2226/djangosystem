@@ -1,5 +1,6 @@
 """
-Core utilities package.
+PDF Generators module alias (core/utils/pdf_generators.py).
+Re-exports PDF generation functions from core.utils.pdf_generator.
 """
 
 from .pdf_generator import (

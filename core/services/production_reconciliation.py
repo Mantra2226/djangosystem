@@ -250,7 +250,7 @@ class ProductionReconciliationEngine:
             # Update WorkOrder completion flags and timestamp
             locked_wo.is_inventory_updated = True
             if not locked_wo.production_end_date:
-                locked_wo.production_end_date = timezone.now().date()
+                locked_wo.production_end_date = timezone.now()
             locked_wo.__class__.objects.filter(pk=locked_wo.pk).update(
                 is_inventory_updated=True,
                 production_end_date=locked_wo.production_end_date
@@ -264,10 +264,9 @@ class ProductionReconciliationEngine:
                 po.status = 'COMPLETED'
                 po.completed_at = timezone.now()
                 update_fields = ['status', 'completed_at']
-                if finished_qty > Decimal('0.00'):
-                    po.quantity = finished_qty
+                if batch_unit_cost is not None:
                     po.unit_cost = batch_unit_cost
-                    update_fields.extend(['quantity', 'unit_cost'])
+                    update_fields.append('unit_cost')
                 po.save(update_fields=update_fields)
 
         return summary

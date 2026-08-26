@@ -13,6 +13,7 @@ import io
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import ValidationError, ObjectDoesNotExist, PermissionDenied
+from django.db import models
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import path, reverse
@@ -32,7 +33,7 @@ from .models import (
     DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
 )
 from .forms import WorkOrderForm
-from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf
+from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf, generate_finance_entry_pdf
 
 
 def export_as_csv(modeladmin, request, queryset):
@@ -240,30 +241,58 @@ class PurchaseOrderItemInline(TabularInline):
 # MODEL ADMIN DEFINITIONS (UNFOLD)
 # =============================================================================
 
+def render_status_badge(text, bg_color, text_color='#ffffff', border_color=None):
+    """
+    Renders a unified, high-contrast, modern HTML status pill badge with no raw color name leakage.
+    """
+    if not text:
+        return mark_safe('<span style="color: #94a3b8; font-style: italic;">-</span>')
+    border_style = f"border: 1px solid {border_color};" if border_color else ""
+    return format_html(
+        '<span style="background-color: {bg}; color: {fg}; {border} '
+        'padding: 3px 10px; border-radius: 9999px; font-weight: 600; '
+        'font-size: 11px; display: inline-flex; align-items: center; justify-content: center; '
+        'text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; line-height: 1.2; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">'
+        '{text}'
+        '</span>',
+        bg=bg_color,
+        fg=text_color,
+        border=border_style,
+        text=text
+    )
+
+
 @admin.register(Supplier)
 class SupplierAdmin(ModelAdmin):
-    list_display = ('name', 'supplier_id', 'contact_info')
-    search_fields = ('name', 'supplier_id', 'contact_info')
+    list_display = ('supplier_code', 'name', 'contact_info')
+    search_fields = ('supplier_code', 'name', 'contact_info')
+    readonly_fields = ('supplier_code',)
 
 
 @admin.register(Product)
 class ProductAdmin(ModelAdmin):
     list_display = ('sku', 'name', 'product_type_badge', 'supplier', 'get_selling_price')
     list_filter = ['product_type', 'supplier']
-    search_fields = ('sku', 'name', 'category', 'supplier__name')
+    search_fields = ('sku', 'name', 'category', 'supplier__name', 'supplier__supplier_code')
     readonly_fields = ('sku',)
     autocomplete_fields = ['supplier']
 
-    @display(description='Product Type', label=True)
+    @display(description='Product Type')
     def product_type_badge(self, obj):
+        if not obj or not obj.product_type:
+            return "-"
+        cat = (obj.category or '').lower()
+        name = (obj.name or '').lower()
+        if obj.product_type == 'RAW' and any(k in cat or k in name for k in ['packaging', 'pack', 'tin', 'lid', 'label', 'container', 'box']):
+            return render_status_badge('Packaging', '#f59e0b')
+
         color_map = {
-            'FINISHED': 'success',
-            'RAW': 'info',
-            'PACKAGING': 'warning',
-            'INTERMEDIATE': 'primary',
+            'FINISHED': '#10b981',     # Emerald Green
+            'RAW': '#0284c7',          # Sky Blue
+            'INTERMEDIATE': '#2563eb', # Royal Blue
         }
-        color = color_map.get(obj.product_type, 'default')
-        return obj.get_product_type_display(), color
+        bg = color_map.get(obj.product_type, '#64748b')
+        return render_status_badge(obj.get_product_type_display(), bg)
 
     @display(description='Selling Price')
     def get_selling_price(self, obj):
@@ -272,17 +301,103 @@ class ProductAdmin(ModelAdmin):
         return "-"
 
 
+class InventoryProductTypeFilter(admin.SimpleListFilter):
+    """
+    Unified multi-source inventory product type and classification filter.
+    Filters Inventory records by product classification:
+    - RAW_CHEMICALS: Raw Chemicals & Raw Materials (RAW excluding packaging)
+    - PACKAGING: Packaging Materials & Containers (Tins, Lids, Labels, Bottles)
+    - INTERMEDIATE: WIP / Bulk Base Putty (INTERMEDIATE)
+    - FINISHED: Finished Packaged Goods (FINISHED)
+    - ALL_RAW: All Raw Materials (incl. Packaging)
+    """
+    title = 'Product Classification'
+    parameter_name = 'product_type'
+
+    def lookups(self, request, model_admin):
+        return (
+            ('RAW_CHEMICALS', 'Raw Chemicals & Materials'),
+            ('PACKAGING', 'Packaging & Containers'),
+            ('INTERMEDIATE', 'WIP / Bulk Base Putty'),
+            ('FINISHED', 'Finished Packaged Goods'),
+            ('ALL_RAW', 'All Raw Materials (incl. Packaging)'),
+        )
+
+    def queryset(self, request, queryset):
+        val = self.value()
+        if not val:
+            return queryset
+        val_upper = val.upper().strip()
+
+        # Keyword classification for packaging items (Tins, Lids, Labels, Containers)
+        packaging_q = (
+            models.Q(product__category__icontains='packaging') |
+            models.Q(product__category__icontains='pack') |
+            models.Q(product__category__icontains='tin') |
+            models.Q(product__category__icontains='lid') |
+            models.Q(product__category__icontains='label') |
+            models.Q(product__name__icontains='tin') |
+            models.Q(product__name__icontains='lid') |
+            models.Q(product__name__icontains='label') |
+            models.Q(product__name__icontains='container') |
+            models.Q(product__name__icontains='box')
+        )
+
+        if val_upper in ['RAW_CHEMICALS', 'RAW_CHEMICAL', 'CHEMICALS', 'RAW_MATERIALS']:
+            return queryset.filter(product__product_type='RAW').exclude(packaging_q)
+        elif val_upper in ['PACKAGING', 'PACK', 'CONTAINERS', 'TINS']:
+            return queryset.filter(models.Q(product__product_type='RAW') & packaging_q)
+        elif val_upper in ['INTERMEDIATE', 'WIP', 'BULK', 'BASE']:
+            return queryset.filter(product__product_type='INTERMEDIATE')
+        elif val_upper in ['FINISHED', 'FG', 'FINISHED_GOODS']:
+            return queryset.filter(product__product_type='FINISHED')
+        elif val_upper in ['ALL_RAW', 'RAW']:
+            return queryset.filter(product__product_type='RAW')
+        return queryset
+
+
 @admin.register(Inventory)
 class InventoryAdmin(ModelAdmin):
-    list_display = ('product', 'quantity_available', 'quantity_allocated', 'location', 'get_unit_cost', 'get_total_valuation', 'last_updated')
-    list_filter = ['location', ('last_updated', RangeDateFilter), ('quantity_available', RangeNumericFilter)]
-    search_fields = ('product__name', 'product__sku', 'location')
+    list_display = (
+        'product', 'product_type_badge', 'product_category_display',
+        'quantity_available', 'quantity_allocated', 'location',
+        'get_unit_cost', 'get_total_valuation', 'last_updated'
+    )
+    list_filter = [
+        InventoryProductTypeFilter,
+        'location',
+        ('last_updated', RangeDateFilter),
+        ('quantity_available', RangeNumericFilter)
+    ]
+    search_fields = ('product__name', 'product__sku', 'product__category', 'location')
     readonly_fields = ['get_total_valuation', 'quantity_allocated']
     autocomplete_fields = ['product']
     actions = [export_as_csv]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('product', 'product__supplier')
+
+    @display(description='Product Type')
+    def product_type_badge(self, obj):
+        if not obj.product:
+            return "-"
+        p_type = obj.product.product_type
+        cat = (obj.product.category or '').lower()
+        name = (obj.product.name or '').lower()
+        if p_type == 'RAW' and any(k in cat or k in name for k in ['packaging', 'pack', 'tin', 'lid', 'label', 'container', 'box']):
+            return render_status_badge('Packaging', '#f59e0b')
+
+        color_map = {
+            'FINISHED': '#10b981',     # Emerald Green
+            'RAW': '#0284c7',          # Sky Blue
+            'INTERMEDIATE': '#2563eb', # Royal Blue
+        }
+        bg = color_map.get(p_type, '#64748b')
+        return render_status_badge(obj.product.get_product_type_display(), bg)
+
+    @display(description='Category')
+    def product_category_display(self, obj):
+        return obj.product.category if (obj.product and obj.product.category) else "-"
 
     @display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
@@ -304,20 +419,20 @@ class StockTransactionAdmin(ModelAdmin):
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('product', 'work_order')
 
-    @display(description='Transaction Type', label=True)
+    @display(description='Transaction Type')
     def transaction_type_badge(self, obj):
         color_map = {
-            'INITIAL_STOCK': 'info',
-            'PURCHASE_RECEIPT': 'success',
-            'PRODUCTION_CONSUMPTION': 'danger',
-            'PRODUCTION_OUTPUT': 'success',
-            'DISPATCH': 'warning',
-            'CUSTOMER_RETURN': 'info',
-            'ADJUSTMENT_IN': 'success',
-            'ADJUSTMENT_OUT': 'danger',
+            'INITIAL_STOCK': '#0284c7',           # Sky Blue
+            'PURCHASE_RECEIPT': '#10b981',        # Emerald Green
+            'PRODUCTION_CONSUMPTION': '#ef4444',   # Crimson Red
+            'PRODUCTION_OUTPUT': '#10b981',        # Emerald Green
+            'DISPATCH': '#f59e0b',                 # Amber Gold
+            'CUSTOMER_RETURN': '#8b5cf6',          # Purple
+            'ADJUSTMENT_IN': '#10b981',            # Emerald Green
+            'ADJUSTMENT_OUT': '#ef4444',           # Crimson Red
         }
-        color = color_map.get(obj.transaction_type, 'default')
-        return obj.get_transaction_type_display(), color
+        bg = color_map.get(obj.transaction_type, '#64748b')
+        return render_status_badge(obj.get_transaction_type_display(), bg)
 
     @display(description='Work Order')
     def get_work_order_code(self, obj):
@@ -399,18 +514,18 @@ class ProductionOrderItemInline(TabularInline):
         'action_links',
     )
 
-    @display(description='Resolution Status', label=True)
+    @display(description='Resolution Status')
     def resolution_status_badge(self, obj):
         color_map = {
-            'NO_SHORTAGE': 'success',
-            'UNRESOLVED': 'danger',
-            'PO_DRAFTED': 'warning',
-            'OVERRIDDEN': 'info',
-            'DOWNSCALED': 'info',
-            'RESOLVED': 'success',
+            'NO_SHORTAGE': '#10b981',     # Emerald Green
+            'UNRESOLVED': '#ef4444',      # Crimson Red
+            'PO_DRAFTED': '#f59e0b',      # Amber
+            'OVERRIDDEN': '#0284c7',      # Sky Blue
+            'DOWNSCALED': '#d97706',      # Burnt Orange
+            'RESOLVED': '#10b981',        # Emerald Green
         }
-        color = color_map.get(obj.resolution_status, 'default')
-        return obj.get_resolution_status_display(), color
+        bg = color_map.get(obj.resolution_status, '#64748b')
+        return render_status_badge(obj.get_resolution_status_display(), bg)
 
     @display(description='Linked PO')
     def linked_po_link(self, obj):
@@ -446,18 +561,18 @@ class ProductionOrderItemAdmin(ModelAdmin):
     readonly_fields = ('raw_material', 'production_order', 'planned_quantity', 'shortage_quantity', 'resolution_status', 'linked_purchase_order', 'resolution_notes', 'resolved_by', 'resolved_at', 'created_at', 'updated_at')
     actions = ['action_resolve_item_po', 'action_resolve_item_override']
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def resolution_status_badge(self, obj):
         color_map = {
-            'NO_SHORTAGE': 'success',
-            'UNRESOLVED': 'danger',
-            'PO_DRAFTED': 'warning',
-            'OVERRIDDEN': 'info',
-            'DOWNSCALED': 'info',
-            'RESOLVED': 'success',
+            'NO_SHORTAGE': '#10b981',     # Emerald Green
+            'UNRESOLVED': '#ef4444',      # Crimson Red
+            'PO_DRAFTED': '#f59e0b',      # Amber
+            'OVERRIDDEN': '#0284c7',      # Sky Blue
+            'DOWNSCALED': '#d97706',      # Burnt Orange
+            'RESOLVED': '#10b981',        # Emerald Green
         }
-        color = color_map.get(obj.resolution_status, 'default')
-        return obj.get_resolution_status_display(), color
+        bg = color_map.get(obj.resolution_status, '#64748b')
+        return render_status_badge(obj.get_resolution_status_display(), bg)
 
     @admin.action(description="Resolve Shortage: Auto-Draft PO")
     def action_resolve_item_po(self, request, queryset):
@@ -480,7 +595,7 @@ class ProductionOrderItemAdmin(ModelAdmin):
 class ProductionOrderAdmin(ModelAdmin):
     form = ProductionOrderAdminForm
     inlines = [ProductionOrderItemInline]
-    list_display = ('production_order_code', 'product', 'work_order', 'quantity', 'status_badge', 'mrp_status_badge', 'get_unit_cost', 'created_at')
+    list_display = ('production_order_code', 'product', 'work_order_link', 'quantity', 'status_badge', 'mrp_status_badge', 'get_unit_cost', 'created_at')
     list_filter = ['status', ('created_at', RangeDateFilter)]
     search_fields = ('production_order_code', 'work_order__work_order_code', 'employee__employee_name', 'product__name')
     filter_horizontal = ('employee',)
@@ -544,31 +659,32 @@ class ProductionOrderAdmin(ModelAdmin):
                 f"Reminder: Production Order '{obj.production_order_code or obj.pk}' was saved without a linked Work Order."
             )
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'DRAFT': 'default',
-            'IN_PROGRESS': 'info',
-            'COMPLETED': 'success',
-            'CANCELLED': 'danger',
-            'ON_HOLD_SHORTAGE': 'danger',
-            'PARTIALLY_RESOLVED': 'warning',
-            'MRP_RESOLVED': 'success',
-            'AWAITING_RESOLUTION': 'warning',
+            'DRAFT': '#64748b',                # Slate Grey
+            'PENDING': '#f59e0b',              # Amber
+            'IN_PROGRESS': '#2563eb',          # Royal Blue
+            'COMPLETED': '#10b981',            # Emerald Green
+            'CANCELLED': '#ef4444',            # Crimson Red
+            'ON_HOLD_SHORTAGE': '#ef4444',     # Crimson
+            'PARTIALLY_RESOLVED': '#f59e0b',   # Amber
+            'MRP_RESOLVED': '#10b981',         # Emerald Green
+            'AWAITING_RESOLUTION': '#d97706',  # Burnt Orange
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
-    @display(description='MRP Resolution', label=True)
+    @display(description='MRP Resolution')
     def mrp_status_badge(self, obj):
         if obj.is_mrp_resolved or (obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']):
             applied = obj.resolution_applied or "RESOLVED"
-            return f"LOCKED ({applied})", "success"
+            return render_status_badge(f"LOCKED ({applied})", '#10b981')
         if obj.status == 'PARTIALLY_RESOLVED':
-            return "PARTIALLY RESOLVED", "warning"
+            return render_status_badge("PARTIALLY RESOLVED", '#f59e0b')
         if obj.status == 'MRP_RESOLVED':
-            return "RESOLVED / READY", "success"
-        return "PENDING EVALUATION", "warning"
+            return render_status_badge("RESOLVED / READY", '#10b981')
+        return render_status_badge("PENDING EVALUATION", '#f59e0b')
 
     @action(description="Check Stock & Auto-Resume Order", url_path="mrp-auto-resume")
     def action_trigger_mrp_resume(self, request, object_id):
@@ -586,6 +702,26 @@ class ProductionOrderAdmin(ModelAdmin):
     @display(description='Product')
     def get_product(self, obj):
         return obj.product.name if obj.product else 'N/A'
+
+    @display(description='Work Order')
+    def work_order_link(self, obj):
+        if not obj.work_order_id:
+            return "-"
+        try:
+            wo = obj.work_order
+            if not wo:
+                return "-"
+            url = reverse('admin:core_workorder_change', args=[wo.pk])
+            wo_code = wo.work_order_code or f"WOC-#{wo.pk}"
+            prod_name = wo.product.name if wo.product else "No Product"
+            display_text = f"{wo_code} — {prod_name}"
+            return format_html(
+                '<a href="{}" style="color: #2563eb; font-weight: 600; text-decoration: underline;">{}</a>',
+                url,
+                display_text
+            )
+        except ObjectDoesNotExist:
+            return "-"
 
     @display(description='Quantity')
     def get_quantity(self, obj):
@@ -792,15 +928,15 @@ class OpenSalesInvoiceInline(TabularInline):
     def get_remaining_balance(self, obj):
         return f"${obj.remaining_balance:,.2f}"
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'POSTED': 'info',
-            'PARTIALLY_PAID': 'warning',
-            'PAID': 'success',
+            'POSTED': '#2563eb',         # Royal Blue
+            'PARTIALLY_PAID': '#f59e0b', # Amber
+            'PAID': '#10b981',           # Emerald Green
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
 
 @admin.register(Customer)
@@ -1168,17 +1304,17 @@ class SalesOrderAdmin(ModelAdmin):
         """
         return mark_safe(table_html)
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'draft': 'default',
-            'approved': 'info',
-            'partially_dispatched': 'warning',
-            'completed': 'success',
-            'cancelled': 'danger',
+            'draft': '#64748b',                # Slate Grey
+            'approved': '#2563eb',             # Royal Blue
+            'partially_dispatched': '#f59e0b', # Amber
+            'completed': '#10b981',            # Emerald Green
+            'cancelled': '#ef4444',            # Crimson Red
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
     @action(description="Confirm Order & Generate Invoice", url_path="confirm-order-action")
     def action_confirm_order(self, request, object_id):
@@ -1297,18 +1433,18 @@ class SalesInvoiceAdmin(ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return request.user.is_superuser
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'DRAFT': 'default',
-            'POSTED': 'info',
-            'PARTIALLY_PAID': 'warning',
-            'PAID': 'success',
-            'CREDITED': 'primary',
-            'CANCELLED': 'danger',
+            'DRAFT': '#64748b',          # Slate Grey
+            'POSTED': '#2563eb',         # Royal Blue
+            'PARTIALLY_PAID': '#f59e0b', # Amber
+            'PAID': '#10b981',           # Emerald Green
+            'CREDITED': '#8b5cf6',       # Purple
+            'CANCELLED': '#ef4444',      # Crimson Red
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
     @display(description='Total Paid')
     def get_total_paid(self, obj):
@@ -1365,15 +1501,15 @@ class CreditNoteAdmin(ModelAdmin):
             return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted)
         return "$0.00"
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'DRAFT': 'default',
-            'POSTED': 'warning',
-            'REFUNDED': 'success',
+            'DRAFT': '#64748b',    # Slate Grey
+            'POSTED': '#f59e0b',   # Amber
+            'REFUNDED': '#10b981', # Emerald Green
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
     @action(description="Download Credit Note PDF", url_path="download-pdf")
     def action_download_pdf(self, request, object_id):
@@ -1395,7 +1531,7 @@ class DocumentSequenceAdmin(ModelAdmin):
 class PurchaseInvoiceAdmin(ModelAdmin):
     list_display = ('invoice_number', 'supplier', 'procurement_order', 'total_amount', 'invoice_date', 'status_badge', 'paid_date', 'remaining_balance')
     list_filter = ['status', ('invoice_date', RangeDateFilter), 'supplier']
-    search_fields = ('invoice_number', 'supplier__name', 'procurement_order__procurement_order_id')
+    search_fields = ('invoice_number', 'supplier__name', 'supplier__supplier_code', 'procurement_order__procurement_order_id')
     inlines = [PurchasePaymentInline]
     autocomplete_fields = ['supplier', 'procurement_order']
     readonly_fields = ['status', 'paid_date', 'remaining_balance', 'total_amount', 'created_at']
@@ -1404,15 +1540,15 @@ class PurchaseInvoiceAdmin(ModelAdmin):
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('supplier', 'procurement_order').prefetch_related('payments')
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'UNPAID': 'danger',
-            'PARTIAL': 'warning',
-            'PAID': 'success',
+            'UNPAID': '#ef4444',   # Crimson Red
+            'PARTIAL': '#f59e0b',  # Amber
+            'PAID': '#10b981',     # Emerald Green
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
 
 @admin.register(Return)
@@ -1426,28 +1562,129 @@ class ReturnAdmin(ModelAdmin):
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('dispatch', 'customer')
 
-    @display(description='QC Status', label=True)
+    @display(description='QC Status')
     def qc_badge(self, obj):
         color_map = {
-            'APPROVED': 'success',
-            'REJECTED': 'danger',
-            'PENDING': 'warning',
+            'APPROVED': '#10b981', # Emerald Green
+            'REJECTED': '#ef4444', # Crimson Red
+            'PENDING': '#f59e0b',  # Amber
         }
-        color = color_map.get(obj.quality_control_status, 'default')
-        return obj.get_quality_control_status_display(), color
+        bg = color_map.get(obj.quality_control_status, '#64748b')
+        return render_status_badge(obj.get_quality_control_status_display(), bg)
 
 
 @admin.register(FinanceEntry)
 class FinanceEntryAdmin(ModelAdmin):
-    list_display = ('finance_entry_id', 'entry_type_badge', 'amount', 'entry_date', 'category')
-    list_filter = ['entry_type', 'category', ('entry_date', RangeDateFilter), ('amount', RangeNumericFilter)]
-    search_fields = ['category', 'sales_invoice__invoice_number', 'procurement_order__procurement_order_id']
+    list_display = (
+        'entry_code', 'timestamp_display', 'entry_type_badge', 'category',
+        'amount_display', 'reference_document_display', 'logged_by_display', 'pdf_download_button'
+    )
+    list_display_links = ('entry_code',)
+    list_filter = ['entry_type', 'category', ('timestamp', RangeDateFilter), ('amount', RangeNumericFilter)]
+    search_fields = ('entry_code', 'reference_document', 'description', 'category', 'sales_invoice__invoice_number')
+    readonly_fields = (
+        'entry_code', 'timestamp', 'entry_type', 'category', 'amount',
+        'reference_document', 'description', 'logged_by', 'procurement_order',
+        'sales_invoice', 'material_variance', 'entry_date'
+    )
     actions = [export_as_csv]
+    actions_detail = ['action_download_pdf']
 
-    @display(description='Entry Type', label=True)
+    fieldsets = (
+        ('Voucher Identification', {
+            'fields': ('entry_code', 'timestamp', 'entry_type', 'category')
+        }),
+        ('Financial & Reference Data', {
+            'fields': ('amount', 'reference_document', 'sales_invoice', 'procurement_order', 'material_variance')
+        }),
+        ('Audit & Attribution', {
+            'fields': ('logged_by', 'description', 'entry_date')
+        }),
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    @display(description='Entry Type')
     def entry_type_badge(self, obj):
-        color = 'success' if obj.entry_type == 'REVENUE' else 'danger'
-        return obj.get_entry_type_display(), color
+        color_map = {
+            'REVENUE': '#10b981',   # Emerald Green
+            'EXPENSE': '#ef4444',   # Crimson Red
+            'CAPITAL': '#8b5cf6',   # Purple
+            'TRANSFER': '#2563eb',  # Royal Blue
+            'ADJUSTMENT': '#f59e0b',# Amber
+        }
+        bg = color_map.get(obj.entry_type, '#64748b')
+        return render_status_badge(obj.get_entry_type_display(), bg)
+
+    @display(description='Amount')
+    def amount_display(self, obj):
+        return f"KES {obj.amount:,.2f}"
+
+    @display(description='Posted At')
+    def timestamp_display(self, obj):
+        if obj.timestamp:
+            return obj.timestamp.strftime('%Y-%m-%d %H:%M')
+        return str(obj.entry_date)
+
+    @display(description='Reference Document')
+    def reference_document_display(self, obj):
+        if obj.reference_document:
+            return obj.reference_document
+        if obj.sales_invoice and obj.sales_invoice.invoice_number:
+            return obj.sales_invoice.invoice_number
+        if obj.procurement_order:
+            return f"PO #{obj.procurement_order_id}"
+        return "-"
+
+    @display(description='Logged By')
+    def logged_by_display(self, obj):
+        return obj.logged_by.username if obj.logged_by else "System Auto-Post"
+
+    @display(description='Voucher PDF')
+    def pdf_download_button(self, obj):
+        url = reverse('admin:financeentry-pdf', args=[obj.pk])
+        return format_html(
+            '<a href="{}" style="display: inline-flex; align-items: center; padding: 4px 10px; background: #0284c7; color: #ffffff; '
+            'border-radius: 4px; font-size: 11px; font-weight: 600; text-decoration: none; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">'
+            '📄 Voucher PDF'
+            '</a>',
+            url
+        )
+
+    @action(description="Download Journal Voucher PDF", url_path="download-pdf")
+    def action_download_pdf(self, request, object_id):
+        entry = get_object_or_404(FinanceEntry, pk=object_id)
+        pdf_buffer = generate_finance_entry_pdf(entry)
+        response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+        filename = f"Voucher_{entry.entry_code or entry.pk}.pdf"
+        response['Content-Disposition'] = f'inline; filename="{filename}"'
+        return response
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                '<int:object_id>/pdf/',
+                self.admin_site.admin_view(self.download_pdf_view),
+                name='financeentry-pdf',
+            ),
+        ]
+        return custom_urls + urls
+
+    def download_pdf_view(self, request, object_id):
+        entry = get_object_or_404(FinanceEntry, pk=object_id)
+        pdf_buffer = generate_finance_entry_pdf(entry)
+        response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+        filename = f"Voucher_{entry.entry_code or entry.pk}.pdf"
+        response['Content-Disposition'] = f'inline; filename="{filename}"'
+        return response
 
 
 @admin.register(Employee)
@@ -1467,9 +1704,11 @@ class BillOfMaterialAdmin(ModelAdmin):
     autocomplete_fields = ['product']
     inlines = [BOMItemInline]
 
-    @display(description='Active Status', label=True)
+    @display(description='Active Status')
     def is_active_badge(self, obj):
-        return ("Active", "success") if obj.is_active else ("Inactive", "default")
+        if obj.is_active:
+            return render_status_badge('Active', '#10b981')
+        return render_status_badge('Inactive', '#64748b')
 
     @display(description='Total Ingredients')
     def get_component_count(self, obj):
@@ -1480,7 +1719,7 @@ class BillOfMaterialAdmin(ModelAdmin):
 class PurchaseOrderAdmin(ModelAdmin):
     list_display = ('po_number', 'supplier', 'order_date', 'status_badge')
     list_filter = ('status', ('order_date', RangeDateFilter), 'supplier')
-    search_fields = ('po_number', 'supplier__name')
+    search_fields = ('po_number', 'supplier__name', 'supplier__supplier_code')
     autocomplete_fields = ['supplier']
     inlines = [PurchaseOrderItemInline]
     readonly_fields = ('po_number', 'order_date', 'status')
@@ -1512,17 +1751,17 @@ class PurchaseOrderAdmin(ModelAdmin):
             obj.save(update_fields=['status'])
             messages.success(request, f"Purchase Order #{obj.po_number} reviewed, confirmed, and marked as 'Sent to Supplier'.")
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'DRAFT': 'default',
-            'SENT': 'info',
-            'PARTIAL': 'warning',
-            'RECEIVED': 'success',
-            'CANCELLED': 'danger',
+            'DRAFT': '#64748b',            # Slate Grey
+            'SENT': '#2563eb',             # Royal Blue
+            'PARTIAL': '#f59e0b',          # Amber
+            'RECEIVED': '#10b981',         # Emerald Green
+            'CANCELLED': '#ef4444',        # Crimson Red
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
 
 class ProcurementOrderForm(forms.ModelForm):
@@ -1558,15 +1797,15 @@ class ProcurementOrderAdmin(ModelAdmin):
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('purchase_order', 'product', 'purchase_order__supplier')
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'PENDING': 'warning',
-            'DELIVERED': 'success',
-            'CANCELLED': 'danger',
+            'PENDING': '#f59e0b',          # Amber
+            'DELIVERED': '#10b981',        # Emerald Green
+            'CANCELLED': '#ef4444',        # Crimson Red
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
 
 @admin.register(DispatchRecord)
@@ -1595,30 +1834,30 @@ class DispatchRecordAdmin(ModelAdmin):
         }),
     )
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'pending': 'warning',
-            'shipped': 'info',
-            'delivered': 'success',
-            'cancelled': 'danger',
+            'pending': '#f59e0b',          # Amber
+            'shipped': '#2563eb',          # Royal Blue
+            'delivered': '#10b981',        # Emerald Green
+            'cancelled': '#ef4444',        # Crimson Red
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
 
 @admin.register(WorkOrder)
 class WorkOrderAdmin(ModelAdmin):
     form = WorkOrderForm
-    list_display = ('work_order_code', 'work_order_id', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
-    readonly_fields = ['work_order_code', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
+    list_display = ('work_order_code', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
+    list_display_links = ('work_order_code',)
+    readonly_fields = ['work_order_code', 'category', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
     inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
     autocomplete_fields = ['product', 'bill_of_material', 'parent_work_order']
     list_filter = ['category', 'status', 'is_inventory_updated', ('production_start_date', RangeDateFilter)]
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
     actions = [export_as_csv, 'action_reconcile_production_stock', 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
-    actions_detail = ['action_start_production_button', 'action_check_stock_resume_button']
 
     class Media:
         js = ('admin/js/workorder_toggle.js', 'admin/js/work_order_category_toggle.js')
@@ -1681,10 +1920,14 @@ class WorkOrderAdmin(ModelAdmin):
         work_order.refresh_from_db()
         work_order.process_inventory()
 
-    @display(description='Category', label=True)
+    @display(description='Category')
     def category_badge(self, obj):
-        color = 'primary' if obj.category == 'PRODUCTION' else 'secondary'
-        return obj.get_category_display(), color
+        color_map = {
+            'PRODUCTION': '#2563eb', # Royal Blue (Bulk Mixing)
+            'PACKAGING': '#f59e0b',  # Amber Gold (Packaging)
+        }
+        bg = color_map.get(obj.category, '#64748b')
+        return render_status_badge(obj.get_category_display(), bg)
 
     @display(description='Assigned Employees')
     def display_employees(self, obj):
@@ -1697,49 +1940,18 @@ class WorkOrderAdmin(ModelAdmin):
     def display_target_quantity(self, obj):
         return f"{obj.target_quantity:.2f}"
 
-    @display(description='Status', label=True)
+    @display(description='Status')
     def status_badge(self, obj):
         color_map = {
-            'DRAFT': 'default',
-            'IN_PROGRESS': 'info',
-            'COMPLETED': 'success',
-            'CANCELLED': 'danger',
-            'AWAITING_RESOLUTION': 'warning',
-            'ON_HOLD_SHORTAGE': 'danger',
+            'DRAFT': '#64748b',                # Slate Grey
+            'IN_PROGRESS': '#2563eb',          # Royal Blue
+            'COMPLETED': '#10b981',            # Emerald Green
+            'CANCELLED': '#ef4444',            # Crimson Red
+            'AWAITING_RESOLUTION': '#d97706',  # Burnt Orange
+            'ON_HOLD_SHORTAGE': '#ef4444',     # Crimson
         }
-        color = color_map.get(obj.status, 'default')
-        return obj.get_status_display(), color
-
-    @action(description="Start Production Run", url_path="start-prod")
-    def action_start_production_button(self, request, object_id):
-        return self.start_production_view(request, object_id)
-
-    @action(description="Re-Check Stock & Start", url_path="check-stock")
-    def action_check_stock_resume_button(self, request, object_id):
-        return self.check_stock_resume_view(request, object_id)
-
-    def get_actions_detail(self, request, object_id=None):
-        actions = super().get_actions_detail(request, object_id)
-        if object_id:
-            try:
-                wo = self.get_object(request, object_id)
-                if wo:
-                    status = (getattr(wo, 'status', '') or '').upper().strip()
-                    filtered = []
-                    for act in actions:
-                        act_name = getattr(act, 'action_name', '')
-                        if 'action_start_production_button' in act_name:
-                            if status in ['PENDING', 'DRAFT']:
-                                filtered.append(act)
-                        elif 'action_check_stock_resume_button' in act_name:
-                            if status in ['PENDING', 'DRAFT', 'ON_HOLD_SHORTAGE', 'AWAITING_RESOLUTION']:
-                                filtered.append(act)
-                        else:
-                            filtered.append(act)
-                    return filtered
-            except Exception:
-                pass
-        return actions
+        bg = color_map.get(obj.status, '#64748b')
+        return render_status_badge(obj.get_status_display(), bg)
 
     @admin.action(description="Shortage Resolution: Top-Up Parent Bulk Order")
     def action_top_up_bulk(self, request, queryset):
@@ -2003,11 +2215,11 @@ class MaterialVarianceRecordAdmin(ModelAdmin):
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')
 
-    @display(description='Run Type', label=True)
+    @display(description='Run Type')
     def get_production_run_type(self, obj):
         run_type = obj.production_run_type
-        color = 'primary' if run_type == 'PRODUCTION' else 'secondary'
-        return run_type, color
+        bg = '#2563eb' if run_type == 'PRODUCTION' else '#f59e0b'
+        return render_status_badge(run_type, bg)
 
     @display(description='Financial Impact')
     def get_financial_impact(self, obj):
@@ -2018,12 +2230,12 @@ class MaterialVarianceRecordAdmin(ModelAdmin):
             return f"-${abs(cost):,.2f}"
         return "$0.00"
 
-    @display(description='Classification', label=True)
+    @display(description='Classification')
     def classification_badge(self, obj):
         color_map = {
-            'UNFAVOURABLE': 'danger',
-            'FAVOURABLE': 'success',
-            'EXACT': 'default',
+            'UNFAVOURABLE': '#ef4444', # Crimson Red
+            'FAVOURABLE': '#10b981',   # Emerald Green
+            'EXACT': '#64748b',        # Slate Grey
         }
-        color = color_map.get(obj.variance_classification, 'default')
-        return obj.get_variance_classification_display(), color
+        bg = color_map.get(obj.variance_classification, '#64748b')
+        return render_status_badge(obj.get_variance_classification_display(), bg)

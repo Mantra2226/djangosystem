@@ -54,11 +54,13 @@ class WorkOrderForm(forms.ModelForm):
         category = cleaned_data.get('category') or getattr(self.instance, 'category', None)
         product = cleaned_data.get('product') or getattr(self.instance, 'product', None)
 
-        if not category and product:
+        if product:
             if product.product_type == 'INTERMEDIATE':
                 category = 'PRODUCTION'
             elif product.product_type == 'FINISHED':
                 category = 'PACKAGING'
+            cleaned_data['category'] = category
+            self.instance.category = category
 
         if qty is None or qty <= 0:
             field_name = 'quantity_produced'

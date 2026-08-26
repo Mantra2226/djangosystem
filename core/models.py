@@ -10,14 +10,50 @@ from django.core.validators import MinValueValidator
 from django.db.models import Sum
 from django.utils import timezone
 from django.apps import apps
+from django.conf import settings
 
 class Supplier(models.Model):
     supplier_id = models.AutoField(primary_key=True)
+    supplier_code = models.CharField(
+        max_length=20,
+        unique=True,
+        editable=False,
+        blank=True,
+        null=True,
+        help_text="Unique supplier code (e.g. SUP-0001), auto-generated if left blank."
+    )
     name = models.CharField(max_length=255)
     contact_info = models.TextField()
 
+    def save(self, *args, **kwargs):
+        # Auto-generate unique supplier code if missing
+        if not self.supplier_code:
+            prefix = "SUP"
+            last_supplier = Supplier.objects.filter(
+                supplier_code__startswith=prefix
+            ).order_by('supplier_id').last()
+
+            if last_supplier and last_supplier.supplier_code:
+                try:
+                    last_sequence = int(last_supplier.supplier_code.split('-')[-1])
+                    new_sequence = last_sequence + 1
+                except (ValueError, IndexError):
+                    new_sequence = 1
+            else:
+                new_sequence = 1
+
+            while Supplier.objects.filter(supplier_code=f"{prefix}-{new_sequence:04d}").exists():
+                new_sequence += 1
+
+            self.supplier_code = f"{prefix}-{new_sequence:04d}"
+
+        super().save(*args, **kwargs)
+
     def __str__(self):
+        if self.supplier_code:
+            return f"{self.supplier_code} - {self.name}"
         return self.name
+
 
 class Product(models.Model):
     PRODUCT_TYPE_CHOICES = [
@@ -570,7 +606,7 @@ class WorkOrder(models.Model):
     ]
     work_order_id = models.AutoField(primary_key=True)
     work_order_code = models.CharField(max_length=20, unique=True, editable=False, blank=True, null=True)
-    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, blank=True, null=True, help_text="Auto-assigned based on product type: INTERMEDIATE -> PRODUCTION, FINISHED -> PACKAGING.")
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, editable=False, blank=True, null=True, help_text="Auto-assigned based on product type: INTERMEDIATE -> PRODUCTION, FINISHED -> PACKAGING.")
     bill_of_material = models.ForeignKey('BillOfMaterial', on_delete=models.PROTECT, blank=True, null=True, help_text="The snapshot version of the recipe locked in for this specific operational run.")
     parent_work_order = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='child_packaging_orders', help_text="The Stage 1 Bulk Intermediate work order required prior to running packaging operations.")
     product = models.ForeignKey('Product', on_delete=models.PROTECT, related_name='work_order', limit_choices_to={'product_type__in': ['FINISHED', 'INTERMEDIATE']})
@@ -870,6 +906,13 @@ class WorkOrder(models.Model):
     def clean(self):
         super().clean()
         errors = {}
+
+        # Auto-assign category based on product classification
+        if self.product:
+            if self.product.product_type == 'INTERMEDIATE':
+                self.category = 'PRODUCTION'
+            elif self.product.product_type == 'FINISHED':
+                self.category = 'PACKAGING'
 
         current_status = (self.status or '').upper().strip()
 
@@ -1347,7 +1390,9 @@ class WorkOrder(models.Model):
         ]
 
     def __str__(self):
-        return f"Work Order {self.work_order_id} — {self.product.name}"
+        code = self.work_order_code or f"WOC-#{self.work_order_id}"
+        prod_name = self.product.name if self.product else "No Product"
+        return f"{code} — {prod_name}"
 
 
 class BillOfMaterial(models.Model):
@@ -2112,10 +2157,10 @@ class DocumentSequence(models.Model):
     last_sequence = models.PositiveIntegerField(default=0, help_text="Monotonically increasing sequence counter.")
 
     @classmethod
-    def get_next_number(cls, doc_type: str, default_prefix: str) -> str:
+    def get_next_number(cls, doc_type: str, default_prefix: str, target_date=None) -> str:
         """
         Uses select_for_update() inside an atomic transaction to increment and
-        return formatted sequential strings: f"{prefix}-{timezone.now().strftime('%Y%m')}-{seq:04d}".
+        return formatted sequential strings: f"{prefix}-{year_month}-{seq:04d}".
         Guarantees uniqueness by advancing past any pre-existing historical document numbers.
         """
         with transaction.atomic():
@@ -2123,13 +2168,15 @@ class DocumentSequence(models.Model):
                 document_type=doc_type,
                 defaults={'prefix': default_prefix, 'last_sequence': 0}
             )
-            year_month = timezone.now().strftime('%Y%m')
+            ref_date = target_date or timezone.now()
+            year_month = ref_date.strftime('%Y%m') if hasattr(ref_date, 'strftime') else timezone.now().strftime('%Y%m')
             prefix = seq_obj.prefix or default_prefix
 
             model_field_map = {
                 'SALES_ORDER': ('core', 'SalesOrder', 'order_number'),
                 'SALES_INVOICE': ('core', 'SalesInvoice', 'invoice_number'),
                 'CREDIT_NOTE': ('core', 'CreditNote', 'credit_note_number'),
+                'FINANCE_ENTRY': ('core', 'FinanceEntry', 'entry_code'),
             }
 
             model_info = model_field_map.get(doc_type)
@@ -3148,6 +3195,15 @@ class FinanceEntry(models.Model):
         ('CUSTOMER_REFUND', 'Customer refund'),
         ('LOSS', 'Inventory Loss'),
     ]
+    entry_code = models.CharField(
+        max_length=64,
+        unique=True,
+        editable=False,
+        db_index=True,
+        null=True,
+        blank=True,
+        help_text="Unique sequential financial voucher number (e.g. FE-YYYYMM-XXXX)."
+    )
     entry_type = models.CharField(max_length=10, choices=ENTRY_TYPE_CHOICES, default='EXPENSE', db_index=True)
     category = models.CharField(max_length=20, choices=ENTRY_CATEGORY_CHOICES, default='SALES', db_index=True)
     procurement_order = models.ForeignKey('ProcurementOrder', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
@@ -3155,6 +3211,10 @@ class FinanceEntry(models.Model):
     material_variance = models.ForeignKey('MaterialVarianceRecord', on_delete=models.PROTECT, null=True, blank=True, related_name='financial_entries')
     amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('0.00'))], help_text="Amount must be a positive amount greater than zero.")
     entry_date = models.DateField(db_index=True)
+    timestamp = models.DateTimeField(default=timezone.now, db_index=True, help_text="Timestamp of ledger entry.")
+    reference_document = models.CharField(max_length=128, blank=True, null=True, help_text="Reference document code (e.g. SINV-..., PO-...).")
+    description = models.TextField(blank=True, null=True, help_text="Audit notes or transaction description.")
+    logged_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='finance_entries')
 
     def clean(self):
         # 1. Prevent negative entries from skewing totals
@@ -3164,10 +3224,29 @@ class FinanceEntry(models.Model):
             raise ValidationError("An Expense entry cannot be categorized under Sales Revenue.")
         if self.material_variance and (self.entry_type != 'EXPENSE' and self.category != 'LOSS'):
             raise ValidationError("Entries tied to a Material Variance Record must be set as an Expense under the Loss category.")
-    
+
     def save(self, *args, **kwargs):
+        # Sync timestamp & entry_date
+        if not self.entry_date:
+            self.entry_date = self.timestamp.date() if self.timestamp else timezone.now().date()
+        elif not self.timestamp:
+            self.timestamp = timezone.now()
+
+        # Auto-resolve reference_document if missing
+        if not self.reference_document:
+            if self.sales_invoice and self.sales_invoice.invoice_number:
+                self.reference_document = self.sales_invoice.invoice_number
+            elif self.procurement_order:
+                self.reference_document = f"PO #{self.procurement_order.procurement_order_id}"
+            elif self.material_variance:
+                self.reference_document = f"Variance #{self.material_variance.pk}"
+
+        # Auto-generate entry_code atomically via DocumentSequence
+        if not self.entry_code:
+            self.entry_code = DocumentSequence.get_next_number('FINANCE_ENTRY', 'FE', target_date=self.timestamp or self.entry_date)
+
         self.full_clean()
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"[{self.get_entry_type_display()}] ${self.amount} — {self.get_category_display()} ({self.entry_date})"
+        return f"{self.entry_code or f'FE-#{self.finance_entry_id}'} - {self.get_entry_type_display()} (KES {self.amount:,.2f})"

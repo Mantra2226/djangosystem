@@ -160,27 +160,28 @@ class WorkOrderProductionOrderSyncTests(TestCase):
         self.assertIsNotNone(self.po.completed_at)
 
     def test_admin_action_predicates_prevent_execution_on_active_orders(self):
-        """Verify get_actions_detail hides Start Production button when WorkOrder is IN_PROGRESS or COMPLETED."""
-        request = self.factory.get(f'/admin/core/workorder/{self.wo.pk}/change/')
-        request.user = self.superuser
+        """Verify change_form renders green Start Production button when WorkOrder is DRAFT and hides it on IN_PROGRESS or COMPLETED."""
+        from django.urls import reverse
+        self.client.force_login(self.superuser)
 
-        # 1. When DRAFT: Start Production action should be visible
+        # 1. When DRAFT: Start Production button is rendered, duplicate Start Production Run is absent
         self.wo.status = 'DRAFT'
         self.wo.save()
-        actions_draft = self.wo_admin.get_actions_detail(request, self.wo.pk)
-        action_names_draft = [a.action_name for a in actions_draft]
-        self.assertTrue(any('action_start_production_button' in name for name in action_names_draft))
+        resp_draft = self.client.get(reverse('admin:core_workorder_change', args=[self.wo.pk]))
+        self.assertEqual(resp_draft.status_code, 200)
+        self.assertContains(resp_draft, 'Start Production')
+        self.assertNotContains(resp_draft, 'Start Production Run')
 
-        # 2. When IN_PROGRESS: Start Production action should be hidden
+        # 2. When IN_PROGRESS: Start Production button is hidden
         self.wo.status = 'IN_PROGRESS'
         self.wo.save()
-        actions_in_prog = self.wo_admin.get_actions_detail(request, self.wo.pk)
-        action_names_in_prog = [a.action_name for a in actions_in_prog]
-        self.assertFalse(any('action_start_production_button' in name for name in action_names_in_prog))
+        resp_in_prog = self.client.get(reverse('admin:core_workorder_change', args=[self.wo.pk]))
+        self.assertEqual(resp_in_prog.status_code, 200)
+        self.assertNotContains(resp_in_prog, 'Start Production')
 
-        # 3. When COMPLETED: Start Production action should be hidden
+        # 3. When COMPLETED: Start Production button is hidden
         self.wo.status = 'COMPLETED'
         self.wo.save()
-        actions_completed = self.wo_admin.get_actions_detail(request, self.wo.pk)
-        action_names_completed = [a.action_name for a in actions_completed]
-        self.assertFalse(any('action_start_production_button' in name for name in action_names_completed))
+        resp_completed = self.client.get(reverse('admin:core_workorder_change', args=[self.wo.pk]))
+        self.assertEqual(resp_completed.status_code, 200)
+        self.assertNotContains(resp_completed, 'Start Production')

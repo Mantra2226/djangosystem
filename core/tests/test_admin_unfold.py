@@ -504,3 +504,69 @@ class UnfoldAdminIntegrationTests(TestCase):
         child_wo = WorkOrder.objects.filter(product=self.raw_putty).order_by('-pk').first()
         self.assertIsNotNone(child_wo)
         self.assertEqual(response.url, f'/admin/core/workorder/{child_wo.pk}/change/')
+
+    def test_work_order_admin_hides_raw_id_and_uses_code_display(self):
+        """Verify WorkOrderAdmin hides raw work_order_id from list_display and links on work_order_code."""
+        admin_instance = site._registry[WorkOrder]
+        self.assertNotIn('work_order_id', admin_instance.list_display)
+        self.assertNotIn('id', admin_instance.list_display)
+        self.assertIn('work_order_code', admin_instance.list_display)
+        self.assertEqual(admin_instance.list_display_links, ('work_order_code',))
+
+        wo = WorkOrder.objects.create(
+            product=self.finished_putty,
+            category='PRODUCTION',
+            quantity_produced=Decimal('50.00')
+        )
+        self.client.force_login(self.superuser)
+        response = self.client.get('/admin/core/workorder/')
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, wo.work_order_code)
+
+    def test_production_order_admin_work_order_link_column(self):
+        """Verify ProductionOrderAdmin renders clickable Work Order link with format {code} — {product}."""
+        admin_instance = site._registry[ProductionOrder]
+        self.assertIn('work_order_link', admin_instance.list_display)
+        self.assertNotIn('work_order', admin_instance.list_display)
+
+        wo = WorkOrder.objects.create(
+            product=self.finished_putty,
+            category='PRODUCTION',
+            quantity_produced=Decimal('35.00')
+        )
+        po = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo,
+            quantity=Decimal('35.00'),
+            status='DRAFT'
+        )
+
+        self.client.force_login(self.superuser)
+        response = self.client.get('/admin/core/productionorder/')
+        self.assertEqual(response.status_code, 200)
+
+        expected_link = f'/admin/core/workorder/{wo.pk}/change/'
+        expected_text = f"{wo.work_order_code} — {self.finished_putty.name}"
+        self.assertContains(response, expected_link)
+        self.assertContains(response, expected_text)
+
+    def test_work_order_category_auto_assigned_and_readonly(self):
+        """Verify WorkOrder.category is read-only in admin and automatically assigned based on product type."""
+        admin_instance = site._registry[WorkOrder]
+        self.assertIn('category', admin_instance.readonly_fields)
+
+        # 1. Product type INTERMEDIATE -> auto-assigned PRODUCTION
+        wo_bulk = WorkOrder.objects.create(
+            product=self.raw_putty,
+            quantity_produced=Decimal('500.00')
+        )
+        self.assertEqual(wo_bulk.category, 'PRODUCTION')
+
+        # 2. Product type FINISHED -> auto-assigned PACKAGING
+        wo_pack = WorkOrder.objects.create(
+            product=self.finished_putty,
+            quantity_produced=Decimal('100.00')
+        )
+        self.assertEqual(wo_pack.category, 'PACKAGING')
+
+

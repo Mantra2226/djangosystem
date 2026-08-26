@@ -11,7 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
-from django.urls import reverse_lazy
+from django.urls import reverse_lazy, reverse
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -189,18 +189,38 @@ UNFOLD = {
                 ],
             },
             {
-                "title": "Inventory & Logistics",
-                "icon": "inventory_2",
+                "title": "Warehouse & Inventory",
+                "icon": "warehouse",
                 "items": [
+                    {
+                        "title": "All Warehouse Stock",
+                        "icon": "inventory_2",
+                        "link": reverse_lazy("admin:core_inventory_changelist"),
+                    },
+                    {
+                        "title": "Raw Chemicals Stock",
+                        "icon": "science",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=RAW_CHEMICALS",
+                    },
+                    {
+                        "title": "Packaging Stock",
+                        "icon": "inventory",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=PACKAGING",
+                    },
+                    {
+                        "title": "WIP Bulk Base Putty",
+                        "icon": "hourglass_top",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=INTERMEDIATE",
+                    },
+                    {
+                        "title": "Finished Goods Stock",
+                        "icon": "verified",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=FINISHED",
+                    },
                     {
                         "title": "Products Catalog",
                         "icon": "category",
                         "link": reverse_lazy("admin:core_product_changelist"),
-                    },
-                    {
-                        "title": "Warehouse Inventory",
-                        "icon": "warehouse",
-                        "link": reverse_lazy("admin:core_inventory_changelist"),
                     },
                     {
                         "title": "Stock Transactions",

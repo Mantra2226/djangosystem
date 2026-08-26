@@ -50,6 +50,7 @@ class ProductSerializer(BaseSerializer):
             "quantity_available": float(stock_item.quantity_available) if stock_item else 0.0,
             "unit_cost": float(stock_item.unit_cost) if stock_item else 0.0,
             "supplier_id": obj.supplier_id,
+            "supplier_code": obj.supplier.supplier_code if obj.supplier else None,
             "supplier_name": obj.supplier.name if obj.supplier else "N/A"
         }
 
@@ -647,6 +648,26 @@ class BulkPaymentAllocationResponseSerializer(serializers.Serializer):
     total_allocated = serializers.DecimalField(max_digits=12, decimal_places=2)
     unallocated_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     allocations = InvoiceAllocationItemSerializer(many=True)
+
+
+class FinanceEntrySerializer(serializers.ModelSerializer):
+    """
+    DRF Serializer for General Ledger FinanceEntry instances.
+    Exposes sequential entry_code as primary identification, suppressing raw database ID.
+    """
+    entry_code = serializers.CharField(read_only=True)
+    entry_type_display = serializers.CharField(source='get_entry_type_display', read_only=True)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    logged_by_username = serializers.CharField(source='logged_by.username', read_only=True, default='System Auto-Post')
+
+    class Meta:
+        model = FinanceEntry
+        fields = [
+            'entry_code', 'timestamp', 'entry_date', 'entry_type', 'entry_type_display',
+            'category', 'category_display', 'amount', 'reference_document',
+            'description', 'logged_by', 'logged_by_username'
+        ]
+
 
 
 
