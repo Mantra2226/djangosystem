@@ -130,6 +130,10 @@ class ProductionReconciliationEngine:
             # Total cost accumulator for AVCO calculation
             total_material_cost = Decimal('0.00')
 
+            # Determine effective finished good yield
+            effective_qty = locked_wo.actual_quantity_produced if locked_wo.actual_quantity_produced is not None else locked_wo.target_quantity
+            finished_qty = effective_qty or Decimal('0.00')
+
             # =========================================================================
             # INVARIANT 4: ACCURATE CONSUMPTION DEDUCTIONS & STOCK LEDGER
             # =========================================================================
@@ -139,7 +143,24 @@ class ProductionReconciliationEngine:
                 if not raw_inv:
                     raise ProductionReconciliationError(f"Inventory record missing for component '{comp.name}'.")
 
-                actual_qty = line.quantity_actual or Decimal('0.00')
+                actual_qty = line.quantity_actual
+                if actual_qty is None or actual_qty == Decimal('0.00'):
+                    # Auto-default actual consumed quantity to BOM recipe requirement for output yield
+                    bom_item = None
+                    if locked_wo.bill_of_material:
+                        bom_item = locked_wo.bill_of_material.items.filter(component=comp).first()
+                    if bom_item and finished_qty > Decimal('0.00'):
+                        actual_qty = (bom_item.quantity_required * finished_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    elif line.quantity_expected and line.quantity_expected > Decimal('0.00'):
+                        actual_qty = line.quantity_expected
+                    else:
+                        actual_qty = line.quantity_allocated or Decimal('0.00')
+
+                    line.quantity_actual = actual_qty
+                    line.save(update_fields=['quantity_actual'])
+                    from core.models import MaterialVarianceRecord
+                    MaterialVarianceRecord.sync_from_material_line(line)
+
                 already_deducted = line.deducted_quantity or Decimal('0.00')
                 delta = actual_qty - already_deducted
 
@@ -174,6 +195,8 @@ class ProductionReconciliationEngine:
                         'transaction_id': st.transaction_id,
                     })
                     summary['stock_transactions'].append(st.transaction_id)
+                    print(f"   [OK] [CONSUMPTION LEDGER] Component '{comp.name}': Consumed={delta} {comp.unit_of_measurement or 'units'} (StockTransaction #{st.transaction_id})", flush=True)
+                    print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
 
                 # Material cost calculation for AVCO
                 comp_cost = comp.unit_cost if hasattr(comp, 'unit_cost') and comp.unit_cost else (raw_inv.unit_cost or Decimal('0.00'))
@@ -191,22 +214,21 @@ class ProductionReconciliationEngine:
                 residual_allocated = max(Decimal('0.00'), allocated_qty - already_deducted)
                 if residual_allocated > Decimal('0.00') and raw_inv:
                     released = min(residual_allocated, raw_inv.quantity_allocated)
-                    raw_inv.quantity_allocated -= released
-                    raw_inv.quantity_available += released
-                    raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
+                    if released > Decimal('0.00'):
+                        raw_inv.quantity_allocated -= released
+                        raw_inv.quantity_available += released
+                        raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                    summary['released_allocations'].append({
-                        'component_id': comp.pk,
-                        'component_name': comp.name,
-                        'released_qty': released,
-                    })
+                        summary['released_allocations'].append({
+                            'component_id': comp.pk,
+                            'component_name': comp.name,
+                            'released_qty': released,
+                        })
+                        print(f"   [RELEASE RESIDUAL] Component '{comp.name}': Released {released} unused allocated units back to available stock.", flush=True)
 
             # =========================================================================
             # INVARIANT 6: FINISHED GOODS OUTPUT LEDGER
             # =========================================================================
-            effective_qty = locked_wo.actual_quantity_produced if locked_wo.actual_quantity_produced is not None else locked_wo.target_quantity
-            finished_qty = effective_qty or Decimal('0.00')
-
             if finished_qty > Decimal('0.00') and locked_wo.product:
                 finished_prod = locked_wo.product
                 finished_inv = locked_inventories.get(finished_prod.pk)
@@ -246,6 +268,8 @@ class ProductionReconciliationEngine:
                 }
                 summary['stock_transactions'].append(st_output.transaction_id)
                 summary['unit_cost_avco'] = finished_inv.unit_cost
+                print(f"   [OK] [FINISHED GOODS OUTPUT] Product '{finished_prod.name}': Output={finished_qty} {finished_prod.unit_of_measurement or 'units'} (StockTransaction #{st_output.transaction_id}, AVCO: ${finished_inv.unit_cost:,.2f})", flush=True)
+                print(f"      Inventory Shift -> Available: {old_qty} => {finished_inv.quantity_available} units", flush=True)
 
             # Update WorkOrder completion flags and timestamp
             locked_wo.is_inventory_updated = True

@@ -987,7 +987,7 @@ class WorkOrder(models.Model):
           to eliminate TOCTOU race conditions between shortage detection and allocation.
         """
         current_status = (self.status or '').upper().strip()
-        if current_status not in ['PENDING', 'DRAFT', 'ON_HOLD_SHORTAGE', 'AWAITING_RESOLUTION']:
+        if current_status not in ['PENDING', 'DRAFT', 'ON_HOLD_SHORTAGE', 'AWAITING_RESOLUTION', 'AWAITING_PROCUREMENT', 'READY_TO_START']:
             raise ValidationError(f"Cannot start production: Work order is already {self.status}.")
 
         # Check for granular raw material shortages in linked ProductionOrder(s)
@@ -995,6 +995,25 @@ class WorkOrder(models.Model):
         for po in ProductionOrder.objects.filter(work_order=self):
             if po.has_unresolved_shortages or po.status in ['ON_HOLD_SHORTAGE', 'PARTIALLY_RESOLVED']:
                 raise ValidationError(f"Cannot start production: Production order '{po.production_order_code or po.pk}' has unresolved raw material shortages. All component shortages must be resolved first.")
+
+        # TWO-TIER PHYSICAL PROCUREMENT GATE:
+        # Check that PO_DRAFTED / CHILD_WO_CREATED / HOLD_ACTIVE_RUN items have physically arrived in unallocated warehouse inventory
+        for po in ProductionOrder.objects.filter(work_order=self):
+            unverified_items = []
+            for item in po.items.filter(resolution_status__in=['PO_DRAFTED', 'CHILD_WO_CREATED', 'HOLD_ACTIVE_RUN']):
+                available_unallocated = Inventory.objects.filter(
+                    product=item.raw_material
+                ).aggregate(total=Sum('quantity_available'))['total'] or Decimal('0.00')
+                if available_unallocated < item.planned_quantity:
+                    unverified_items.append(
+                        f"{item.raw_material.name} (Need: {item.planned_quantity:.2f}, Available Unallocated: {available_unallocated:.2f})"
+                    )
+            if unverified_items:
+                raise ValidationError(
+                    f"Cannot start production: Materials have been planned/drafted but goods have not "
+                    f"been physically received in unallocated inventory for: {'; '.join(unverified_items)}. "
+                    f"Receive the goods into warehouse inventory first, then retry."
+                )
 
         # Temporarily evaluate status as IN_PROGRESS so clean() enforces operational gates
         old_status = self.status
@@ -1060,7 +1079,7 @@ class WorkOrder(models.Model):
         # Early exit: nothing to do if already fully updated and not in a
         # state that requires incremental processing.
         if self.is_inventory_updated:
-            print(f"\n[HYBRID INVENTORY ENGINE] Work Order ID: {self.pk} — SKIPPED (is_inventory_updated=True)", flush=True)
+            print(f"\n[IDEMPOTENCY GUARD] Work Order ID: {self.pk} ({self.work_order_code}) — Stock reconciliation already completed (is_inventory_updated=True). Safely skipping redundant pass.", flush=True)
             return
 
         from .models import Inventory, StockTransaction
@@ -1130,8 +1149,17 @@ class WorkOrder(models.Model):
 
                     # Step 4: PRE-FLIGHT GATE - Check ALL components have sufficient stock
                     #         before mutating any row. Prevents partial allocations.
+                    #         Supervisor authorized OVERRIDDEN items bypass this physical pre-flight gate.
+                    overridden_product_ids = set()
+                    from .models import ProductionOrder
+                    for po in ProductionOrder.objects.filter(work_order=self):
+                        for item in po.items.filter(resolution_status='OVERRIDDEN'):
+                            overridden_product_ids.add(item.raw_material_id)
+
                     shortage_errors = []
                     for comp_id in sorted_ids:
+                        if comp_id in overridden_product_ids:
+                            continue
                         plan = allocation_plan[comp_id]
                         inv = locked_inventories[comp_id]
                         if inv.quantity_available < plan['required_qty']:
@@ -1152,8 +1180,12 @@ class WorkOrder(models.Model):
                         old_avail = inv.quantity_available
                         old_alloc = inv.quantity_allocated
 
-                        inv.quantity_available -= plan['required_qty']
-                        inv.quantity_allocated += plan['required_qty']
+                        alloc_qty = plan['required_qty']
+                        if comp_id in overridden_product_ids:
+                            alloc_qty = min(inv.quantity_available, plan['required_qty'])
+
+                        inv.quantity_available -= alloc_qty
+                        inv.quantity_allocated += alloc_qty
                         inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
                         print(f"   [OK] [RESERVED ALLOCATION] Component: '{plan['component'].name}'", flush=True)
@@ -1366,6 +1398,7 @@ class WorkOrder(models.Model):
                             update_fields.append('quantity')
                     if update_fields:
                         po.work_order = self  # Ensure PO references this in-memory instance with the flag
+                        po._skip_wo_inventory_sync = True
                         po.save(update_fields=update_fields)
                         print(f"    Updated ProductionOrder #{po.pk} fields: {update_fields}.", flush=True)
                 self._skip_po_inventory_sync = False
@@ -1691,6 +1724,8 @@ class ProductionOrder(models.Model):
         ('IN_PROGRESS', 'In Progress'),
         ('ON_HOLD_SHORTAGE', 'On Hold (Stock Shortage)'),
         ('PARTIALLY_RESOLVED', 'Partially Resolved'),
+        ('AWAITING_PROCUREMENT', 'Awaiting Procurement (POs Drafted)'),
+        ('READY_TO_START', 'Ready to Start (Stock Verified)'),
         ('MRP_RESOLVED', 'MRP Resolved / Ready'),
         ('COMPLETED', 'Completed'),
         ('CANCELLED', 'Cancelled'),
@@ -1733,15 +1768,40 @@ class ProductionOrder(models.Model):
         unresolved_count = items.filter(resolution_status='UNRESOLVED').count()
         shortage_items = items.exclude(resolution_status='NO_SHORTAGE')
         shortage_count = shortage_items.count()
-
         if shortage_count == 0:
             self.status = 'MRP_RESOLVED'
             self.is_mrp_resolved = True
-        elif unresolved_count == 0:
-            self.status = 'MRP_RESOLVED'
-            self.is_mrp_resolved = True
-            self.resolution_applied = 'GRANULAR_MULTI_MATERIAL_RESOLVED'
+            self.resolution_applied = 'NO_SHORTAGES_DETECTED'
             self.resolved_at = timezone.now()
+        elif unresolved_count == 0:
+            # All shortage items have been resolved (PO_DRAFTED, OVERRIDDEN, DOWNSCALED, RESOLVED, CHILD_WO_CREATED, HOLD_ACTIVE_RUN)
+            pending_procurement_count = items.filter(
+                resolution_status__in=['PO_DRAFTED', 'CHILD_WO_CREATED', 'HOLD_ACTIVE_RUN']
+            ).count()
+            if pending_procurement_count > 0:
+                # Check if all pending items currently have physical unallocated stock in inventory
+                all_physically_satisfied = True
+                for item in items.filter(resolution_status__in=['PO_DRAFTED', 'CHILD_WO_CREATED', 'HOLD_ACTIVE_RUN']):
+                    available_unallocated = Inventory.objects.filter(
+                        product=item.raw_material
+                    ).aggregate(total=Sum('quantity_available'))['total'] or Decimal('0.00')
+                    if available_unallocated < item.planned_quantity:
+                        all_physically_satisfied = False
+                        break
+                if all_physically_satisfied:
+                    self.status = 'READY_TO_START'
+                    self.is_mrp_resolved = True
+                    self.resolution_applied = 'GRANULAR_ALL_ITEMS_PLANNED_AND_STOCKED'
+                    self.resolved_at = timezone.now()
+                else:
+                    self.status = 'AWAITING_PROCUREMENT'
+                    self.is_mrp_resolved = False
+                    self.resolution_applied = 'GRANULAR_ALL_ITEMS_PLANNED'
+            else:
+                self.status = 'MRP_RESOLVED'
+                self.is_mrp_resolved = True
+                self.resolution_applied = 'GRANULAR_MULTI_MATERIAL_RESOLVED'
+                self.resolved_at = timezone.now()
         elif unresolved_count < shortage_count:
             self.status = 'PARTIALLY_RESOLVED'
             self.is_mrp_resolved = False
@@ -1807,7 +1867,7 @@ class ProductionOrder(models.Model):
             if total_available < total_needed:
                 shortage = total_needed - total_available
                 po_item.shortage_quantity = shortage
-                if po_item.resolution_status not in ['PO_DRAFTED', 'OVERRIDDEN', 'DOWNSCALED', 'RESOLVED']:
+                if po_item.resolution_status not in ['PO_DRAFTED', 'OVERRIDDEN', 'DOWNSCALED', 'RESOLVED', 'CHILD_WO_CREATED', 'HOLD_ACTIVE_RUN']:
                     po_item.resolution_status = 'UNRESOLVED'
             else:
                 po_item.shortage_quantity = Decimal('0.00')
@@ -1859,49 +1919,23 @@ class ProductionOrder(models.Model):
             new_weighted_cost = (current_value + batch_value) / total_qty
             inventory.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             inventory.save()
- 
 
     def clean(self):
         super().clean()
-
-        # Auto-assign product from work order if blank
-        if self.work_order_id and not self.product_id:
-            try:
-                self.product = self.work_order.product
-            except ObjectDoesNotExist:
-                pass
-
-        # Normalize status string for case-insensitive checks
         current_status = (self.status or '').upper().strip()
 
-        # PRODUCT & WORK ORDER CONSTRAINTS
-        if self.product and self.product.product_type not in ['Finished Goods', 'FINISHED', 'INTERMEDIATE']:
-            raise ValidationError({
-                'product': "Only products designated as 'Finished Goods' or 'Intermediate' can be selected for a production run."
-            })
-
+        # PREVENT LINKING COMPLETED WORK ORDERS
         if self.work_order_id:
             try:
                 wo = self.work_order
                 if wo:
-                    if self.product and wo.product != self.product:
-                        raise ValidationError({
-                            'work_order': (
-                                f"Conflict: The selected Work Order ({wo}) is for '{wo.product}', "
-                                f"but this Production Order is set to produce '{self.product}'."
-                            )
-                        })
-
-                    # Validation: Prevent linking a completed work order when creating or reassigning a ProductionOrder
                     wo_status = (wo.status or '').upper().strip()
-                    is_new = not self.pk
-                    is_changing_wo = False
-                    if self.pk:
+                    is_new = self.pk is None
+                    orig_wo_id = None
+                    if not is_new and self.pk:
                         orig_wo_id = ProductionOrder.objects.filter(pk=self.pk).values_list('work_order_id', flat=True).first()
-                        if orig_wo_id != self.work_order_id:
-                            is_changing_wo = True
 
-                    if (is_new or is_changing_wo) and wo_status == 'COMPLETED':
+                    if (is_new or orig_wo_id != wo.pk) and wo_status == 'COMPLETED':
                         raise ValidationError({
                             'work_order': (
                                 f"Work Order '{wo.work_order_code or wo.pk}' cannot be linked because it is already COMPLETED. "
@@ -1924,7 +1958,6 @@ class ProductionOrder(models.Model):
 
         # Trigger stock pre-check when starting production run
         if is_now_in_progress and not was_in_progress and not self.is_mrp_resolved:
-            # Use planned target quantity directly (does not fall back to quantity_produced)
             target_qty = self.quantity or Decimal('0.00')
 
             if target_qty <= Decimal('0.00'):
@@ -1948,7 +1981,6 @@ class ProductionOrder(models.Model):
                     item_req = item.quantity_required or Decimal('0.00')
                     total_needed = item_req * target_qty
 
-                    # Sum available stock across all warehouse records
                     total_available = Inventory.objects.filter(
                         product=item.component
                     ).aggregate(
@@ -1960,7 +1992,8 @@ class ProductionOrder(models.Model):
                         shortage_msgs.append(f"{item.component.name} (Need: {total_needed:.2f}, Avail: {total_available:.2f}, Short: {shortage:.2f})")
 
                 if shortage_msgs:
-                    self.status = 'ON_HOLD_SHORTAGE'
+                    if self.status not in ['AWAITING_PROCUREMENT', 'PARTIALLY_RESOLVED']:
+                        self.status = 'ON_HOLD_SHORTAGE'
                     shortage_note = f"[MRP SHORTAGE FLAGGED] Insufficient inventory: {'; '.join(shortage_msgs)}"
                     if not self.notes:
                         self.notes = shortage_note
@@ -1979,18 +2012,20 @@ class ProductionOrder(models.Model):
 
             if last_po and last_po.production_order_code:
                 try:
-                    last_seq = int(last_po.production_order_code.split('-')[-1])
-                    new_seq = last_seq + 1
-                except (ValueError, IndexError):
-                    new_seq = 1
+                    last_num = int(last_po.production_order_code.replace(f"{prefix}-", ""))
+                    next_num = last_num + 1
+                except ValueError:
+                    next_num = 1
             else:
-                new_seq = 1
+                next_num = 1
 
-            self.production_order_code = f"{prefix}-{new_seq:04d}"
+            self.production_order_code = f"{prefix}-{next_num:04d}"
 
         old_status = None
-        if not is_new:
+        if not is_new and self.pk:
             old_status = ProductionOrder.objects.filter(pk=self.pk).values_list('status', flat=True).first()
+            if old_status:
+                old_status = old_status.upper().strip()
 
         is_transitioning_to_completed = (old_status != 'COMPLETED' and self.status == 'COMPLETED')
 
@@ -2020,7 +2055,7 @@ class ProductionOrder(models.Model):
             # handles process_inventory() after inlines are committed.
             # We detect the admin flow by checking for the _skip_po_inventory_sync
             # flag set by WorkOrder.save().
-            if self.work_order_id:
+            if self.work_order_id and not getattr(self, '_skip_wo_inventory_sync', False):
                 try:
                     wo = self.work_order
                     if wo and not getattr(wo, '_skip_po_inventory_sync', False):
@@ -2054,6 +2089,8 @@ class ProductionOrderItem(models.Model):
         ('OVERRIDDEN', 'Overridden / Authorized'),
         ('DOWNSCALED', 'Downscaled Batch Target'),
         ('RESOLVED', 'Resolved'),
+        ('CHILD_WO_CREATED', 'Sub-Assembly Work Order Spawned'),
+        ('HOLD_ACTIVE_RUN', 'Held for Active Floor Run'),
     ]
 
     item_id = models.AutoField(primary_key=True)

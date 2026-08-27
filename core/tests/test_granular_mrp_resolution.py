@@ -146,7 +146,7 @@ class GranularMRPResolutionTests(TestCase):
         self.assertTrue(self.po.has_unresolved_shortages)
 
     def test_resolving_all_items_transitions_order_to_mrp_resolved(self):
-        """Resolving all items transitions ProductionOrder to MRP_RESOLVED and clears has_unresolved_shortages."""
+        """Resolving all items transitions ProductionOrder to AWAITING_PROCUREMENT when POs are drafted and clears has_unresolved_shortages."""
         self.po.evaluate_mrp()
 
         # 1. Resolve Calcium Carbonate with Auto-Draft PO
@@ -161,10 +161,9 @@ class GranularMRPResolutionTests(TestCase):
         self.assertEqual(oil_item.resolution_status, 'OVERRIDDEN')
         self.assertEqual(oil_item.resolved_by, self.supervisor)
 
-        # ProductionOrder should now be MRP_RESOLVED
+        # ProductionOrder should now be AWAITING_PROCUREMENT (PO drafted for CC, stock pending)
         self.po.refresh_from_db()
-        self.assertEqual(self.po.status, 'MRP_RESOLVED')
-        self.assertTrue(self.po.is_mrp_resolved)
+        self.assertEqual(self.po.status, 'AWAITING_PROCUREMENT')
         self.assertFalse(self.po.has_unresolved_shortages)
 
     def test_work_order_cannot_start_until_all_items_resolved(self):
@@ -191,7 +190,7 @@ class GranularMRPResolutionTests(TestCase):
         oil_item.resolve_with_override(user=self.supervisor, notes="Verified stock available")
 
         self.po.refresh_from_db()
-        self.assertEqual(self.po.status, 'MRP_RESOLVED')
+        self.assertIn(self.po.status, ['READY_TO_START', 'MRP_RESOLVED'])
 
         # Now start_production should succeed
         success, msg = self.wo.start_production()

@@ -315,9 +315,9 @@ class InventoryProductTypeFilterTests(TestCase):
         item_titles = [it.get("title") for it in items]
 
         self.assertIn("All Warehouse Stock", item_titles)
-        self.assertIn("Raw Chemicals Stock", item_titles)
+        self.assertIn("Raw Material Stock", item_titles)
         self.assertIn("Packaging Stock", item_titles)
-        self.assertIn("WIP Bulk Base Putty", item_titles)
+        self.assertIn("Intermediates Stock", item_titles)
         self.assertIn("Finished Goods Stock", item_titles)
 
         # Verify dynamic link evaluation for callables and expected targets
@@ -331,16 +331,16 @@ class InventoryProductTypeFilterTests(TestCase):
                 evaluated_link = str(link)
 
             if title in [
-                "All Warehouse Stock", "Raw Chemicals Stock", "Packaging Stock",
-                "WIP Bulk Base Putty", "Finished Goods Stock"
+                "All Warehouse Stock", "Raw Material Stock", "Packaging Stock",
+                "Intermediates Stock", "Finished Goods Stock"
             ]:
                 self.assertTrue(evaluated_link.startswith('/admin/core/inventory/'), f"Link {evaluated_link} must target inventory changelist.")
 
-            if title == "Raw Chemicals Stock":
+            if title == "Raw Material Stock":
                 self.assertIn("product_type=RAW_CHEMICALS", evaluated_link)
             elif title == "Packaging Stock":
                 self.assertIn("product_type=PACKAGING", evaluated_link)
-            elif title == "WIP Bulk Base Putty":
+            elif title == "Intermediates Stock":
                 self.assertIn("product_type=INTERMEDIATE", evaluated_link)
             elif title == "Finished Goods Stock":
                 self.assertIn("product_type=FINISHED", evaluated_link)

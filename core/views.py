@@ -283,7 +283,7 @@ def mrp_resolve_action(request):
     try:
         if action == 'raw_autodraft_po':
             new_po = resolve_raw_autodraft_po(po, component_id, shortfall_qty)
-            po.lock_mrp_resolution(pathway_name='RAW_AUTODRAFT_PO')
+            po.refresh_from_db()
             messages.success(
                 request,
                 f"Auto-drafted Purchase Order #{new_po.po_number}. "
@@ -293,7 +293,7 @@ def mrp_resolve_action(request):
 
         elif action == 'raw_direct_procurement':
             proc = resolve_raw_direct_procurement(po, component_id, shortfall_qty)
-            po.lock_mrp_resolution(pathway_name='RAW_DIRECT_PROCUREMENT')
+            po.refresh_from_db()
             messages.success(
                 request,
                 f"Spawned Fast-Track Procurement Order #{proc.procurement_order_id}. "
@@ -302,14 +302,15 @@ def mrp_resolve_action(request):
             return redirect(reverse('admin:core_procurementorder_change', args=[proc.pk]))
 
         elif action == 'raw_hold_inbound':
-            resolve_raw_hold_inbound(po, component_id)
-            po.lock_mrp_resolution(pathway_name='RAW_HOLD_INBOUND')
-            messages.info(request, "Order status held on ON_HOLD_SHORTAGE awaiting inbound PO stock.")
+            inbound_po_id = params.get('inbound_po_id')
+            resolve_raw_hold_inbound(po, component_id, inbound_po=inbound_po_id)
+            po.refresh_from_db()
+            messages.info(request, "Shortage bound to incoming Purchase Order delivery.")
             return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
         elif action == 'intermediate_build':
             wo, child_po = resolve_intermediate_build(po, component_id, shortfall_qty)
-            po.lock_mrp_resolution(pathway_name='INTERMEDIATE_BUILD')
+            po.refresh_from_db()
             messages.success(
                 request,
                 f"Spawned Sub-Assembly Work Order #{wo.work_order_code or wo.pk} (Production Run #{child_po.production_order_code or child_po.pk}). "
@@ -318,15 +319,28 @@ def mrp_resolve_action(request):
             return redirect(reverse('admin:core_workorder_change', args=[wo.pk]))
 
         elif action == 'intermediate_hold_active':
-            resolve_intermediate_hold_active(po, component_id)
-            po.lock_mrp_resolution(pathway_name='INTERMEDIATE_HOLD_ACTIVE')
+            active_po_id = params.get('active_po_id')
+            resolve_intermediate_hold_active(po, component_id, active_po=active_po_id)
+            po.refresh_from_db()
             messages.info(request, "Linked order to active intermediate shop floor run.")
             return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
-        elif action == 'intermediate_partial_batch':
-            resolve_intermediate_partial_batch(po, max_producible)
-            po.lock_mrp_resolution(pathway_name='INTERMEDIATE_PARTIAL_BATCH')
-            messages.success(request, f"Down-scaled production batch target to {max_producible} units. Order is now IN_PROGRESS.")
+        elif action in ['batch_downscale', 'intermediate_partial_batch']:
+            if component_id:
+                from .services import resolve_batch_downscale
+                resolve_batch_downscale(po, component_id)
+            else:
+                resolve_intermediate_partial_batch(po, max_producible)
+            po.refresh_from_db()
+            messages.success(request, f"Down-scaled production batch target to {po.quantity} units based on available stock.")
+            return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+        elif action == 'item_override':
+            notes = params.get('notes') or f"Authorized override by {request.user.username}"
+            from .services import resolve_item_override
+            resolve_item_override(po, component_id, user=request.user, notes=notes)
+            po.refresh_from_db()
+            messages.success(request, "Authorized shortage override for component.")
             return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
         else:

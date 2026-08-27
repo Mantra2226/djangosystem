@@ -523,6 +523,8 @@ class ProductionOrderItemInline(TabularInline):
             'OVERRIDDEN': '#0284c7',      # Sky Blue
             'DOWNSCALED': '#d97706',      # Burnt Orange
             'RESOLVED': '#10b981',        # Emerald Green
+            'CHILD_WO_CREATED': '#8b5cf6', # Violet
+            'HOLD_ACTIVE_RUN': '#06b6d4',  # Cyan
         }
         bg = color_map.get(obj.resolution_status, '#64748b')
         return render_status_badge(obj.get_resolution_status_display(), bg)
@@ -570,6 +572,8 @@ class ProductionOrderItemAdmin(ModelAdmin):
             'OVERRIDDEN': '#0284c7',      # Sky Blue
             'DOWNSCALED': '#d97706',      # Burnt Orange
             'RESOLVED': '#10b981',        # Emerald Green
+            'CHILD_WO_CREATED': '#8b5cf6', # Violet
+            'HOLD_ACTIVE_RUN': '#06b6d4',  # Cyan
         }
         bg = color_map.get(obj.resolution_status, '#64748b')
         return render_status_badge(obj.get_resolution_status_display(), bg)
@@ -607,11 +611,102 @@ class ProductionOrderAdmin(ModelAdmin):
     def get_urls(self):
         urls = super().get_urls()
         custom_urls = [
+            path('<int:object_id>/resolve-po/<int:item_id>/', self.admin_site.admin_view(self.action_resolve_po_view), name='core_productionorder_resolve_po'),
+            path('<int:object_id>/resolve-inbound/<int:item_id>/', self.admin_site.admin_view(self.action_resolve_inbound_view), name='core_productionorder_resolve_inbound'),
+            path('<int:object_id>/resolve-downscale/<int:item_id>/', self.admin_site.admin_view(self.action_resolve_downscale_view), name='core_productionorder_resolve_downscale'),
+            path('<int:object_id>/resolve-build-child/<int:item_id>/', self.admin_site.admin_view(self.action_resolve_build_child_view), name='core_productionorder_resolve_build_child'),
+            path('<int:object_id>/resolve-hold-active/<int:item_id>/', self.admin_site.admin_view(self.action_resolve_hold_active_view), name='core_productionorder_resolve_hold_active'),
+            path('<int:object_id>/resolve-override/<int:item_id>/', self.admin_site.admin_view(self.action_resolve_override_view), name='core_productionorder_resolve_override'),
             path('resolve-item-po/<int:item_id>/', self.admin_site.admin_view(self.resolve_item_po_view), name='core_productionorder_resolve_item_po'),
             path('resolve-item-override/<int:item_id>/', self.admin_site.admin_view(self.resolve_item_override_view), name='core_productionorder_resolve_item_override'),
             path('evaluate-mrp/<int:object_id>/', self.admin_site.admin_view(self.evaluate_mrp_view), name='core_productionorder_evaluate_mrp'),
         ]
         return custom_urls + urls
+
+    def action_resolve_po_view(self, request, object_id, item_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        item = get_object_or_404(ProductionOrderItem, pk=item_id, production_order=po)
+        from .services import resolve_raw_autodraft_po
+        draft_po = resolve_raw_autodraft_po(po, item.raw_material_id, item.shortage_quantity)
+        self.message_user(
+            request,
+            f"Auto-drafted Purchase Order #{draft_po.po_number or draft_po.pk} for {item.raw_material.name}.",
+            level=messages.SUCCESS
+        )
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def action_resolve_inbound_view(self, request, object_id, item_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        item = get_object_or_404(ProductionOrderItem, pk=item_id, production_order=po)
+        from .services import resolve_raw_hold_inbound
+        try:
+            resolve_raw_hold_inbound(po, item.raw_material_id)
+            self.message_user(
+                request,
+                f"Shortage for {item.raw_material.name} bound to incoming Purchase Order delivery.",
+                level=messages.INFO
+            )
+        except Exception as e:
+            self.message_user(request, f"Inbound hold error: {str(e)}", level=messages.ERROR)
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def action_resolve_downscale_view(self, request, object_id, item_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        item = get_object_or_404(ProductionOrderItem, pk=item_id, production_order=po)
+        from .services import resolve_batch_downscale
+        try:
+            resolve_batch_downscale(po, item.raw_material_id)
+            self.message_user(
+                request,
+                f"Batch size downscaled to {po.quantity} units based on available stock of {item.raw_material.name}.",
+                level=messages.SUCCESS
+            )
+        except Exception as e:
+            self.message_user(request, f"Downscale error: {str(e)}", level=messages.ERROR)
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def action_resolve_build_child_view(self, request, object_id, item_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        item = get_object_or_404(ProductionOrderItem, pk=item_id, production_order=po)
+        from .services import resolve_intermediate_build
+        try:
+            child_wo, child_po = resolve_intermediate_build(po, item.raw_material_id, item.shortage_quantity)
+            self.message_user(
+                request,
+                f"Spawned Sub-Assembly Work Order #{child_wo.work_order_code or child_wo.pk} (Run #{child_po.pk}) for {item.raw_material.name}.",
+                level=messages.SUCCESS
+            )
+        except Exception as e:
+            self.message_user(request, f"Sub-assembly spawn error: {str(e)}", level=messages.ERROR)
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def action_resolve_hold_active_view(self, request, object_id, item_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        item = get_object_or_404(ProductionOrderItem, pk=item_id, production_order=po)
+        from .services import resolve_intermediate_hold_active
+        try:
+            resolve_intermediate_hold_active(po, item.raw_material_id)
+            self.message_user(
+                request,
+                f"Linked {item.raw_material.name} to active shop floor run.",
+                level=messages.INFO
+            )
+        except Exception as e:
+            self.message_user(request, f"Active run hold error: {str(e)}", level=messages.ERROR)
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    def action_resolve_override_view(self, request, object_id, item_id):
+        po = get_object_or_404(ProductionOrder, pk=object_id)
+        item = get_object_or_404(ProductionOrderItem, pk=item_id, production_order=po)
+        from .services import resolve_item_override
+        notes = request.GET.get('notes') or request.POST.get('notes') or f"Authorized override by {request.user.username}"
+        resolve_item_override(po, item.raw_material_id, user=request.user, notes=notes)
+        self.message_user(
+            request,
+            f"Authorized shortage override for {item.raw_material.name}.",
+            level=messages.SUCCESS
+        )
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
     def resolve_item_po_view(self, request, item_id):
         item = get_object_or_404(ProductionOrderItem, pk=item_id)
@@ -622,8 +717,6 @@ class ProductionOrderAdmin(ModelAdmin):
             f"Auto-drafted Purchase Order #{item.linked_purchase_order.po_number or item.linked_purchase_order.pk} for {item.raw_material.name}.",
             level=messages.SUCCESS
         )
-        if item.linked_purchase_order:
-            return redirect(reverse('admin:core_purchaseorder_change', args=[item.linked_purchase_order.pk]))
         return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
     def resolve_item_override_view(self, request, item_id):
@@ -669,6 +762,8 @@ class ProductionOrderAdmin(ModelAdmin):
             'CANCELLED': '#ef4444',            # Crimson Red
             'ON_HOLD_SHORTAGE': '#ef4444',     # Crimson
             'PARTIALLY_RESOLVED': '#f59e0b',   # Amber
+            'AWAITING_PROCUREMENT': '#8b5cf6', # Violet
+            'READY_TO_START': '#059669',       # Teal Green
             'MRP_RESOLVED': '#10b981',         # Emerald Green
             'AWAITING_RESOLUTION': '#d97706',  # Burnt Orange
         }
@@ -677,13 +772,20 @@ class ProductionOrderAdmin(ModelAdmin):
 
     @display(description='MRP Resolution')
     def mrp_status_badge(self, obj):
-        if obj.is_mrp_resolved or (obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']):
+        if obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']:
             applied = obj.resolution_applied or "RESOLVED"
             return render_status_badge(f"LOCKED ({applied})", '#10b981')
-        if obj.status == 'PARTIALLY_RESOLVED':
-            return render_status_badge("PARTIALLY RESOLVED", '#f59e0b')
+        if (obj.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']:
+            applied = obj.resolution_applied or "RESOLVED"
+            return render_status_badge(f"LOCKED ({applied})", '#10b981')
+        if obj.status == 'AWAITING_PROCUREMENT':
+            return render_status_badge("AWAITING PROCUREMENT", '#8b5cf6')
+        if obj.status == 'READY_TO_START':
+            return render_status_badge("READY TO START", '#059669')
         if obj.status == 'MRP_RESOLVED':
             return render_status_badge("RESOLVED / READY", '#10b981')
+        if obj.status == 'PARTIALLY_RESOLVED':
+            return render_status_badge("PARTIALLY RESOLVED", '#f59e0b')
         return render_status_badge("PENDING EVALUATION", '#f59e0b')
 
     @action(description="Check Stock & Auto-Resume Order", url_path="mrp-auto-resume")
@@ -755,7 +857,12 @@ class ProductionOrderAdmin(ModelAdmin):
         if not obj or not obj.pk:
             return "Save record to evaluate MRP shortages."
 
-        if obj.is_mrp_resolved or (obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED']):
+        # Locked Banner: Only when production run is actively in progress or completed
+        is_active_or_completed = (
+            (obj.status or '').upper() in ['IN_PROGRESS', 'COMPLETED'] or
+            (obj.work_order and (obj.work_order.status or '').upper() in ['IN_PROGRESS', 'COMPLETED'])
+        )
+        if is_active_or_completed:
             resolved_time = obj.resolved_at.strftime('%Y-%m-%d %H:%M') if obj.resolved_at else "Run Commencement"
             pathway_text = obj.resolution_applied or "INITIAL_STOCK_ALLOCATION"
             return format_html(
@@ -774,101 +881,210 @@ class ProductionOrderAdmin(ModelAdmin):
                 "</div>"
             )
 
-        from .services import evaluate_mrp_shortages
-        report = evaluate_mrp_shortages(obj)
-
-        if not report:
-            return mark_safe("<span style='color: #666;'>No material blueprint / BOM requirements evaluated.</span>")
-
-        shortage_items = [r for r in report if r['has_shortage']]
-        if not shortage_items:
-            return mark_safe("<div style='padding: 10px; background: #e8f8f5; border-left: 4px solid #2ecc71; color: #27ae60; border-radius: 4px;'><strong>All Stock Satisfied:</strong> All component inventory levels meet or exceed batch requirements.</div>")
+        items = obj.items.select_related('raw_material', 'linked_purchase_order', 'resolved_by').all()
+        if not items.exists():
+            return mark_safe(
+                "<div style='padding: 10px; background: #f8fafc; border-left: 4px solid #94a3b8; color: #475569; border-radius: 4px;'>"
+                "<strong>No Material Items Evaluated:</strong> Click <em>'Evaluate Granular MRP Shortages'</em> button to scan recipe requirements against inventory."
+                "</div>"
+            )
 
         cards_html = []
-        for item in shortage_items:
-            comp = item['component']
-            shortfall = item['shortfall_qty']
-            req = item['required_qty']
-            avail = item['available_qty']
-            p_type = item['product_type']
-            supplier_name = item['supplier'].name if item['supplier'] else "No Supplier Assigned"
+        header_banner = ""
 
-            options_html = ""
-            if p_type == 'RAW':
-                options_html = f"""
-                <div style="margin-top: 8px; font-size: 12px; background: #fff; padding: 10px; border-radius: 4px; border: 1px solid #e2e8f0;">
-                    <strong style="color: #2b6cb0;">Tailored Resolution Pathways (Raw Material):</strong>
-                    <div style="margin-top: 6px; display: grid; gap: 8px;">
-                        <div style="background: #ebf8ff; padding: 8px; border-radius: 4px; border-left: 3px solid #3182ce;">
-                            <div><strong>Option 1: Auto-Draft Purchase Order</strong> - Append {shortfall:.2f} units to an open DRAFT Purchase Order for supplier <em>{supplier_name}</em> and open for review.</div>
-                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&shortfall_qty={shortfall}&resolution_action=raw_autodraft_po"
-                               style="display: inline-block; margin-top: 6px; background: #2563eb; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
-                                Execute Option 1: Auto-Draft &amp; Open Purchase Order
-                            </a>
-                        </div>
-                        <div style="background: #feebc8; padding: 8px; border-radius: 4px; border-left: 3px solid #dd6b20;">
-                            <div><strong>Option 2: Direct Procurement</strong> - Spawn a Fast-Track Procurement Order and open for review.</div>
-                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&shortfall_qty={shortfall}&resolution_action=raw_direct_procurement"
-                               style="display: inline-block; margin-top: 6px; background: #d97706; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
-                                Execute Option 2: Spawn &amp; Open Procurement Order
-                            </a>
-                        </div>
-                        <div style="background: #edf2f7; padding: 8px; border-radius: 4px; border-left: 3px solid #718096;">
-                            <div><strong>Option 3: Hold for Inbound Stock</strong> - Maintain ON_HOLD status (In-Transit Qty: {item['inbound_po_qty']:.2f}).</div>
-                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&resolution_action=raw_hold_inbound"
-                               style="display: inline-block; margin-top: 6px; background: #4b5563; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
-                                Execute Option 3: Hold for Inbound POs
-                            </a>
-                        </div>
+        if obj.status == 'AWAITING_PROCUREMENT':
+            header_banner = (
+                "<div style='margin-bottom: 12px; padding: 12px 16px; background: #f5f3ff; border-left: 4px solid #8b5cf6; color: #5b21b6; border-radius: 6px; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);'>"
+                "<strong>Awaiting Procurement (Purchase Orders Drafted / Sub-Assemblies Spawned):</strong> All component shortages have planned resolutions. "
+                "Physical delivery must be received into unallocated warehouse inventory before production can commence."
+                "</div>"
+            )
+        elif obj.status == 'READY_TO_START':
+            header_banner = (
+                "<div style='margin-bottom: 12px; padding: 12px 16px; background: #ecfdf5; border-left: 4px solid #059669; color: #065f46; border-radius: 6px; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);'>"
+                "<strong>Ready to Start (Stock Verified):</strong> All planned materials are physically available in unallocated warehouse stock. "
+                "The Work Order can now start production."
+                "</div>"
+            )
+
+        for item in items:
+            comp = item.raw_material
+            p_type = (comp.product_type or 'RAW').upper()
+            is_intermediate = (p_type == 'INTERMEDIATE')
+            status = item.resolution_status
+
+            if status == 'NO_SHORTAGE':
+                card = f"""
+                <div style="padding: 12px 14px; background: #f0fdf4; border: 1px solid #bbf7d0; border-left: 4px solid #22c55e; border-radius: 6px; color: #166534; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #15803d;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #dcfce7; color: #166534; padding: 2px 8px; border-radius: 10px; font-weight: 700;">In Stock</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #15803d;">
+                        <strong>Planned Required:</strong> {item.planned_quantity:.2f} {comp.unit_of_measurement or 'units'}
                     </div>
                 </div>
                 """
-            else:
-                max_prod = item['max_producible']
-                options_html = f"""
-                <div style="margin-top: 8px; font-size: 12px; background: #fff; padding: 10px; border-radius: 4px; border: 1px solid #e2e8f0;">
-                    <strong style="color: #6b46c1;">Tailored Resolution Pathways (Sub-Assembly / Intermediate Good):</strong>
-                    <div style="margin-top: 6px; display: grid; gap: 8px;">
-                        <div style="background: #faf5ff; padding: 8px; border-radius: 4px; border-left: 3px solid #805ad5;">
-                            <div><strong>Option 1: Build Sub-Assembly</strong> - Spawn a child Work Order for {shortfall:.2f} units of {comp.name} and open it to review.</div>
-                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&shortfall_qty={shortfall}&resolution_action=intermediate_build"
-                               style="display: inline-block; margin-top: 6px; background: #7c3aed; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
-                                Execute Option 1: Build &amp; Open Sub-Assembly Work Order
-                            </a>
-                        </div>
-                        <div style="background: #ebf8ff; padding: 8px; border-radius: 4px; border-left: 3px solid #3182ce;">
-                            <div><strong>Option 2: Hold for Active Run</strong> - Link parent order to active shop floor runs (Active Run Qty: {item['active_run_qty']:.2f}).</div>
-                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&resolution_action=intermediate_hold_active"
-                               style="display: inline-block; margin-top: 6px; background: #2563eb; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
-                                Execute Option 2: Hold for Active Run
-                            </a>
-                        </div>
-                        <div style="background: #f0fff4; padding: 8px; border-radius: 4px; border-left: 3px solid #38a169;">
-                            <div><strong>Option 3: Partial Batch Run</strong> - Down-scale parent batch target size to match available stock ({max_prod:.2f} units).</div>
-                            <a href="/mrp_resolve_action/?production_order_id={obj.pk}&component_id={comp.pk}&max_producible={max_prod}&resolution_action=intermediate_partial_batch"
-                               style="display: inline-block; margin-top: 6px; background: #059669; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 4px; font-weight: 600; font-size: 11px;">
-                                Execute Option 3: Scale Batch to {max_prod:.2f} Units
-                            </a>
-                        </div>
+            elif status == 'PO_DRAFTED':
+                po_info = "-"
+                if item.linked_purchase_order:
+                    po = item.linked_purchase_order
+                    po_url = reverse('admin:core_purchaseorder_change', args=[po.pk])
+                    po_info = f'<a href="{po_url}" style="color: #2563eb; text-decoration: underline; font-weight: 600;">{po.po_number or f"PO #{po.pk}"}</a>'
+                card = f"""
+                <div style="padding: 12px 14px; background: #eff6ff; border: 1px solid #bfdbfe; border-left: 4px solid #3b82f6; border-radius: 6px; color: #1e40af; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #1d4ed8;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #dbeafe; color: #1e40af; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Purchase Order Drafted</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #1d4ed8;">
+                        <strong>Shortfall:</strong> -{item.shortage_quantity:.2f} {comp.unit_of_measurement or 'units'} | <strong>Purchase Order:</strong> {po_info}
+                    </div>
+                    <div style="font-size: 11px; margin-top: 4px; color: #3b82f6;">
+                        {item.resolution_notes or 'Awaiting supplier delivery and physical warehouse receipt.'}
                     </div>
                 </div>
                 """
+            elif status == 'CHILD_WO_CREATED':
+                card = f"""
+                <div style="padding: 12px 14px; background: #faf5ff; border: 1px solid #e9d5ff; border-left: 4px solid #a855f7; border-radius: 6px; color: #6b21a8; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #7e22ce;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #f3e8ff; color: #6b21a8; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Sub-Assembly Work Order Spawned</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #7e22ce;">
+                        <strong>Shortfall:</strong> -{item.shortage_quantity:.2f} {comp.unit_of_measurement or 'units'}
+                    </div>
+                    <div style="font-size: 11px; margin-top: 4px; color: #a855f7;">
+                        {item.resolution_notes or 'Sub-assembly work order created.'}
+                    </div>
+                </div>
+                """
+            elif status == 'HOLD_ACTIVE_RUN':
+                card = f"""
+                <div style="padding: 12px 14px; background: #ecfeff; border: 1px solid #a5f3fc; border-left: 4px solid #06b6d4; border-radius: 6px; color: #0e7490; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #0891b2;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #cffafe; color: #0e7490; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Held for Active Floor Run</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #0891b2;">
+                        <strong>Status:</strong> Awaiting completion of shop floor run
+                    </div>
+                    <div style="font-size: 11px; margin-top: 4px; color: #06b6d4;">
+                        {item.resolution_notes or 'Holding for in-progress mixing/sub-assembly run.'}
+                    </div>
+                </div>
+                """
+            elif status == 'OVERRIDDEN':
+                user_info = item.resolved_by.username if item.resolved_by else 'Supervisor'
+                card = f"""
+                <div style="padding: 12px 14px; background: #f0f9ff; border: 1px solid #bae6fd; border-left: 4px solid #0284c7; border-radius: 6px; color: #075985; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #0369a1;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #e0f2fe; color: #0369a1; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Authorized Override</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #0284c7;">
+                        <strong>Shortage:</strong> -{item.shortage_quantity:.2f} {comp.unit_of_measurement or 'units'} | <strong>Authorized By:</strong> {user_info}
+                    </div>
+                    <div style="font-size: 11px; margin-top: 4px; color: #0284c7;">
+                        {item.resolution_notes or 'Authorized to proceed with production despite stock deficit.'}
+                    </div>
+                </div>
+                """
+            elif status == 'DOWNSCALED':
+                card = f"""
+                <div style="padding: 12px 14px; background: #fffbeb; border: 1px solid #fde68a; border-left: 4px solid #d97706; border-radius: 6px; color: #92400e; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #b45309;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #fef3c7; color: #92400e; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Downscaled Batch Target</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #b45309;">
+                        {item.resolution_notes or 'Batch production target downscaled to match currently available inventory.'}
+                    </div>
+                </div>
+                """
+            elif status == 'RESOLVED':
+                card = f"""
+                <div style="padding: 12px 14px; background: #ecfdf5; border: 1px solid #a7f3d0; border-left: 4px solid #10b981; border-radius: 6px; color: #065f46; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="font-size: 13px; color: #047857;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #d1fae5; color: #065f46; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Resolved</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #047857;">
+                        {item.resolution_notes or 'Shortage resolved.'}
+                    </div>
+                </div>
+                """
+            else:  # UNRESOLVED
+                btn_style = "color: #ffffff !important; text-decoration: none; padding: 6px 12px; border-radius: 4px; font-weight: 600; font-size: 11px; display: inline-flex; align-items: center;"
+                action_btns = []
 
-            card = f"""
-            <div style="margin-bottom: 12px; padding: 12px; background: #fff5f5; border-left: 4px solid #e53e3e; border-radius: 4px; color: #2d3748;">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <strong style="color: #c53030; font-size: 14px;">Shortage: {comp.name} [{p_type}]</strong>
-                    <span style="font-size: 12px; background: #feb2b2; color: #9b2c2c; padding: 2px 8px; border-radius: 10px; font-weight: bold;">Shortfall: -{shortfall:.2f}</span>
+                downscale_url = reverse('admin:core_productionorder_resolve_downscale', args=[obj.pk, item.pk])
+                override_url = reverse('admin:core_productionorder_resolve_override', args=[obj.pk, item.pk])
+
+                if not is_intermediate:
+                    # RAW material options
+                    draft_po_url = reverse('admin:core_productionorder_resolve_po', args=[obj.pk, item.pk])
+                    action_btns.append(
+                        f'<a href="{draft_po_url}" style="{btn_style} background: #2563eb;">Draft Purchase Order</a>'
+                    )
+                    # Check inbound PO existence
+                    inbound_pos = PurchaseOrder.objects.filter(
+                        items__product=comp,
+                        status__in=['SENT', 'PARTIAL', 'DRAFT']
+                    ).distinct()
+                    if inbound_pos.exists():
+                        inbound_url = reverse('admin:core_productionorder_resolve_inbound', args=[obj.pk, item.pk])
+                        action_btns.append(
+                            f'<a href="{inbound_url}" style="{btn_style} background: #475569;">Hold Inbound Purchase Order</a>'
+                        )
+                    action_btns.append(
+                        f'<a href="{downscale_url}" style="{btn_style} background: #d97706;">Downscale Production Batch</a>'
+                    )
+                    action_btns.append(
+                        f'<a href="{override_url}" style="{btn_style} background: #4b5563;">Authorize Supervisor Override</a>'
+                    )
+                else:
+                    # INTERMEDIATE material options
+                    child_wo_url = reverse('admin:core_productionorder_resolve_build_child', args=[obj.pk, item.pk])
+                    action_btns.append(
+                        f'<a href="{child_wo_url}" style="{btn_style} background: #7c3aed;">Trigger Child Work Order</a>'
+                    )
+                    # Check active runs
+                    active_runs = ProductionOrder.objects.filter(
+                        product=comp,
+                        status='IN_PROGRESS'
+                    ).exclude(pk=obj.pk)
+                    if active_runs.exists():
+                        hold_active_url = reverse('admin:core_productionorder_resolve_hold_active', args=[obj.pk, item.pk])
+                        action_btns.append(
+                            f'<a href="{hold_active_url}" style="{btn_style} background: #0891b2;">Hold for Active Production Run</a>'
+                        )
+                    action_btns.append(
+                        f'<a href="{downscale_url}" style="{btn_style} background: #d97706;">Downscale Production Batch</a>'
+                    )
+                    action_btns.append(
+                        f'<a href="{override_url}" style="{btn_style} background: #4b5563;">Authorize Supervisor Override</a>'
+                    )
+
+                card = f"""
+                <div style="padding: 14px; background: #fff5f5; border: 1px solid #fecaca; border-left: 4px solid #ef4444; border-radius: 6px; color: #1f2937; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong style="color: #dc2626; font-size: 13px;">{comp.name} [{p_type}]</strong>
+                        <span style="font-size: 11px; background: #fee2e2; color: #dc2626; padding: 2px 8px; border-radius: 10px; font-weight: 700;">Deficit: -{item.shortage_quantity:.2f} {comp.unit_of_measurement or 'units'}</span>
+                    </div>
+                    <div style="font-size: 12px; margin-top: 6px; color: #4b5563;">
+                        <strong>Planned Required:</strong> {item.planned_quantity:.2f} {comp.unit_of_measurement or 'units'}
+                    </div>
+                    <div style="margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap;">
+                        {"".join(action_btns)}
+                    </div>
                 </div>
-                <div style="font-size: 12px; margin-top: 4px; color: #4a5568;">
-                    <strong>Required:</strong> {req:.2f} | <strong>Available:</strong> {avail:.2f}
-                </div>
-                {options_html}
-            </div>
-            """
+                """
             cards_html.append(card)
 
-        return mark_safe("".join(cards_html))
+        grid_html = f'<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; margin-top: 8px;">{"".join(cards_html)}</div>'
+        return mark_safe(header_banner + grid_html)
 
     def work_order_details_viewer(self, obj):
         if not obj or not obj.work_order_id:

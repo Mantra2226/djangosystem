@@ -198,7 +198,7 @@ UNFOLD = {
                         "link": reverse_lazy("admin:core_inventory_changelist"),
                     },
                     {
-                        "title": "Raw Chemicals Stock",
+                        "title": "Raw Material Stock",
                         "icon": "science",
                         "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=RAW_CHEMICALS",
                     },
@@ -208,7 +208,7 @@ UNFOLD = {
                         "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=PACKAGING",
                     },
                     {
-                        "title": "WIP Bulk Base Putty",
+                        "title": "Intermediates Stock",
                         "icon": "hourglass_top",
                         "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=INTERMEDIATE",
                     },

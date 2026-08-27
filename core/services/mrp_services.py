@@ -10,7 +10,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from core.models import (
-    Product, BillOfMaterial, BOMItem, Inventory, ProductionOrder, 
+    Product, BillOfMaterial, BOMItem, Inventory, ProductionOrder, ProductionOrderItem,
     WorkOrder, PurchaseOrder, PurchaseOrderItem, ProcurementOrder
 )
 
@@ -64,12 +64,9 @@ def evaluate_mrp_shortages(production_order):
     """
     Evaluates material line requirements for a ProductionOrder or WorkOrder.
     Returns a list of shortage analysis dicts per component line.
-    Skips recalculation if MRP resolution is locked or production run is active/completed.
+    Inspects ProductionOrderItem.resolution_status to preserve saved resolutions.
     """
     if not production_order or not getattr(production_order, 'work_order', None):
-        return []
-
-    if getattr(production_order, 'is_mrp_resolved', False):
         return []
 
     work_order = production_order.work_order
@@ -83,10 +80,16 @@ def evaluate_mrp_shortages(production_order):
     target_qty = getattr(production_order, 'quantity', Decimal('0.00')) or Decimal('0.00')
     shortage_report = []
 
+    # Map existing ProductionOrderItem records by raw_material_id
+    saved_items = {
+        item.raw_material_id: item
+        for item in production_order.items.select_related('raw_material', 'linked_purchase_order').all()
+    } if production_order.pk else {}
+
     for item in bom.items.select_related('component'):
         component = item.component
         item_req = item.quantity_required or Decimal('0.00')
-        total_needed = item_req * target_qty
+        total_needed = (item_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         total_available = Inventory.objects.filter(
             product=component
@@ -95,6 +98,17 @@ def evaluate_mrp_shortages(production_order):
         )['total'] or Decimal('0.00')
 
         shortfall = max(Decimal('0.00'), total_needed - total_available)
+
+        saved_item = saved_items.get(component.pk)
+        is_resolved = False
+        resolution_status = 'UNRESOLVED'
+        linked_po = None
+
+        if saved_item:
+            resolution_status = saved_item.resolution_status
+            linked_po = saved_item.linked_purchase_order
+            if resolution_status in ['PO_DRAFTED', 'OVERRIDDEN', 'DOWNSCALED', 'RESOLVED', 'NO_SHORTAGE']:
+                is_resolved = True
 
         # Check for open inbound PurchaseOrders for Raw Materials
         inbound_po_qty = Decimal('0.00')
@@ -121,7 +135,10 @@ def evaluate_mrp_shortages(production_order):
             'available_qty': total_available,
             'shortfall_qty': shortfall,
             'product_type': component.product_type,
-            'has_shortage': shortfall > Decimal('0.00'),
+            'has_shortage': shortfall > Decimal('0.00') and not is_resolved,
+            'is_resolved': is_resolved,
+            'resolution_status': resolution_status,
+            'linked_po': linked_po,
             'inbound_po_qty': inbound_po_qty,
             'active_run_qty': active_run_qty,
             'max_producible': max_producible,
@@ -132,13 +149,14 @@ def evaluate_mrp_shortages(production_order):
 
 
 # =========================================================================
-# RESOLUTION PATHWAY HANDLERS FOR RAW MATERIALS (3 OPTIONS)
+# RESOLUTION PATHWAY HANDLERS FOR RAW MATERIALS
 # =========================================================================
 
 def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
     """
     OPTION 1: Auto-Draft PO
     Looks up Product.supplier and appends shortfall to an open PurchaseOrder (or creates a new draft).
+    Updates the corresponding ProductionOrderItem with PO_DRAFTED.
     """
     component = Product.objects.get(pk=component_id)
     if not component.supplier:
@@ -177,6 +195,17 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
             po.save(update_fields=['status'])
 
         if production_order and production_order.pk:
+            order_item, _ = ProductionOrderItem.objects.get_or_create(
+                production_order=production_order,
+                raw_material=component,
+                defaults={
+                    'planned_quantity': shortfall,
+                    'shortage_quantity': shortfall,
+                    'resolution_status': 'UNRESOLVED'
+                }
+            )
+            order_item.resolve_with_po(purchase_order=po)
+
             note_msg = f"[MRP RESOLVED] Appended {shortfall} units of {component.name} to Draft PO #{po.po_number}."
             production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
             production_order.save(update_fields=['notes'])
@@ -185,9 +214,54 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
     return po
 
 
+def resolve_raw_hold_inbound(production_order, component_id, inbound_po=None):
+    """
+    OPTION 2: Hold for Inbound Stock
+    Binds the shortage item to an open incoming Purchase Order already in transit / drafted.
+    """
+    component = Product.objects.get(pk=component_id)
+    
+    if isinstance(inbound_po, (int, str)):
+        inbound_po = PurchaseOrder.objects.filter(pk=inbound_po).first()
+
+    if not inbound_po:
+        inbound_po = PurchaseOrder.objects.filter(
+            items__product=component,
+            status__in=['SENT', 'PARTIAL', 'DRAFT']
+        ).first()
+
+    if not inbound_po:
+        raise ValidationError(
+            f"No active inbound Purchase Orders (Sent, Partial, Draft) found for '{component.name}'. "
+            f"Please draft a new Purchase Order instead."
+        )
+
+    with transaction.atomic():
+        order_item, _ = ProductionOrderItem.objects.get_or_create(
+            production_order=production_order,
+            raw_material=component,
+            defaults={
+                'planned_quantity': Decimal('0.00'),
+                'shortage_quantity': Decimal('0.00'),
+                'resolution_status': 'UNRESOLVED'
+            }
+        )
+
+        order_item.resolve_with_po(
+            purchase_order=inbound_po,
+            notes=f"Holding for inbound delivery on PO #{inbound_po.po_number or inbound_po.pk}."
+        )
+        msg = f"[MRP HELD] Awaiting inbound stock for {component.name} from PO #{inbound_po.po_number or inbound_po.pk}."
+
+        production_order.notes = f"{production_order.notes or ''}\n{msg}".strip()
+        production_order.save(update_fields=['notes'])
+
+    return production_order
+
+
 def resolve_raw_direct_procurement(production_order, component_id, shortfall_qty):
     """
-    OPTION 2: Direct Procurement
+    OPTION 3: Direct Fast-Track Procurement
     Spawns a ProcurementOrder set to PENDING for fast-tracking delivery.
     """
     component = Product.objects.get(pk=component_id)
@@ -203,6 +277,21 @@ def resolve_raw_direct_procurement(production_order, component_id, shortfall_qty
         )
 
         if production_order and production_order.pk:
+            order_item, _ = ProductionOrderItem.objects.get_or_create(
+                production_order=production_order,
+                raw_material=component,
+                defaults={
+                    'planned_quantity': shortfall,
+                    'shortage_quantity': shortfall,
+                    'resolution_status': 'UNRESOLVED'
+                }
+            )
+            order_item.resolution_status = 'RESOLVED'
+            order_item.resolution_notes = f"Fast-Track Procurement Order #{procurement.procurement_order_id} ({shortfall} units)."
+            order_item.resolved_at = timezone.now()
+            order_item.save()
+            production_order.update_mrp_resolution_state()
+
             note_msg = f"[MRP RESOLVED] Spawned Fast-Track Procurement Order #{procurement.procurement_order_id} ({shortfall} units)."
             production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
             production_order.save(update_fields=['notes'])
@@ -210,36 +299,125 @@ def resolve_raw_direct_procurement(production_order, component_id, shortfall_qty
     return procurement
 
 
-def resolve_raw_hold_inbound(production_order, component_id):
-    """
-    OPTION 3: Hold for Inbound Stock
-    Keeps order ON_HOLD_SHORTAGE to consume stock from an existing open PO already in transit.
-    """
-    component = Product.objects.get(pk=component_id)
-    open_pos = PurchaseOrder.objects.filter(
-        items__product=component,
-        status__in=['SENT', 'PARTIAL']
-    ).distinct()
+# =========================================================================
+# UNIVERSAL BATCH DOWNSCALE & SUPERVISOR OVERRIDE
+# =========================================================================
 
-    po_numbers = [po.po_number for po in open_pos]
-    msg = f"[MRP HELD] Awaiting inbound stock for {component.name} from open POs: {', '.join(po_numbers) if po_numbers else 'None in transit'}."
+def resolve_batch_downscale(production_order, bottleneck_component_id):
+    """
+    Calculates maximum producible yield based on available stock of the bottleneck component,
+    scales down work_order target quantity and production_order.quantity, recalculates all
+    ProductionOrderItem.planned_quantity rows, and marks the bottleneck item as DOWNSCALED.
+    """
+    from decimal import ROUND_HALF_UP
+    component = Product.objects.get(pk=bottleneck_component_id)
+    avail = Inventory.objects.filter(product=component).aggregate(
+        total=Sum('quantity_available')
+    )['total'] or Decimal('0.00')
+
+    bom = None
+    if production_order.work_order and production_order.work_order.bill_of_material:
+        bom = production_order.work_order.bill_of_material
+    elif production_order.product:
+        bom = production_order.product.boms.filter(is_active=True).first()
+
+    req_per_unit = Decimal('1.00')
+    if bom:
+        bom_item = bom.items.filter(component=component).first()
+        if bom_item and bom_item.quantity_required and bom_item.quantity_required > Decimal('0.00'):
+            req_per_unit = bom_item.quantity_required
+
+    max_producible = (avail / req_per_unit).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    if max_producible <= Decimal('0.00'):
+        raise ValidationError(f"Cannot downscale batch: Available inventory for '{component.name}' is zero.")
 
     with transaction.atomic():
-        production_order.status = 'ON_HOLD_SHORTAGE'
-        production_order.notes = f"{production_order.notes or ''}\n{msg}".strip()
-        production_order.save(update_fields=['status', 'notes'])
+        production_order.quantity = max_producible
+        note_msg = f"[MRP RESOLVED] Down-scaled production batch target to {max_producible} units based on available stock of {component.name}."
+        production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
+        production_order.save(update_fields=['quantity', 'notes'])
+
+        if production_order.work_order_id and getattr(production_order, 'work_order', None):
+            wo = production_order.work_order
+            wo.quantity_produced = max_producible
+            wo.save(update_fields=['quantity_produced'])
+
+        # Recalculate MRP for all components under new batch size
+        production_order.evaluate_mrp()
+
+        # Flag the bottleneck component specifically as DOWNSCALED
+        b_item = ProductionOrderItem.objects.filter(
+            production_order=production_order,
+            raw_material=component
+        ).first()
+        if b_item:
+            b_item.resolution_status = 'DOWNSCALED'
+            b_item.shortage_quantity = Decimal('0.00')
+            b_item.resolution_notes = f"Batch target downscaled to {max_producible} units based on available stock ({avail:.2f} available)."
+            b_item.resolved_at = timezone.now()
+            b_item.save(update_fields=['resolution_status', 'shortage_quantity', 'resolution_notes', 'resolved_at'])
+
+        production_order.update_mrp_resolution_state()
+        production_order.refresh_from_db()
 
     return production_order
 
 
+def resolve_intermediate_partial_batch(production_order, max_producible_qty):
+    """Backwards-compatible alias for partial batch run."""
+    new_qty = Decimal(str(max_producible_qty)).quantize(Decimal('0.01'))
+    if new_qty <= Decimal('0.00'):
+        raise ValidationError("Cannot adjust batch size: Available component inventory is zero.")
+
+    with transaction.atomic():
+        production_order.quantity = new_qty
+        note_msg = f"[MRP RESOLVED] Down-scaled production batch target to {new_qty} units based on available component stock."
+        production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
+        production_order.save(update_fields=['quantity', 'notes'])
+
+        if production_order.work_order_id and getattr(production_order, 'work_order', None):
+            production_order.work_order.quantity_produced = new_qty
+            production_order.work_order.save(update_fields=['quantity_produced'])
+
+        for item in production_order.items.all():
+            if item.resolution_status == 'UNRESOLVED':
+                item.resolution_status = 'DOWNSCALED'
+                item.resolution_notes = f"Downscaled production batch target to {new_qty} units."
+                item.resolved_at = timezone.now()
+                item.save(update_fields=['resolution_status', 'resolution_notes', 'resolved_at'])
+
+        production_order.evaluate_mrp()
+
+    return production_order
+
+
+def resolve_item_override(production_order, component_id, user=None, notes=""):
+    """Authorizes supervisor override for the shortage item."""
+    component = Product.objects.get(pk=component_id)
+    order_item = ProductionOrderItem.objects.filter(
+        production_order=production_order,
+        raw_material=component
+    ).first()
+    if not order_item:
+        order_item = ProductionOrderItem.objects.create(
+            production_order=production_order,
+            raw_material=component,
+            planned_quantity=Decimal('0.00'),
+            shortage_quantity=Decimal('0.00'),
+            resolution_status='UNRESOLVED'
+        )
+    return order_item.resolve_with_override(user=user, notes=notes)
+
+
 # =========================================================================
-# RESOLUTION PATHWAY HANDLERS FOR INTERMEDIATE SUB-ASSEMBLIES (3 OPTIONS)
+# RESOLUTION PATHWAY HANDLERS FOR INTERMEDIATE SUB-ASSEMBLIES
 # =========================================================================
 
 def resolve_intermediate_build(production_order, component_id, shortfall_qty):
     """
     OPTION 1: Build Sub-Assembly
     Spawns a child WorkOrder and ProductionOrder with quantity = shortfall.
+    Sets po_item.resolution_status = 'CHILD_WO_CREATED'.
     """
     component = Product.objects.get(pk=component_id)
     active_bom = component.boms.filter(is_active=True).first()
@@ -253,18 +431,33 @@ def resolve_intermediate_build(production_order, component_id, shortfall_qty):
             bill_of_material=active_bom,
             quantity_produced=shortfall,
             production_start_date=timezone.now().date(),
-            status='IN_PROGRESS'
+            status='PENDING'
         )
 
         child_po = ProductionOrder.objects.create(
             product=component,
             work_order=child_wo,
             quantity=shortfall,
-            status='IN_PROGRESS',
+            status='PENDING',
             notes=f"Auto-generated sub-assembly run for parent Production Order #{production_order.pk}."
         )
 
         if production_order and production_order.pk:
+            order_item, _ = ProductionOrderItem.objects.get_or_create(
+                production_order=production_order,
+                raw_material=component,
+                defaults={
+                    'planned_quantity': shortfall,
+                    'shortage_quantity': shortfall,
+                    'resolution_status': 'UNRESOLVED'
+                }
+            )
+            order_item.resolution_status = 'CHILD_WO_CREATED'
+            order_item.resolution_notes = f"Spawned child Sub-Assembly Run #{child_po.pk} (WO-{child_wo.pk}) for {shortfall} units of {component.name}."
+            order_item.resolved_at = timezone.now()
+            order_item.save(update_fields=['resolution_status', 'resolution_notes', 'resolved_at'])
+            production_order.update_mrp_resolution_state()
+
             note_msg = f"[MRP RESOLVED] Spawned child Sub-Assembly Run #{child_po.pk} (WO-{child_wo.pk}) for {shortfall} units of {component.name}."
             production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
             production_order.save(update_fields=['notes'])
@@ -272,48 +465,50 @@ def resolve_intermediate_build(production_order, component_id, shortfall_qty):
     return child_wo, child_po
 
 
-def resolve_intermediate_hold_active(production_order, component_id):
+def resolve_intermediate_hold_active(production_order, component_id, active_po=None):
     """
     OPTION 2: Hold for Active Run
     Links the parent order to an active intermediate run currently IN_PROGRESS on the floor.
+    Sets po_item.resolution_status = 'HOLD_ACTIVE_RUN'.
     """
     component = Product.objects.get(pk=component_id)
-    active_runs = ProductionOrder.objects.filter(
-        product=component,
-        status='IN_PROGRESS'
-    ).exclude(pk=production_order.pk if production_order else None)
+    if isinstance(active_po, (int, str)):
+        active_po = ProductionOrder.objects.filter(pk=active_po).first()
 
-    run_ids = [f"#{po.pk}" for po in active_runs]
-    msg = f"[MRP HELD] Linked to active shop floor runs for {component.name}: {', '.join(run_ids) if run_ids else 'No active runs'}."
+    if not active_po:
+        active_po = ProductionOrder.objects.filter(
+            product=component,
+            status='IN_PROGRESS'
+        ).exclude(pk=production_order.pk if production_order else None).first()
+
+    if not active_po:
+        raise ValidationError(
+            f"No active shop floor runs (IN_PROGRESS) found for '{component.name}'. "
+            f"Please trigger a Child Work Order instead."
+        )
+
+    run_code = active_po.production_order_code or f"#{active_po.pk}"
+    msg = f"[MRP HELD] Linked to active shop floor run {run_code} for {component.name}."
 
     with transaction.atomic():
-        production_order.status = 'ON_HOLD_SHORTAGE'
+        if production_order and production_order.pk:
+            order_item, _ = ProductionOrderItem.objects.get_or_create(
+                production_order=production_order,
+                raw_material=component,
+                defaults={
+                    'planned_quantity': Decimal('0.00'),
+                    'shortage_quantity': Decimal('0.00'),
+                    'resolution_status': 'UNRESOLVED'
+                }
+            )
+            order_item.resolution_status = 'HOLD_ACTIVE_RUN'
+            order_item.resolution_notes = msg
+            order_item.resolved_at = timezone.now()
+            order_item.save(update_fields=['resolution_status', 'resolution_notes', 'resolved_at'])
+            production_order.update_mrp_resolution_state()
+
         production_order.notes = f"{production_order.notes or ''}\n{msg}".strip()
-        production_order.save(update_fields=['status', 'notes'])
-
-    return production_order
-
-
-def resolve_intermediate_partial_batch(production_order, max_producible_qty):
-    """
-    OPTION 3: Partial Batch Run
-    Adjusts parent production target down to match currently available stock.
-    """
-    new_qty = Decimal(str(max_producible_qty)).quantize(Decimal('0.01'))
-    if new_qty <= Decimal('0.00'):
-        raise ValidationError("Cannot adjust batch size: Available component inventory is zero.")
-
-    with transaction.atomic():
-        production_order.quantity = new_qty
-        production_order.status = 'IN_PROGRESS'
-
-        note_msg = f"[MRP RESOLVED] Down-scaled production batch target to {new_qty} units based on available component stock."
-        production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
-        production_order.save(update_fields=['quantity', 'status', 'notes'])
-
-        if production_order.work_order_id and getattr(production_order, 'work_order', None):
-            production_order.work_order.quantity_produced = new_qty
-            production_order.work_order.save(update_fields=['quantity_produced'])
+        production_order.save(update_fields=['notes'])
 
     return production_order
 
@@ -324,24 +519,41 @@ def resolve_intermediate_partial_batch(production_order, max_producible_qty):
 
 def check_and_auto_resume_on_hold_orders(product=None):
     """
-    Scans all ProductionOrders currently ON_HOLD_SHORTAGE.
-    If inventory for all required BOM material lines is now sufficient, auto-resumes to IN_PROGRESS.
+    Scans ProductionOrders currently in ON_HOLD_SHORTAGE, PARTIALLY_RESOLVED, or AWAITING_PROCUREMENT.
+    Re-evaluates physical inventory against planned quantities for PO_DRAFTED items.
+    If physical unallocated inventory is now sufficient, updates item resolution_status = 'NO_SHORTAGE'.
+    If all items are satisfied, order status automatically transitions to READY_TO_START / MRP_RESOLVED.
     """
-    on_hold_orders = ProductionOrder.objects.filter(status='ON_HOLD_SHORTAGE')
+    target_orders = ProductionOrder.objects.filter(
+        status__in=['ON_HOLD_SHORTAGE', 'PARTIALLY_RESOLVED', 'AWAITING_PROCUREMENT']
+    )
     if product:
-        on_hold_orders = on_hold_orders.filter(work_order__bill_of_material__items__component=product).distinct()
+        target_orders = target_orders.filter(
+            work_order__bill_of_material__items__component=product
+        ).distinct()
 
     resumed_orders = []
-    for po in on_hold_orders:
-        report = evaluate_mrp_shortages(po)
-        has_any_shortage = any(item['has_shortage'] for item in report)
+    for po in target_orders:
+        with transaction.atomic():
+            # Check PO_DRAFTED items for physical goods arrival
+            for item in po.items.filter(resolution_status='PO_DRAFTED'):
+                available_unallocated = Inventory.objects.filter(
+                    product=item.raw_material
+                ).aggregate(total=Sum('quantity_available'))['total'] or Decimal('0.00')
+                if available_unallocated >= item.planned_quantity:
+                    item.resolution_status = 'NO_SHORTAGE'
+                    item.shortage_quantity = Decimal('0.00')
+                    item.save(update_fields=['resolution_status', 'shortage_quantity'])
 
-        if not has_any_shortage and report:
-            with transaction.atomic():
-                po.status = 'IN_PROGRESS'
-                resume_note = f"[MRP AUTO-RESUMED] Stock sufficiency restored. Order auto-resumed to IN_PROGRESS."
+            # Re-evaluate MRP shortages (preserves saved resolutions)
+            po.evaluate_mrp()
+            po.update_mrp_resolution_state()
+            po.refresh_from_db()
+
+            if po.status in ['READY_TO_START', 'MRP_RESOLVED'] and not po.has_unresolved_shortages:
+                resume_note = f"[MRP AUTO-RESUMED] Stock sufficiency verified. Order status transitioned to {po.get_status_display()}."
                 po.notes = f"{po.notes or ''}\n{resume_note}".strip()
-                po.save(update_fields=['status', 'notes'])
+                po.save(update_fields=['notes'])
                 resumed_orders.append(po)
 
     return resumed_orders
