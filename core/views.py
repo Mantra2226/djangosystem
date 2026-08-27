@@ -252,60 +252,104 @@ def po_products_json(request):
 @staff_member_required
 def mrp_resolve_action(request):
     """
-    HTTP POST Handler for executing tailored MRP resolution pathways from Admin/Dashboard.
+    HTTP Handler for executing tailored MRP resolution pathways from Admin/Dashboard.
+    Supports both POST and GET parameters so buttons/links navigate directly to target records.
     """
-    if request.method == 'POST':
-        from django.contrib import messages
-        from django.shortcuts import redirect
-        from .models import ProductionOrder
-        from .services import (
-            resolve_raw_autodraft_po,
-            resolve_raw_direct_procurement,
-            resolve_raw_hold_inbound,
-            resolve_intermediate_build,
-            resolve_intermediate_hold_active,
-            resolve_intermediate_partial_batch
-        )
+    from django.urls import reverse
+    from django.shortcuts import redirect
+    from .models import ProductionOrder, ProcurementOrder
+    from .services import (
+        resolve_raw_autodraft_po,
+        resolve_raw_direct_procurement,
+        resolve_raw_hold_inbound,
+        resolve_intermediate_build,
+        resolve_intermediate_hold_active,
+        resolve_intermediate_partial_batch
+    )
 
-        po_id = request.POST.get('production_order_id')
-        component_id = request.POST.get('component_id')
-        shortfall_qty = request.POST.get('shortfall_qty', '0.00')
-        action = request.POST.get('resolution_action')
-        max_producible = request.POST.get('max_producible', '0.00')
+    params = request.POST if request.method == 'POST' else request.GET
 
-        po = ProductionOrder.objects.filter(pk=po_id).first()
-        if not po:
-            messages.error(request, "Production order not found.")
-            return redirect(request.META.get('HTTP_REFERER', '/admin/'))
+    po_id = params.get('production_order_id')
+    component_id = params.get('component_id')
+    shortfall_qty = params.get('shortfall_qty', '0.00')
+    action = params.get('resolution_action')
+    max_producible = params.get('max_producible', '0.00')
 
-        try:
-            if action == 'raw_autodraft_po':
-                new_po = resolve_raw_autodraft_po(po, component_id, shortfall_qty)
-                messages.success(request, f"Auto-drafted Purchase Order #{new_po.po_number}.")
-            elif action == 'raw_direct_procurement':
-                proc = resolve_raw_direct_procurement(po, component_id, shortfall_qty)
-                messages.success(request, f"Spawned direct Procurement Order #{proc.procurement_order_id}.")
-            elif action == 'raw_hold_inbound':
-                resolve_raw_hold_inbound(po, component_id)
-                messages.info(request, "Order status held for inbound PO stock.")
-            elif action == 'intermediate_build':
-                wo, child_po = resolve_intermediate_build(po, component_id, shortfall_qty)
-                messages.success(request, f"Spawned child Sub-Assembly Work Order #{wo.pk} (Production Run #{child_po.pk}).")
-            elif action == 'intermediate_hold_active':
-                resolve_intermediate_hold_active(po, component_id)
-                messages.info(request, "Linked order to active intermediate shop floor run.")
-            elif action == 'intermediate_partial_batch':
-                resolve_intermediate_partial_batch(po, max_producible)
-                messages.success(request, f"Down-scaled production batch to {max_producible} units.")
+    po = ProductionOrder.objects.filter(pk=po_id).first()
+    if not po:
+        messages.error(request, "Production order not found.")
+        return redirect(request.META.get('HTTP_REFERER', '/admin/'))
+
+    try:
+        if action == 'raw_autodraft_po':
+            new_po = resolve_raw_autodraft_po(po, component_id, shortfall_qty)
+            po.refresh_from_db()
+            messages.success(
+                request,
+                f"Auto-drafted Purchase Order #{new_po.po_number}. "
+                f"Please review details below and click Save to confirm and send to supplier."
+            )
+            return redirect(reverse('admin:core_purchaseorder_change', args=[new_po.pk]))
+
+        elif action == 'raw_direct_procurement':
+            proc = resolve_raw_direct_procurement(po, component_id, shortfall_qty)
+            po.refresh_from_db()
+            messages.success(
+                request,
+                f"Spawned Fast-Track Procurement Order #{proc.procurement_order_id}. "
+                f"Please review and save."
+            )
+            return redirect(reverse('admin:core_procurementorder_change', args=[proc.pk]))
+
+        elif action == 'raw_hold_inbound':
+            inbound_po_id = params.get('inbound_po_id')
+            resolve_raw_hold_inbound(po, component_id, inbound_po=inbound_po_id)
+            po.refresh_from_db()
+            messages.info(request, "Shortage bound to incoming Purchase Order delivery.")
+            return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+        elif action == 'intermediate_build':
+            wo, child_po = resolve_intermediate_build(po, component_id, shortfall_qty)
+            po.refresh_from_db()
+            messages.success(
+                request,
+                f"Spawned Sub-Assembly Work Order #{wo.work_order_code or wo.pk} (Production Run #{child_po.production_order_code or child_po.pk}). "
+                f"Please review specifications and click Start Production."
+            )
+            return redirect(reverse('admin:core_workorder_change', args=[wo.pk]))
+
+        elif action == 'intermediate_hold_active':
+            active_po_id = params.get('active_po_id')
+            resolve_intermediate_hold_active(po, component_id, active_po=active_po_id)
+            po.refresh_from_db()
+            messages.info(request, "Linked order to active intermediate shop floor run.")
+            return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+        elif action in ['batch_downscale', 'intermediate_partial_batch']:
+            if component_id:
+                from .services import resolve_batch_downscale
+                resolve_batch_downscale(po, component_id)
             else:
-                messages.warning(request, "Unknown resolution action.")
-        except Exception as e:
-            messages.error(request, f"MRP Resolution Error: {str(e)}")
+                resolve_intermediate_partial_batch(po, max_producible)
+            po.refresh_from_db()
+            messages.success(request, f"Down-scaled production batch target to {po.quantity} units based on available stock.")
+            return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
-        redirect_url = request.META.get('HTTP_REFERER') or f'/admin/core/productionorder/{po_id}/change/'
-        return redirect(redirect_url)
+        elif action == 'item_override':
+            notes = params.get('notes') or f"Authorized override by {request.user.username}"
+            from .services import resolve_item_override
+            resolve_item_override(po, component_id, user=request.user, notes=notes)
+            po.refresh_from_db()
+            messages.success(request, "Authorized shortage override for component.")
+            return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
-    return redirect('/admin/')
+        else:
+            messages.warning(request, "Unknown resolution action.")
+            return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
+
+    except Exception as e:
+        messages.error(request, f"MRP Resolution Error: {str(e)}")
+        return redirect(reverse('admin:core_productionorder_change', args=[po.pk]))
 
 
 @staff_member_required
@@ -854,52 +898,11 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        total_received = serializer.validated_data['amount']
-        remaining_funds = total_received
-
-        open_invoices = customer.sales_invoices.filter(
-            status__in=['POSTED', 'PARTIALLY_PAID']
-        ).order_by('invoice_date', 'invoice_id')
-
-        allocations = []
-        total_allocated = Decimal('0.00')
-
-        for invoice in open_invoices:
-            already_paid = invoice.total_paid
-            balance_before = invoice.total_amount - already_paid
-            if balance_before <= Decimal('0.00'):
-                continue
-
-            allocated = min(remaining_funds, balance_before) if remaining_funds > Decimal('0.00') else Decimal('0.00')
-            if allocated > Decimal('0.00'):
-                balance_after = max(Decimal('0.00'), balance_before - allocated)
-                projected_status = 'PAID' if balance_after == Decimal('0.00') else 'PARTIALLY_PAID'
-                allocations.append({
-                    'invoice_id': invoice.invoice_id,
-                    'invoice_number': invoice.invoice_number,
-                    'invoice_date': invoice.invoice_date,
-                    'total_amount': invoice.total_amount,
-                    'already_paid': already_paid,
-                    'balance_before': balance_before,
-                    'allocated_amount': allocated,
-                    'balance_after': balance_after,
-                    'projected_status': projected_status,
-                })
-                total_allocated += allocated
-                remaining_funds -= allocated
-
-            if remaining_funds <= Decimal('0.00'):
-                break
-
-        unallocated_amount = max(Decimal('0.00'), total_received - total_allocated)
-        response_data = {
-            'customer_id': customer.customer_id,
-            'customer_name': customer.customer_name,
-            'total_received': total_received,
-            'total_allocated': total_allocated,
-            'unallocated_amount': unallocated_amount,
-            'allocations': allocations,
-        }
+        from .services import preview_customer_bulk_allocation
+        response_data = preview_customer_bulk_allocation(
+            customer=customer,
+            total_received=serializer.validated_data['amount']
+        )
         return Response(BulkPaymentAllocationResponseSerializer(response_data).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='allocate-payment')
@@ -913,74 +916,19 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        total_received = serializer.validated_data['amount']
-        payment_method = serializer.validated_data.get('payment_method', 'BANK_TRANSFER')
-        reference = serializer.validated_data.get('reference', '')
-        remaining_funds = total_received
-
-        method_map = {
-            'BANK_TRANSFER': 'TRANSFER',
-            'CREDIT_CARD': 'CARD',
-            'CARD': 'CARD',
-            'TRANSFER': 'TRANSFER',
-            'CASH': 'CASH',
-            'CHEQUE': 'TRANSFER',
-        }
-        model_method = method_map.get(payment_method.upper(), payment_method)
-
-        allocations = []
-        total_allocated = Decimal('0.00')
-
+        from .services import execute_customer_bulk_allocation
         try:
-            with transaction.atomic():
-                open_invoices = customer.sales_invoices.select_for_update().filter(
-                    status__in=['POSTED', 'PARTIALLY_PAID']
-                ).order_by('invoice_date', 'invoice_id')
-
-                for invoice in open_invoices:
-                    already_paid = invoice.total_paid
-                    balance_before = invoice.total_amount - already_paid
-                    if balance_before <= Decimal('0.00'):
-                        continue
-
-                    allocated = min(remaining_funds, balance_before)
-                    if allocated > Decimal('0.00'):
-                        ref = reference if reference else f"BULK-{invoice.invoice_number}"
-                        SalesInvoicePayments.objects.create(
-                            invoice=invoice,
-                            amount=allocated,
-                            payment_method=model_method,
-                            reference_number=ref
-                        )
-                        invoice.refresh_from_db()
-                        invoice.update_payment_status(save=True)
-                        balance_after = max(Decimal('0.00'), balance_before - allocated)
-                        allocations.append({
-                            'invoice_id': invoice.invoice_id,
-                            'invoice_number': invoice.invoice_number,
-                            'invoice_date': invoice.invoice_date,
-                            'total_amount': invoice.total_amount,
-                            'already_paid': already_paid,
-                            'balance_before': balance_before,
-                            'allocated_amount': allocated,
-                            'balance_after': balance_after,
-                            'projected_status': invoice.status,
-                        })
-                        total_allocated += allocated
-                        remaining_funds -= allocated
-
-                    if remaining_funds <= Decimal('0.00'):
-                        break
-
-            unallocated_amount = max(Decimal('0.00'), total_received - total_allocated)
-            response_data = {
-                'customer_id': customer.customer_id,
-                'customer_name': customer.customer_name,
-                'total_received': total_received,
-                'total_allocated': total_allocated,
-                'unallocated_amount': unallocated_amount,
-                'allocations': allocations,
-            }
+            response_data = execute_customer_bulk_allocation(
+                customer=customer,
+                total_received=serializer.validated_data['amount'],
+                payment_method=serializer.validated_data.get('payment_method', 'BANK_TRANSFER'),
+                reference=serializer.validated_data.get('reference', ''),
+                payment_date=serializer.validated_data.get('payment_date')
+            )
+            # Map final_status to projected_status for serializer schema compatibility
+            for alloc in response_data.get('allocations', []):
+                if 'final_status' in alloc and 'projected_status' not in alloc:
+                    alloc['projected_status'] = alloc['final_status']
             return Response(BulkPaymentAllocationResponseSerializer(response_data).data, status=status.HTTP_200_OK)
         except ValidationError as e:
             error_msg = e.messages if hasattr(e, 'messages') else (e.message_dict if hasattr(e, 'message_dict') else str(e))

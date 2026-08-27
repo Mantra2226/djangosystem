@@ -459,3 +459,180 @@ def generate_credit_note_pdf(credit_note) -> io.BytesIO:
     buffer.seek(0)
     return buffer
 
+
+def generate_finance_entry_pdf(finance_entry) -> io.BytesIO:
+    """
+    Generates an official General Ledger Journal Voucher PDF document in memory.
+
+    Sections:
+    - Document Title ("OFFICIAL GENERAL LEDGER JOURNAL VOUCHER")
+    - Voucher Metadata: Voucher Number, Posting Timestamp, Status / Type Badge
+    - Ledger Details Grid Table: Wrapped cells for Category, Type, Amount (KES), Reference Document, Logged By, and Description
+    - Authorization & Signature Block: Prepared By, Authorised By, Date & Stamp
+
+    Returns:
+        io.BytesIO: In-memory buffer containing PDF binary stream.
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+
+    styles = getSampleStyleSheet()
+
+    # Custom styles
+    title_style = ParagraphStyle(
+        'CompanyTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor('#1E293B'),
+        alignment=TA_LEFT,
+        spaceAfter=4
+    )
+    subtitle_style = ParagraphStyle(
+        'DocSubtitle',
+        parent=styles['Heading2'],
+        fontSize=13,
+        leading=16,
+        textColor=colors.HexColor('#0284C7'),
+        alignment=TA_LEFT,
+        spaceAfter=12
+    )
+    meta_style = ParagraphStyle(
+        'MetaText',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor('#334155')
+    )
+    bold_meta_style = ParagraphStyle(
+        'BoldMetaText',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=13,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor('#0F172A')
+    )
+    grid_label_style = ParagraphStyle(
+        'GridLabel',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=12,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor('#475569')
+    )
+    grid_value_style = ParagraphStyle(
+        'GridValue',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor('#0F172A')
+    )
+    amount_style = ParagraphStyle(
+        'AmountValue',
+        parent=styles['Normal'],
+        fontSize=12,
+        leading=15,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor('#047857') if finance_entry.entry_type == 'REVENUE' else colors.HexColor('#B91C1C')
+    )
+    sign_title_style = ParagraphStyle(
+        'SignTitle',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=11,
+        fontName='Helvetica-Bold',
+        textColor=colors.HexColor('#334155'),
+        alignment=TA_CENTER
+    )
+
+    story = []
+
+    # 1. Document Title
+    story.append(Paragraph("OFFICIAL GENERAL LEDGER JOURNAL VOUCHER", title_style))
+    story.append(Spacer(1, 10))
+
+    # 2. Voucher Top Summary (2 columns)
+    entry_code = finance_entry.entry_code or f"FE-#{finance_entry.pk or 'DRAFT'}"
+    if finance_entry.timestamp:
+        post_time_str = finance_entry.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+    elif finance_entry.entry_date:
+        post_time_str = f"{finance_entry.entry_date} 00:00:00"
+    else:
+        post_time_str = "N/A"
+
+    left_header = [
+        Paragraph(f"<b>Voucher Number:</b> {entry_code}", bold_meta_style),
+        Paragraph(f"<b>Posting Date & Time:</b> {post_time_str}", meta_style),
+    ]
+    right_header = [
+        Paragraph(f"<b>Ledger Category:</b> {finance_entry.get_category_display()}", bold_meta_style),
+        Paragraph(f"<b>Accounting Effect:</b> {finance_entry.get_entry_type_display()}", meta_style),
+    ]
+
+    header_table = Table([[left_header, right_header]], colWidths=[270, 270])
+    header_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(1, 14))
+
+    # 3. Main Detail Grid (Flowable table wrapping description and reference strings)
+    ref_doc = finance_entry.reference_document or (finance_entry.sales_invoice.invoice_number if finance_entry.sales_invoice else 'N/A')
+    logged_by_name = finance_entry.logged_by.username if finance_entry.logged_by else 'System Auto-Post'
+    desc_text = finance_entry.description or 'Standard Ledger Accounting Entry'
+    amount_str = f"KES {finance_entry.amount:,.2f}"
+
+    grid_data = [
+        [Paragraph("Entry Voucher Code", grid_label_style), Paragraph(entry_code, grid_value_style)],
+        [Paragraph("Transaction Type", grid_label_style), Paragraph(finance_entry.get_entry_type_display(), grid_value_style)],
+        [Paragraph("Accounting Category", grid_label_style), Paragraph(finance_entry.get_category_display(), grid_value_style)],
+        [Paragraph("Total Amount", grid_label_style), Paragraph(amount_str, amount_style)],
+        [Paragraph("Reference Document", grid_label_style), Paragraph(ref_doc, grid_value_style)],
+        [Paragraph("Logged By / Poster", grid_label_style), Paragraph(logged_by_name, grid_value_style)],
+        [Paragraph("Audit Notes / Description", grid_label_style), Paragraph(desc_text, grid_value_style)],
+    ]
+
+    detail_table = Table(grid_data, colWidths=[160, 380])
+    detail_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#F8FAFC')),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 7),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    story.append(detail_table)
+    story.append(Spacer(1, 35))
+
+    # 4. Signatures & Verification Block
+    sig_data = [
+        [
+            Paragraph("____________________________<br/><b>Prepared By</b>", sign_title_style),
+            Paragraph("____________________________<br/><b>Authorised By</b>", sign_title_style),
+            Paragraph("____________________________<br/><b>Date & Official Stamp</b>", sign_title_style),
+        ]
+    ]
+    sig_table = Table(sig_data, colWidths=[180, 180, 180])
+    sig_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    story.append(sig_table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+

@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+from django.urls import reverse_lazy, reverse
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -31,6 +32,10 @@ ALLOWED_HOSTS = ['*']
 # Application definition
 
 INSTALLED_APPS = [
+    'unfold',
+    'unfold.contrib.filters',
+    'unfold.contrib.forms',
+    'unfold.contrib.inlines',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -124,7 +129,8 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
-STATIC_FILES_DIRS = [BASE_DIR / "static"]
+STATICFILES_DIRS = [BASE_DIR / "static"]
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -144,4 +150,189 @@ REST_FRAMEWORK = {
         'rest_framework.renderers.JSONRenderer',
         'rest_framework.renderers.BrowsableAPIRenderer',
     ],
+}
+
+# Django Unfold Enterprise Admin Configuration
+UNFOLD = {
+    "SITE_TITLE": "Manufacturing Command Center",
+    "SITE_HEADER": "Manufacturing Command Center",
+    "SITE_SUBHEADER": "Operations & Commercial Billing",
+    "DASHBOARD_CALLBACK": "core.dashboard.dashboard_callback",
+    "SIDEBAR": {
+        "show_search": True,
+        "show_all_applications": False,
+        "navigation": [
+            {
+                "title": "Manufacturing & Shop-Floor",
+                "icon": "precision_manufacturing",
+                "items": [
+                    {
+                        "title": "Work Orders",
+                        "icon": "assignment",
+                        "link": reverse_lazy("admin:core_workorder_changelist"),
+                    },
+                    {
+                        "title": "Production Orders",
+                        "icon": "fact_check",
+                        "link": reverse_lazy("admin:core_productionorder_changelist"),
+                    },
+                    {
+                        "title": "Bills of Material (BOM)",
+                        "icon": "schema",
+                        "link": reverse_lazy("admin:core_billofmaterial_changelist"),
+                    },
+                    {
+                        "title": "Material Variances",
+                        "icon": "analytics",
+                        "link": reverse_lazy("admin:core_materialvariancerecord_changelist"),
+                    },
+                ],
+            },
+            {
+                "title": "Warehouse & Inventory",
+                "icon": "warehouse",
+                "items": [
+                    {
+                        "title": "All Warehouse Stock",
+                        "icon": "inventory_2",
+                        "link": reverse_lazy("admin:core_inventory_changelist"),
+                    },
+                    {
+                        "title": "Raw Material Stock",
+                        "icon": "science",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=RAW_CHEMICALS",
+                    },
+                    {
+                        "title": "Packaging Stock",
+                        "icon": "inventory",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=PACKAGING",
+                    },
+                    {
+                        "title": "Intermediates Stock",
+                        "icon": "hourglass_top",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=INTERMEDIATE",
+                    },
+                    {
+                        "title": "Finished Goods Stock",
+                        "icon": "verified",
+                        "link": lambda request: f"{reverse('admin:core_inventory_changelist')}?product_type=FINISHED",
+                    },
+                    {
+                        "title": "Products Catalog",
+                        "icon": "category",
+                        "link": reverse_lazy("admin:core_product_changelist"),
+                    },
+                    {
+                        "title": "Stock Transactions",
+                        "icon": "swap_horiz",
+                        "link": reverse_lazy("admin:core_stocktransaction_changelist"),
+                    },
+                    {
+                        "title": "Dispatch Records",
+                        "icon": "local_shipping",
+                        "link": reverse_lazy("admin:core_dispatchrecord_changelist"),
+                    },
+                    {
+                        "title": "RMA Returns",
+                        "icon": "assignment_return",
+                        "link": reverse_lazy("admin:core_return_changelist"),
+                    },
+                ],
+            },
+            {
+                "title": "Sales & Commercial Billing",
+                "icon": "receipt_long",
+                "items": [
+                    {
+                        "title": "Sales Orders",
+                        "icon": "shopping_cart",
+                        "link": reverse_lazy("admin:core_salesorder_changelist"),
+                    },
+                    {
+                        "title": "Sales Invoices",
+                        "icon": "receipt",
+                        "link": reverse_lazy("admin:core_salesinvoice_changelist"),
+                    },
+                    {
+                        "title": "Credit Notes",
+                        "icon": "credit_card",
+                        "link": reverse_lazy("admin:core_creditnote_changelist"),
+                    },
+                    {
+                        "title": "Customers",
+                        "icon": "business",
+                        "link": reverse_lazy("admin:core_customer_changelist"),
+                    },
+                    {
+                        "title": "Document Sequences",
+                        "icon": "pin",
+                        "link": reverse_lazy("admin:core_documentsequence_changelist"),
+                    },
+                ],
+            },
+            {
+                "title": "Procurement & Vendors",
+                "icon": "local_shipping",
+                "items": [
+                    {
+                        "title": "Purchase Orders",
+                        "icon": "shopping_bag",
+                        "link": reverse_lazy("admin:core_purchaseorder_changelist"),
+                    },
+                    {
+                        "title": "Procurement Runs",
+                        "icon": "outbox",
+                        "link": reverse_lazy("admin:core_procurementorder_changelist"),
+                    },
+                    {
+                        "title": "Purchase Invoices",
+                        "icon": "payments",
+                        "link": reverse_lazy("admin:core_purchaseinvoice_changelist"),
+                    },
+                    {
+                        "title": "Suppliers",
+                        "icon": "store",
+                        "link": reverse_lazy("admin:core_supplier_changelist"),
+                    },
+                ],
+            },
+            {
+                "title": "HR & Identity Access",
+                "icon": "groups",
+                "items": [
+                    {
+                        "title": "Employees",
+                        "icon": "badge",
+                        "link": reverse_lazy("admin:core_employee_changelist"),
+                    },
+                    {
+                        "title": "Users",
+                        "icon": "person",
+                        "link": reverse_lazy("admin:auth_user_changelist"),
+                    },
+                    {
+                        "title": "Roles & Groups",
+                        "icon": "security",
+                        "link": reverse_lazy("admin:auth_group_changelist"),
+                    },
+                ],
+            },
+            {
+                "title": "Finance & Analytics",
+                "icon": "account_balance",
+                "items": [
+                    {
+                        "title": "Finance Entries (GL)",
+                        "icon": "account_balance_wallet",
+                        "link": reverse_lazy("admin:core_financeentry_changelist"),
+                    },
+                    {
+                        "title": "Reports Dashboard",
+                        "icon": "monitoring",
+                        "link": reverse_lazy("admin_reports_dashboard"),
+                    },
+                ],
+            },
+        ],
+    },
 }

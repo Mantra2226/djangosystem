@@ -5,31 +5,31 @@
     {% if original.pk and original.status == 'DRAFT' %}
         <li>
             <a href="{% url 'admin:workorder-start-production' original.pk %}" class="button" style="background:#28a745; color:white !important; font-weight:bold; padding: 6px 14px; border-radius: 4px; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                ▶ Start Production
+                Start Production
             </a>
         </li>
     {% endif %}
     {% if original.pk and original.status == 'AWAITING_RESOLUTION' %}
         <li>
             <a href="{% url 'admin:workorder-resolve-shortage' original.pk 'TOP_UP_BULK' %}" class="viewsitelink" style="background-color: #2b6cb0; color: #ffffff !important; font-weight: bold; padding: 6px 12px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; text-decoration: none;">
-                🔄 Top-Up Bulk
+                Top-Up Bulk
             </a>
         </li>
         <li>
             <a href="{% url 'admin:workorder-resolve-shortage' original.pk 'DOWNSCALE_TARGET' %}" class="viewsitelink" style="background-color: #dd6b20; color: #ffffff !important; font-weight: bold; padding: 6px 12px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; text-decoration: none;">
-                📉 Downscale Target
+                Downscale Target
             </a>
         </li>
         <li>
             <a href="{% url 'admin:workorder-resolve-shortage' original.pk 'HOLD_FOR_EXISTING' %}" class="viewsitelink" style="background-color: #4a5568; color: #ffffff !important; font-weight: bold; padding: 6px 12px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; text-decoration: none;">
-                ⏸ Hold for Existing
+                Hold for Existing
             </a>
         </li>
     {% endif %}
     {% if original.pk and original.status == 'ON_HOLD_SHORTAGE' %}
         <li>
             <a href="{% url 'admin:workorder-check-stock-resume' original.pk %}" class="viewsitelink" style="background-color: #319795; color: #ffffff !important; font-weight: bold; padding: 6px 14px; border-radius: 4px; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                ▶ Re-Check Stock & Start
+                Re-Check Stock & Start
             </a>
         </li>
     {% endif %}
@@ -44,9 +44,8 @@
         <!-- Header Banner -->
         <div style="background: linear-gradient(135deg, #dd6b20 0%, #c05621 100%); color: #ffffff; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
             <div style="display: flex; align-items: center; gap: 10px;">
-                <span style="font-size: 24px;">⚠️</span>
                 <div>
-                    <h3 style="margin: 0; font-size: 16px; font-weight: bold; color: #ffffff;">⚠️ Intermediate Component Shortage Detected</h3>
+                    <h3 style="margin: 0; font-size: 16px; font-weight: bold; color: #ffffff;">[SHORTAGE] Intermediate Component Shortage Detected</h3>
                     <p style="margin: 2px 0 0 0; font-size: 13px; color: #feebc8;">Insufficient Bulk Putty Base in inventory to fulfill this packaging run. Select a resolution pathway below:</p>
                 </div>
             </div>
@@ -88,7 +87,7 @@
             </div>
 
             <h4 style="margin: 0 0 14px 0; font-size: 14px; color: #2d3748; font-weight: bold; display: flex; align-items: center; gap: 6px;">
-                <span>🎯 Select Shortage Resolution Pathway:</span>
+                <span>Select Shortage Resolution Pathway:</span>
             </h4>
 
             <!-- 3 Resolution Strategy Action Cards / Buttons -->
@@ -98,8 +97,8 @@
                 <div style="background: #ffffff; border-radius: 8px; border: 1px solid #bee3f8; box-shadow: 0 2px 4px rgba(0,0,0,0.04); display: flex; flex-direction: column; justify-content: space-between; overflow: hidden;">
                     <div style="padding: 16px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 13px; font-weight: bold; color: #2b6cb0; display: flex; align-items: center; gap: 6px;">
-                                <span>🔄</span> 1. Build Sub-Assembly (Top-Up)
+                            <span style="font-size: 13px; font-weight: bold; color: #2b6cb0;">
+                                1. Build Sub-Assembly (Top-Up)
                             </span>
                             <span style="background: #ebf8ff; color: #2b6cb0; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; border: 1px solid #bee3f8;">RECOMMENDED</span>
                         </div>
@@ -109,7 +108,7 @@
                     </div>
                     <div style="padding: 12px 16px; background: #f7fafc; border-top: 1px solid #edf2f7; display: flex; gap: 8px;">
                         <a href="{% url 'admin:workorder-resolve-shortage' original.pk 'TOP_UP_BULK' %}" style="width: 100%; background: #2b6cb0; color: #ffffff !important; border: none; padding: 10px 14px; border-radius: 4px; font-weight: bold; font-size: 12px; text-decoration: none; text-align: center; display: inline-flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-                            🔄 Build Sub-Assembly (Top-Up)
+                            Build Sub-Assembly (Top-Up)
                         </a>
                     </div>
                 </div>
@@ -118,8 +117,8 @@
                 <div style="background: #ffffff; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 2px 4px rgba(0,0,0,0.04); display: flex; flex-direction: column; justify-content: space-between; overflow: hidden;">
                     <div style="padding: 16px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 13px; font-weight: bold; color: #4a5568; display: flex; align-items: center; gap: 6px;">
-                                <span>⏸</span> 2. Hold for Active Bulk Run
+                            <span style="font-size: 13px; font-weight: bold; color: #4a5568;">
+                                2. Hold for Active Bulk Run
                             </span>
                             <span style="background: #edf2f7; color: #4a5568; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; border: 1px solid #e2e8f0;">SHOP FLOOR SYNC</span>
                         </div>
@@ -143,7 +142,7 @@
                                 </div>
                             {% endif %}
                             <button type="submit" style="width: 100%; background: #4a5568; color: #ffffff; border: none; padding: 10px 14px; border-radius: 4px; font-weight: bold; font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-                                ⏸ Hold for Active Bulk Run
+                                Hold for Active Bulk Run
                             </button>
                         </form>
                     </div>
@@ -153,8 +152,8 @@
                 <div style="background: #ffffff; border-radius: 8px; border: 1px solid #feebc8; box-shadow: 0 2px 4px rgba(0,0,0,0.04); display: flex; flex-direction: column; justify-content: space-between; overflow: hidden;">
                     <div style="padding: 16px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 13px; font-weight: bold; color: #c05621; display: flex; align-items: center; gap: 6px;">
-                                <span>📉</span> 3. Downscale Batch to Available Stock
+                            <span style="font-size: 13px; font-weight: bold; color: #c05621;">
+                                3. Downscale Batch to Available Stock
                             </span>
                             <span style="background: #fffaf0; color: #c05621; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; border: 1px solid #feebc8;">RUN IMMEDIATELY</span>
                         </div>
@@ -164,7 +163,7 @@
                     </div>
                     <div style="padding: 12px 16px; background: #f7fafc; border-top: 1px solid #edf2f7; display: flex; gap: 8px;">
                         <a href="{% url 'admin:workorder-resolve-shortage' original.pk 'DOWNSCALE_TARGET' %}" style="width: 100%; background: #dd6b20; color: #ffffff !important; border: none; padding: 10px 14px; border-radius: 4px; font-weight: bold; font-size: 12px; text-decoration: none; text-align: center; display: inline-flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-                            📉 Downscale Batch to Available Stock
+                            Downscale Batch to Available Stock
                         </a>
                     </div>
                 </div>
@@ -178,14 +177,13 @@
     <div style="margin-bottom: 24px; border-radius: 8px; border: 1px solid #feebc8; background: #fffaf0; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.08); overflow: hidden;">
         <div style="background: linear-gradient(135deg, #dd6b20 0%, #c05621 100%); color: #ffffff; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
             <div style="display: flex; align-items: center; gap: 10px;">
-                <span style="font-size: 22px;">⏸</span>
                 <div>
                     <h3 style="margin: 0; font-size: 16px; font-weight: bold; color: #ffffff;">Order Status: ON HOLD (Awaiting Bulk Material)</h3>
                     <p style="margin: 2px 0 0 0; font-size: 13px; color: #feebc8;">This Packaging Work Order is currently suspended until intermediate bulk stock is available.</p>
                 </div>
             </div>
             <a href="{% url 'admin:workorder-check-stock-resume' original.pk %}" style="background: #ffffff; color: #c05621 !important; font-weight: bold; padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 12px; display: inline-flex; align-items: center; gap: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                ▶ Re-Check Stock & Start
+                Re-Check Stock & Start
             </a>
         </div>
         <div style="padding: 16px 20px; font-size: 13px; color: #4a5568;">
@@ -198,7 +196,7 @@
                         <span style="margin-left: 8px; color: #718096; font-size: 12px;">({{ original.parent_work_order.product.name }} — {{ original.parent_work_order.quantity_produced }} units)</span>
                     </div>
                     <a href="{% url 'admin:core_workorder_change' original.parent_work_order.pk %}" style="color: #2b6cb0; font-weight: bold; text-decoration: none; font-size: 12px;">
-                        Open Bulk Order ➔
+                        Open Bulk Order ->
                     </a>
                 </div>
             {% else %}

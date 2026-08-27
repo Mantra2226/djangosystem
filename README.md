@@ -1,85 +1,280 @@
 # Django Manufacturing ERP System
 
-A full-stack Enterprise Resource Planning (ERP) system built with **Django 5.2** for small-to-mid-scale manufacturing operations. The system covers end-to-end workflows across **Procurement**, **Production**, **Inventory**, **Sales & Dispatch**, **Finance**, and **Executive Reporting**—unified under a single Django Admin interface with a RESTful JSON API layer for frontend integration.
+A robust, full-stack Enterprise Resource Planning (ERP) and Manufacturing Execution System (MES) built with **Django 5.2**, **Django REST Framework (DRF)**, **ReportLab**, and **django-unfold**. Designed for precision batch manufacturing (such as chemical formulation, glass putty, coatings, and packaging), the system delivers end-to-end operational control across **Supply Chain**, **Two-Stage Manufacturing**, **Hybrid Inventory**, **Order-to-Cash (O2C) Billing**, **General Ledger Accounting**, and **Executive Analytics**.
 
 ---
 
 ## Table of Contents
 
-- [Features](#features)
+- [System Architecture](#system-architecture)
+- [Mathematical Formulas & Calculation Engine](#mathematical-formulas--calculation-engine)
+  - [1. Inventory Costing (AVCO - Moving Weighted Average Cost)](#1-inventory-costing-avco---moving-weighted-average-cost)
+  - [2. Total Inventory Valuation](#2-total-inventory-valuation)
+  - [3. Multi-Level BOM Explosion & Batch Component Requirements](#3-multi-level-bom-explosion--batch-component-requirements)
+  - [4. MRP Shortage & Downscaling Capacity](#4-mrp-shortage--downscaling-capacity)
+  - [5. Two-Stage Yield Propagation & Packaging Scaling](#5-two-stage-yield-propagation--packaging-scaling)
+  - [6. Production Yield, Scrap & Material Variance](#6-production-yield-scrap--material-variance)
+  - [7. Finished Goods Batch Unit Costing (COGM)](#7-finished-goods-batch-unit-costing-cogm)
+  - [8. Commercial Sales Invoicing, Tax, and Net Receivables](#8-commercial-sales-invoicing-tax-and-net-receivables)
+  - [9. FIFO Lump-Sum Deposit Settlement](#9-fifo-lump-sum-deposit-settlement)
+  - [10. Supplier Delivery Reliability (OTIF Metrics)](#10-supplier-delivery-reliability-otif-metrics)
+  - [11. Financial Statements & Aging Buckets](#11-financial-statements--aging-buckets)
+- [Core Subsystems & Features](#core-subsystems--features)
+  - [Two-Stage Manufacturing Pipeline](#two-stage-manufacturing-pipeline)
+  - [3-Phase Hybrid Inventory Engine](#3-phase-hybrid-inventory-engine)
+  - [Granular MRP & Shortage Resolution](#granular-mrp--shortage-resolution)
+  - [Order-to-Cash (O2C) & Billing Subsystem](#order-to-cash-o2c--billing-subsystem)
+  - [Procurement & Supplier Directory](#procurement--supplier-directory)
+  - [Financial Ledger & Double-Entry Accounting](#financial-ledger--double-entry-accounting)
+- [REST API & PDF Generation](#rest-api--pdf-generation)
+- [Enterprise Admin Command Center (django-unfold)](#enterprise-admin-command-center-django-unfold)
+- [Data Model Reference](#data-model-reference)
 - [Technology Stack](#technology-stack)
 - [Project Structure](#project-structure)
-- [Data Model Architecture](#data-model-architecture)
-- [Two-Stage Manufacturing Flow](#two-stage-manufacturing-flow)
-- [Hybrid Inventory Engine](#hybrid-inventory-engine)
-- [MRP Shortage Resolution](#mrp-shortage-resolution)
-- [RESTful JSON API](#restful-json-api)
-- [Executive Reporting Dashboard](#executive-reporting-dashboard)
-- [Django Admin Customizations](#django-admin-customizations)
 - [Getting Started](#getting-started)
-- [Running Tests](#running-tests)
-- [Configuration Reference](#configuration-reference)
+- [Running Automated Tests](#running-automated-tests)
 - [License](#license)
 
 ---
 
-## Features
+## System Architecture
 
-### Procurement & Supply Chain
-- **Supplier Management** — Maintain supplier directory with contact info.
-- **Purchase Orders (POs)** — Auto-numbered POs (`PO-YYYY-NNNNN`) with line items, unit pricing, and automatic delivery status tracking (`DRAFT` → `SENT` → `PARTIAL` → `RECEIVED`).
-- **Procurement Orders** — Track individual raw material deliveries against POs, with automatic AVCO (Average Weighted Cost) recalculation on receipt.
-- **Purchase Invoices** — Supplier billing with partial payment tracking and automatic `PAID` / `PARTIAL` / `UNPAID` status transitions.
-- **Supplier OTIF Metrics** — On-Time In-Full delivery percentage calculated across all delivered procurements.
+```mermaid
+graph TD
+    A[Supplier Management & POs] -->|Deliveries & AVCO| B[(Warehouse Inventory)]
+    B -->|Phase 1: Reservation| C[Stage 1: Bulk Production WO]
+    C -->|Dynamic Yield Scaling| D[Stage 2: Packaging WO]
+    D -->|Phase 3: Reconciliation| B
+    E[Customer Sales Orders] -->|Order / Delivery Policy| F[Commercial Invoices]
+    B -->|Dispatch Deduction| G[Dispatch Records]
+    G -->|Post-Shipment Billing| F
+    F -->|FIFO Deposit / Payments| H[General Ledger Finance Entries]
+    F -->|ReportLab Stream| I[PDF Commercial Documents]
+    F -->|Return / RMA| J[Credit Notes & Restock]
+```
 
-### Production & Manufacturing
-- **Bills of Materials (BOMs)** — Multi-level recipe management with circular dependency detection. Supports `RAW` and `INTERMEDIATE` components. Enforces single active BOM per product.
-- **Work Orders** — Auto-coded (`WOC-NNNN`) production blueprints with step-by-step instruction sequences, employee assignments, BOM locking, and automated status state machine (`IN_PROGRESS` → `COMPLETED` / `CANCELLED`).
-- **Production Orders** — Batch run records (`POC-NNNN`) with pre-run MRP stock availability checks. Automatically transitions to `ON_HOLD_SHORTAGE` when inventory is insufficient.
-- **Two-Stage Manufacturing** — Automated Stage 1 Bulk Intermediate → Stage 2 Packaging flow with sequence lock validation, auto-spawning parent orders, and dynamic yield auto-scaling.
-- **Material Variance Records** — Auto-calculated per-component variance analysis (Expected vs Actual), efficiency rates, financial impact, and `FAVOURABLE` / `UNFAVOURABLE` / `EXACT` classification.
-- **Work Order Material Lines** — Per-component actual consumption tracking with incremental delta deduction from inventory.
+---
 
-### Inventory Management
-- **Multi-Location Tracking** — Product stock tracked by warehouse location with unique `(product, location)` constraints.
-- **AVCO Costing** — Moving weighted average cost automatically recalculated on every procurement receipt.
-- **Stock Allocation & Reservation** — BOM-driven stock reservation on `IN_PROGRESS` work orders, with Phase 2 incremental actual consumption and Phase 3 reconciliation releasing unused allocations.
-- **Stock Transactions** — Full audit trail of every stock movement (`RECEIPT`, `PRODUCTION_OUTPUT`, `PRODUCTION_CONSUMPTION`, `SHIPMENT`, `ADJUSTMENT`).
-- **Automatic Inventory Creation** — Finished goods automatically receive an Inventory record on product creation.
+## Mathematical Formulas & Calculation Engine
 
-### Sales & Dispatch
-- **Customer Management** — Customer directory with contact and shipping information.
-- **Sales Orders** — Auto-numbered (`SO-YYYYMM-NNNN`) with line items and automatic status management (`draft` → `approved` → `partially_dispatched` → `completed`).
-- **Dispatch Records** — Auto-coded (`DISP-NNNN`) shipment tracking with stock deduction on `shipped` / `delivered` status. Validates inventory availability before dispatch. Automatically syncs parent Sales Order status.
-- **Sales Invoices** — Auto-numbered (`SINV-YYYYMM-NNNN`) with auto-calculated totals from dispatch quantities × selling prices. Supports partial payments with automatic status transitions.
-- **Returns** — Customer return processing with QC inspection workflow (`PENDING` → `APPROVED` → `REJECTED`), automatic inventory restocking on approval, and Sales Invoice credit adjustments.
+The system enforces strict, deterministic mathematical formulas across inventory valuation, production yields, cost accounting, and financial ledger calculations.
 
-### Finance
-- **Finance Entries** — Revenue and Expense ledger with category enforcement (`SALES`, `LABOR`, `OVERHEAD`, `PROCUREMENT`, `CUSTOMER_REFUND`, `LOSS`). Cross-reference validation prevents invalid category/type combinations.
-- **Sales Invoice Payments** — Multiple payment methods (`CASH`, `CARD`, `TRANSFER`) with reference number enforcement for electronic payments.
-- **Purchase Payments** — Supplier payment tracking (`CASH`, `TRANSFER`, `CHEQUE`) with overpayment prevention and automatic invoice status updates.
+### 1. Inventory Costing (AVCO - Moving Weighted Average Cost)
+Whenever new goods are received into stock via a Procurement Order delivery, the unit cost is recalculated automatically using the Moving Weighted Average Cost formula:
 
-### Reporting & Analytics
-- **Profit & Loss (P&L)** — Revenue, COGS, operating expenses, gross profit, net income, and gross margin percentage.
-- **Cost of Goods Manufactured (COGM)** — Direct material cost, scrap/variance impact, estimated labor cost, total COGM.
-- **Yield & Scrap Analytics** — Production yield rates, variance classification breakdowns, machine/workstation utilization.
-- **Inventory Health** — Total inventory valuation, low-stock alerts (threshold ≤ 10 units), supplier OTIF delivery percentage.
-- **A/R & A/P Aging** — Accounts Receivable and Payable aging buckets (Current 0–30, 31–60, 61–90, 90+ days).
+$$\text{New Unit Cost} = \frac{(\text{Current Stock} \times \text{Current AVCO Cost}) + (\text{Received Quantity} \times \text{Purchase Unit Price})}{\text{Current Stock} + \text{Received Quantity}}$$
+
+*Where received quantity is greater than zero and values are rounded to 2 decimal places using standard half-up rounding.*
+
+### 2. Total Inventory Valuation
+The total warehouse asset value across all tracked SKUs and locations:
+
+$$\text{Total Valuation} = \sum_{i=1}^{N} \left( \text{quantity\_available}_i \times \text{unit\_cost}_i \right)$$
+
+### 3. Multi-Level BOM Explosion & Batch Component Requirements
+For a given Work Order or Production Order with target batch quantity $Q_{\text{target}}$:
+
+$$\text{Component Requirement}_c = Q_{\text{target}} \times \text{BOM Item Ratio}_c$$
+
+Where $\text{BOM Item Ratio}_c$ represents the quantity of component $c$ required to manufacture one unit of output.
+
+### 4. MRP Shortage & Downscaling Capacity
+- **Component Shortfall:**
+  $$\text{Shortfall}_c = \max\left(0, \, \text{Component Requirement}_c - \text{Available Stock}_c\right)$$
+
+- **Maximum Achievable Production Units (Downscale Target):**
+  When raw materials or intermediates are constrained, the maximum feasible batch size is governed by the limiting component:
+  $$\text{Max Producible Units} = \min_{c \in \text{BOM}} \left( \left\lfloor \frac{\text{Available Stock}_c}{\text{BOM Item Ratio}_c} \right\rfloor \right)$$
+
+### 5. Two-Stage Yield Propagation & Packaging Scaling
+For Stage 2 packaging work orders linked to a Stage 1 bulk intermediate run:
+
+- **Intermediate Bulk Expected Quantity:**
+  $$Q_{\text{bulk\_expected}} = Q_{\text{packaging\_target}} \times \text{Intermediate BOM Ratio}$$
+
+- **Dynamic Yield Expectation Scaling:**
+  When actual bulk yield $Y_{\text{bulk\_actual}}$ deviates from nominal output due to physical reaction variances:
+  $$\text{Scaled Child Component Expectation}_c = Y_{\text{bulk\_actual}} \times \left( \frac{\text{Original Expected Quantity}_c}{Q_{\text{packaging\_target}}} \right)$$
+
+### 6. Production Yield, Scrap & Material Variance
+- **Batch Yield Percentage:**
+  $$\text{Yield \%} = \left( \frac{\text{Actual Quantity Produced}}{Q_{\text{target}}} \right) \times 100\%$$
+
+- **Material Quantity Variance ($\Delta Q$):**
+  $$\Delta Q_c = \text{Actual Consumed Quantity}_c - \text{Expected Quantity}_c$$
+
+- **Material Cost Variance ($\Delta C$):**
+  $$\Delta C_c = \Delta Q_c \times \text{Standard Unit Cost}_c$$
+
+- **Material Efficiency Rate:**
+  $$\text{Efficiency \%}_c = \left( \frac{\text{Expected Quantity}_c}{\text{Actual Consumed Quantity}_c} \right) \times 100\%$$
+
+  $$\text{Classification} = \begin{cases} \text{FAVOURABLE}, & \text{Actual} < \text{Expected} \\ \text{EXACT}, & \text{Actual} = \text{Expected} \\ \text{UNFAVOURABLE}, & \text{Actual} > \text{Expected} \end{cases}$$
+
+### 7. Finished Goods Batch Unit Costing (COGM)
+Upon Work Order completion (Phase 3 Reconciliation), the unit cost of manufactured goods is computed from actual consumed raw materials and overheads:
+
+$$\text{Finished Unit Cost} = \frac{\sum_{c} \left( \text{Actual Quantity Consumed}_c \times \text{Unit Cost}_c \right) + \text{Direct Labor Cost} + \text{Allocated Overhead}}{\text{Actual Quantity Produced}}$$
+
+### 8. Commercial Sales Invoicing, Tax, and Net Receivables
+- **Line Item Net Subtotal:**
+  $$\text{Line Subtotal} = \text{Billed Quantity} \times \text{Unit Selling Price}$$
+
+- **Line Item Tax Amount:**
+  $$\text{Line Tax} = \text{Line Subtotal} \times \left( \frac{\text{Tax Rate \%}}{100} \right)$$
+
+- **Line Total Price:**
+  $$\text{Line Total} = \text{Line Subtotal} + \text{Line Tax}$$
+
+- **Invoice Total Amount:**
+  $$\text{Invoice Total} = \sum \text{Line Total}$$
+
+- **Outstanding Balance:**
+  $$\text{Remaining Balance} = \max\left(0, \, \text{Invoice Total} - \sum \text{Payments Applied} - \sum \text{Credit Notes Applied}\right)$$
+
+### 9. FIFO Lump-Sum Deposit Settlement
+When a customer pays a lump-sum amount $P$, funds are allocated strictly in chronological order across open invoices $I_1, I_2, \dots, I_n$ (sorted by `invoice_date` ascending):
+
+For each open invoice $k = 1 \dots n$:
+$$\text{Allocation}_k = \min(P_{\text{remaining}}, \, \text{Remaining Balance}_k)$$
+$$\text{Remaining Balance}_{k, \text{new}} = \text{Remaining Balance}_k - \text{Allocation}_k$$
+$$P_{\text{remaining}} \leftarrow P_{\text{remaining}} - \text{Allocation}_k$$
+
+- **Customer Unallocated Credit Balance (Surplus Overpayment):**
+  $$\text{Surplus Credit} = P_{\text{remaining}}$$
+
+### 10. Supplier Delivery Reliability (OTIF Metrics)
+$$\text{OTIF \%} = \left( \frac{\text{Number of Deliveries Delivered On-Time and In-Full}}{\text{Total Procurement Deliveries}} \right) \times 100\%$$
+
+### 11. Financial Statements & Aging Buckets
+- **Gross Profit:** $\text{Gross Profit} = \text{Sales Revenue} - \text{COGS}$
+- **Gross Margin %:** $\text{Gross Margin} = \left( \frac{\text{Gross Profit}}{\text{Sales Revenue}} \right) \times 100\%$
+- **Net Income:** $\text{Net Income} = \text{Gross Profit} - \text{Operating Expenses}$
+- **Accounts Receivable Aging:**
+  $$\text{Aging Days} = \text{Current Date} - \text{Invoice Date}$$
+  $$\text{Bucket} = \begin{cases} \text{Current (0–30 days)}, & 0 \le \text{Days} \le 30 \\ \text{31–60 days}, & 31 \le \text{Days} \le 60 \\ \text{61–90 days}, & 61 \le \text{Days} \le 90 \\ \text{90+ days (Overdue)}, & \text{Days} > 90 \end{cases}$$
+
+---
+
+## Core Subsystems & Features
+
+### Two-Stage Manufacturing Pipeline
+- **Stage 1 (Bulk Intermediate Mixing):** Automatically spawns a parent `PRODUCTION` Work Order to blend intermediate recipes (e.g. Bulk Putty Base from Calcium Carbonate and Linseed Oil).
+- **Stage 2 (Packaging & Canning):** Tracks packaging materials (Tins, Lids, Labels) into commercial finished units.
+- **Sequence Lock Guardrail:** Work Order validation prevents packaging runs from starting before their parent bulk run reaches `COMPLETED` status.
+- **Dynamic Yield Propagation:** Updates packaging material lines to match actual bulk output.
+
+### 3-Phase Hybrid Inventory Engine
+1. **Phase 1 (Stock Allocation):** When Work Orders move to `IN_PROGRESS`, calculated recipe quantities shift from `quantity_available` to `quantity_allocated` using row-level locking (`select_for_update`) to prevent race conditions.
+2. **Phase 2 (Incremental Consumption):** Tracks actual shop-floor ingredient additions and applies delta deductions.
+3. **Phase 3 (Reconciliation & Output):** Upon `COMPLETED`, releases unused residual allocations, increments Finished Goods inventory, logs stock audit entries, and computes exact batch AVCO cost.
+
+### Granular MRP & Shortage Resolution
+When stock is insufficient for a planned batch, orders enter `ON_HOLD_SHORTAGE` / `AWAITING_RESOLUTION`. Three one-click resolution pathways are provided in the admin command center:
+1. **Option 1: Top-Up Bulk** — Auto-spawns an intermediate bulk mixing Work Order to supply the shortfall.
+2. **Option 2: Downscale Target** — Recalculates and scales down the batch quantity to match available stock.
+3. **Option 3: Hold for Inbound** — Places the order on hold until scheduled PO deliveries arrive, auto-resuming via Django signals.
+
+### Order-to-Cash (O2C) & Billing Subsystem
+- **Sales Orders:** State machine (`draft` &rarr; `approved` &rarr; `partially_dispatched` &rarr; `completed`) with policy-driven invoice triggers:
+  - `ORDER_BASED`: Invoices generated immediately upon order confirmation.
+  - `DELIVERY_BASED`: Invoices generated upon physical dispatch.
+- **Commercial Invoices:** Auto-sequenced (`SINV-YYYYMM-NNNN`), immutable after issuance, supporting partial payments, due date aging, and PDF document export.
+- **Credit Notes:** RMA adjustments (`CN-YYYYMM-NNNN`) referencing original invoices with automatic inventory restocking and financial credits.
+- **FIFO Deposit Settlement:** Allows one-click bulk payment recording with a visual simulated dry-run preview.
+
+### Procurement & Supplier Directory
+- **Supplier Codes:** Auto-generated unique supplier identifiers (`SUP-0001`, `SUP-0002`), hiding raw database IDs and enabling rapid autocomplete.
+- **Purchase Orders:** Multi-line order creation (`PO-YYYY-NNNNN`) with supplier assignment and partial delivery receipt tracking.
+- **Automated AVCO:** Updates weighted cost immediately upon delivery confirmation.
+
+### Financial Ledger & Double-Entry Accounting
+- **Finance Entries:** General Ledger entries auto-posted on customer payments, supplier payments, and scrap losses (`FE-YYYYMM-NNNN`).
+- **Audit Trails:** Immutable ledger records linking source invoices, dispatch records, and work orders.
+
+---
+
+## REST API & PDF Generation
+
+The system includes both lightweight JSON endpoints and full Django REST Framework (DRF) ViewSets with role-based permissions and ReportLab document generators.
+
+### DRF ViewSets & Routes
+
+| HTTP Method | Endpoint | Description | Permission |
+|---|---|---|---|
+| `GET`, `POST` | `/api/sales/orders/` | List and create Sales Orders (nested line support) | `IsSalesOrBillingStaff` |
+| `POST` | `/api/sales/orders/{id}/confirm/` | Confirm Sales Order & auto-generate invoice | `IsSalesOrBillingStaff` |
+| `GET` | `/api/sales/invoices/` | List and retrieve Commercial Invoices | `IsSalesOrBillingStaff` |
+| `POST` | `/api/sales/invoices/{id}/record-payment/` | Record payment, update balance & post GL | `IsSalesOrBillingStaff` |
+| `GET` | `/api/sales/invoices/{id}/pdf/` | Download Commercial Sales Invoice PDF | `IsSalesOrBillingStaff` |
+| `GET` | `/api/sales/credit-notes/` | List and retrieve Credit Notes | `IsSalesOrBillingStaff` |
+| `GET` | `/api/sales/credit-notes/{id}/pdf/` | Download Credit Note / Adjustment Memo PDF | `IsSalesOrBillingStaff` |
+
+### PDF Generation Service (`core/utils/pdf_generator.py`)
+Built using ReportLab (`SimpleDocTemplate`, `Table`, `TableStyle`, `Paragraph`):
+- **Commercial Invoices:** Formats company header, customer billing address, order references, itemized line items, tax rate, total paid, remaining balance, and payment status.
+- **Credit Notes:** Formats memo reference, original invoice link, reason for RMA return, credited lines, tax credited, and net refund total.
+
+---
+
+## Enterprise Admin Command Center (django-unfold)
+
+The Django Admin has been modernized using `django-unfold` with responsive Tailwind UI, dark/light theme switching, and custom operational widgets:
+
+- **Executive KPI Dashboard:** Real-time metrics for warehouse stock value, active work orders, outstanding AR debt, and OTIF rates.
+- **Warehouse & Inventory Sidebar Navigation:**
+  - *All Warehouse Stock* (`/admin/core/inventory/`)
+  - *Raw Material Stock* (`?product_type=RAW_CHEMICALS`)
+  - *Packaging Stock* (`?product_type=PACKAGING`)
+  - *Intermediates Stock* (`?product_type=INTERMEDIATE`)
+  - *Finished Goods Stock* (`?product_type=FINISHED`)
+- **Interactive MRP Resolution Panels:** Action cards for resolving component deficits directly on Work Order and Production Order change forms.
+- **High-Contrast Theme-Adaptive FIFO Bulk Deposit Page:** Dry-run simulation breakdown and settlement buttons with dark mode compatibility.
+
+---
+
+## Data Model Reference
+
+| Domain | Model | Key Fields & Identifiers | Primary Purpose |
+|---|---|---|---|
+| **Procurement** | `Supplier` | `supplier_code` (`SUP-0001`), `name`, `contact_info` | Supplier directory & purchase master data |
+| **Procurement** | `PurchaseOrder` | `po_number` (`PO-YYYY-NNNNN`), `status`, `order_date` | Multi-item purchase orders |
+| **Procurement** | `PurchaseOrderItem`| `product`, `quantity_ordered`, `quantity_received`, `unit_price` | PO line item details |
+| **Procurement** | `ProcurementOrder`| `procurement_order_id`, `delivery_date`, `quantity_received` | Delivery receipt & AVCO cost trigger |
+| **Manufacturing**| `Product` | `sku` (`RAW-001`, `FG-001`), `product_type`, `selling_price` | Product catalog master |
+| **Manufacturing**| `BillOfMaterial` | `product`, `name`, `is_active` | Recipe definition (single active rule) |
+| **Manufacturing**| `BOMItem` | `bom`, `component`, `quantity` | Ingredient ratio with circular check |
+| **Manufacturing**| `WorkOrder` | `work_order_code` (`WOC-0001`), `status`, `category` | Shop-floor production blueprints |
+| **Manufacturing**| `ProductionOrder` | `production_order_code` (`POC-0001`), `status`, `quantity`| Planned batch runs with MRP gates |
+| **Manufacturing**| `WorkOrderMaterialLine`| `work_order`, `component`, `quantity_actual` | Incremental material consumption |
+| **Manufacturing**| `MaterialVarianceRecord`| `work_order`, `component`, `variance_quantity`, `efficiency_rate` | Expected vs actual variance tracking |
+| **Inventory** | `Inventory` | `product`, `location`, `quantity_available`, `quantity_allocated`| Multi-location stock ledger & AVCO |
+| **Inventory** | `StockTransaction`| `transaction_id`, `product`, `transaction_type`, `quantity` | Immutable stock audit log |
+| **Sales & Billing**| `Customer` | `customer_name`, `contact_info`, `shipping_address` | Customer master directory |
+| **Sales & Billing**| `SalesOrder` | `order_number` (`SO-YYYYMM-NNNN`), `invoicing_policy`, `status` | Customer orders & fulfillment |
+| **Sales & Billing**| `SalesOrderItem`| `sales_order`, `product`, `quantity_ordered`, `unit_price` | Order line items |
+| **Sales & Billing**| `DispatchRecord` | `dispatch_code` (`DISP-0001`), `status`, `dispatch_date` | Outbound shipment & inventory deduction |
+| **Sales & Billing**| `SalesInvoice` | `invoice_number` (`SINV-YYYYMM-NNNN`), `status`, `total_amount` | Commercial sales invoices |
+| **Sales & Billing**| `SalesInvoiceLine`| `invoice`, `product`, `quantity`, `unit_price`, `tax_rate` | Invoice line item breakdown |
+| **Sales & Billing**| `CreditNote` | `credit_note_number` (`CN-YYYYMM-NNNN`), `status`, `total_amount` | RMA adjustments & customer credit memos |
+| **Sales & Billing**| `CreditNoteLine`| `credit_note`, `product`, `quantity_returned`, `tax_rate` | Credited item line details |
+| **Sales & Billing**| `SalesInvoicePayments`| `invoice`, `amount_paid`, `payment_method`, `reference_number` | Payment receipts & GL trigger |
+| **Finance** | `FinanceEntry` | `entry_code` (`FE-YYYYMM-NNNN`), `entry_type`, `category`, `amount` | General Ledger double-entry records |
+| **Finance** | `DocumentSequence`| `document_type`, `prefix`, `last_sequence` | Thread-safe sequential document counters |
 
 ---
 
 ## Technology Stack
 
-| Layer | Technology |
-|---|---|
-| **Backend Framework** | Django 5.2 (Python) |
-| **Database** | SQLite 3 (development) — swappable to PostgreSQL/MySQL |
-| **Admin Interface** | Django Admin with custom inlines, actions, and JS widgets |
-| **API Layer** | Vanilla Django views returning `JsonResponse` (no DRF dependency) |
-| **Serialization** | Custom `core/serializers.py` (lightweight, zero-dependency) |
-| **Middleware** | Custom `ApiExceptionMiddleware` for standardized API error responses |
-| **Frontend** | HTML5, Vanilla CSS, Vanilla JavaScript (`fetch()` API client) |
-| **Reporting** | SQL-level `aggregate()` / `annotate()` via Django ORM |
+| Layer | Component | Description |
+|---|---|---|
+| **Backend Core** | Django 5.2.15 | Python web framework, ORM, atomic transactions |
+| **API Framework** | Django REST Framework (DRF) | REST endpoints, serializers, permissions |
+| **Admin UI** | django-unfold | Modern Tailwind-based enterprise admin interface |
+| **PDF Engine** | ReportLab 4.4.10 | Programmatic binary PDF generation for invoices & credit memos |
+| **Database** | SQLite 3 (Dev) / PostgreSQL (Prod) | Relational database with row-locking support |
+| **Authentication** | Django Auth & Permissions | Role-based group access (`IsSalesOrBillingStaff`, Superusers) |
+| **Date & Time** | Django Timezone | Fully timezone-aware datetime handling |
 
 ---
 
@@ -87,255 +282,59 @@ A full-stack Enterprise Resource Planning (ERP) system built with **Django 5.2**
 
 ```
 djangosystem/
-├── manage.py                          # Django management script
-├── db.sqlite3                         # SQLite database file
-├── djangosystem/                      # Project configuration
-│   ├── settings.py                    # Django settings (middleware, apps, DB)
-│   ├── urls.py                        # Root URL configuration
-│   └── wsgi.py                        # WSGI entry point
-├── core/                              # Main application
-│   ├── models.py                      # 20+ domain models (~2,100 lines)
-│   ├── admin.py                       # Django Admin customizations (~900 lines)
-│   ├── views.py                       # Form views + API endpoints
-│   ├── urls.py                        # URL routing (forms, reports, API)
-│   ├── serializers.py                 # Object-to-dict serializers & validators
-│   ├── middleware.py                  # ApiExceptionMiddleware
-│   ├── reports.py                     # Executive reporting analytics engine
-│   ├── services.py                    # MRP engine & BOM explosion services
-│   ├── signals.py                     # Django signals
-│   ├── tests.py                       # Unit test suite (20+ test cases)
-│   ├── migrations/                    # 31 database migrations
-│   ├── templates/core/               # Django HTML templates
-│   │   ├── reports_dashboard.html     # Executive reporting dashboard
-│   │   ├── home.html, index.html      # Landing pages
-│   │   ├── *_form.html                # Data entry forms
-│   │   └── ...
-│   └── static/                        # Static assets
-│       ├── styles.css                 # Global stylesheet
-│       ├── scripts.js                 # Global JS utilities
-│       ├── procurement_product_filter.js  # PO→Product dynamic filter
-│       └── core/js/api.js             # Vanilla JS API client (APIClient class)
+├── manage.py                              # Django administrative CLI
+├── requirements.txt                       # Project dependencies (Django, DRF, Unfold, ReportLab)
+├── db.sqlite3                             # Local development database
+├── djangosystem/                          # Project configuration
+│   ├── settings.py                        # Settings, DRF configuration, UNFOLD sidebar navigation
+│   ├── urls.py                            # Root URL routing
+│   └── wsgi.py                            # WSGI deployment entry point
+├── templates/                             # Global template overrides
+│   └── admin/
+│       ├── core/
+│       │   ├── customer/
+│       │   │   └── receive_deposit.html   # Unfold FIFO bulk deposit UI
+│       │   └── workorder/
+│       │       └── change_form.html       # MRP shortage resolution panels
+│       └── customer_receive_deposit.html  # High-contrast customer deposit template
+├── core/                                  # Main ERP Application
+│   ├── models.py                          # 25+ domain models, lifecycle state machines (~3,200 lines)
+│   ├── admin.py                           # Unfold ModelAdmin classes, custom views, inlines (~2,200 lines)
+│   ├── serializers.py                     # DRF serializers for O2C & Shop-Floor APIs
+│   ├── views.py                           # DRF ViewSets, API actions, and standard Django views
+│   ├── permissions.py                     # Role-based API permissions (IsSalesOrBillingStaff)
+│   ├── urls.py                            # DRF DefaultRouter and application routes
+│   ├── dashboard.py                       # UNFOLD command center KPI callback
+│   ├── reports.py                         # Executive analytics (P&L, COGM, Yield, Aging)
+│   ├── signals.py                         # Django signals for auto-resuming on-hold orders
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   └── pdf_generator.py               # ReportLab PDF invoice and credit note generators
+│   ├── services/
+│   │   ├── __init__.py
+│   │   └── production_reconciliation.py   # Phase 3 Production Reconciliation Engine
+│   ├── migrations/                        # 49+ database migrations
+│   └── tests/                             # Comprehensive automated test suites (220+ tests)
+│       ├── test_core.py                   # Core business logic & two-stage manufacturing
+│       ├── test_sales_billing_models.py   # Milestone 1 domain models & immutability
+│       ├── test_sales_billing_admin.py    # Milestone 2 admin, FIFO deposit, aging
+│       ├── test_sales_billing_api.py      # Milestone 3 DRF endpoints & PDF downloads
+│       ├── test_inventory_product_type_filter.py # Sidebar shortcuts & warehouse filters
+│       ├── test_supplier.py               # Supplier unique codes and admin visibility
+│       ├── test_reconciliation.py         # Phase 3 reconciliation engine tests
+│       ├── test_shopfloor_api.py          # Shop-floor manufacturing execution endpoints
+│       └── ...
 ```
-
----
-
-## Data Model Architecture
-
-The system is built on **20+ interconnected Django models** organized into five functional domains:
-
-### Procurement Domain
-| Model | Purpose |
-|---|---|
-| `Supplier` | Supplier directory (name, contact info) |
-| `PurchaseOrder` | Multi-item purchase orders with auto-numbered codes |
-| `PurchaseOrderItem` | Line items on a PO (product, qty ordered/received, unit price) |
-| `ProcurementOrder` | Individual deliveries against POs, triggers AVCO recalculation |
-
-### Production Domain
-| Model | Purpose |
-|---|---|
-| `Product` | Product master data with types (`RAW`, `FINISHED`, `INTERMEDIATE`), auto-generated SKUs |
-| `BillOfMaterial` | Recipe definitions with single-active-per-product enforcement |
-| `BOMItem` | Recipe ingredients with quantity-per-unit and circular dependency checks |
-| `WorkOrder` | Production blueprints with BOM locking, status state machine, and inventory engine |
-| `WorkOrderInstruction` | Step-by-step manufacturing instructions with machine assignments |
-| `WorkOrderMaterialLine` | Per-component actual vs expected consumption tracking |
-| `ProductionOrder` | Batch run records with MRP pre-checks and status sync |
-| `MaterialVarianceRecord` | Auto-calculated variance analysis (quantity, cost, efficiency) |
-| `Employee` | Workforce directory with auto-coded employee IDs and hourly rates |
-
-### Inventory Domain
-| Model | Purpose |
-|---|---|
-| `Inventory` | Multi-location stock ledger with AVCO unit cost and valuation |
-| `StockTransaction` | Complete audit trail of every stock movement |
-
-### Sales Domain
-| Model | Purpose |
-|---|---|
-| `Customer` | Customer directory (name, contact, shipping address) |
-| `SalesOrder` | Multi-item customer orders with automatic status tracking |
-| `SalesOrderItem` | Line items with dispatched quantity tracking |
-| `DispatchRecord` | Shipment records with stock deduction and delivery tracking |
-| `SalesInvoice` | Auto-calculated invoices with partial payment support |
-| `SalesInvoicePayments` | Individual payment entries with method & reference tracking |
-| `Return` | Customer returns with QC workflow and auto-restocking |
-
-### Finance Domain
-| Model | Purpose |
-|---|---|
-| `PurchaseInvoice` | Supplier billing with auto-status from payment tracking |
-| `PurchasePayment` | Outgoing payments with overpayment prevention |
-| `FinanceEntry` | General ledger entries (Revenue/Expense) with category validation |
-
----
-
-## Two-Stage Manufacturing Flow
-
-The system implements an automated two-stage manufacturing pipeline for packaging transformations (Bulk Intermediate → Finished Goods):
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  STAGE 1: Bulk Intermediate Mixing                      │
-│  (Auto-spawned parent WorkOrder)                        │
-│                                                         │
-│  • Automatically created when a Finished Good WO        │
-│    has an INTERMEDIATE component in its BOM             │
-│  • Calculates bulk requirement: target_qty × BOM ratio  │
-│  • Linked as parent_work_order on the packaging WO      │
-└─────────────────────┬───────────────────────────────────┘
-                      │ On COMPLETED
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  DYNAMIC YIELD AUTO-SCALING                             │
-│  sync_child_packaging_expectations()                    │
-│                                                         │
-│  • Propagates actual bulk yield to child packaging      │
-│    material lines (quantity_expected)                   │
-│  • Prevents negative inventory from physical variance   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  STAGE 2: Packaging Operations                          │
-│  (Original WorkOrder)                                   │
-│                                                         │
-│  • SEQUENCE LOCK: Cannot start/complete until Stage 1   │
-│    parent_work_order.status == 'COMPLETED'              │
-│  • Raises ValidationError with clear operator messaging │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Key Guardrails
-- **Sequence Lock Validation** (`WorkOrder.clean()`) — Prevents packaging operations from executing before bulk mixing is complete.
-- **Auto-Spawning** (`WorkOrder.save()`) — Automatically creates the parent bulk WorkOrder and calculates intermediate material requirements.
-- **Dynamic Yield Scaling** (`sync_child_packaging_expectations()`) — Updates child packaging material expectations to match actual bulk output, preventing allocation crashes from physical yield variance.
-
----
-
-## Hybrid Inventory Engine
-
-The `WorkOrder.process_inventory()` method implements a three-phase inventory management engine:
-
-| Phase | Trigger | Action |
-|---|---|---|
-| **Phase 1: Allocation** | Status → `IN_PROGRESS` | Reserves BOM-calculated stock from `quantity_available` into `quantity_allocated` |
-| **Phase 2: Consumption** | During production | Deducts incremental actual consumption deltas from allocated pool |
-| **Phase 3: Reconciliation** | Status → `COMPLETED` | Releases unused allocations, adds finished goods output, logs stock transactions |
-
-Each phase includes safety gates (`is_inventory_allocated`, `is_inventory_updated`) to prevent duplicate processing.
-
----
-
-## MRP Shortage Resolution
-
-The system includes a Material Requirements Planning (MRP) engine (`core/services.py`) that:
-
-1. **Explodes multi-level BOMs** recursively down to raw material requirements.
-2. **Evaluates stock shortages** per component with detailed shortage analysis.
-3. **Provides resolution pathways** accessible via Django Admin action buttons:
-
-| Resolution | Component Type | Action |
-|---|---|---|
-| `raw_autodraft_po` | Raw Material | Auto-drafts a Purchase Order to the component's supplier |
-| `raw_direct_procurement` | Raw Material | Spawns a direct Procurement Order |
-| `raw_hold_inbound` | Raw Material | Holds production pending inbound PO delivery |
-| `intermediate_build` | Intermediate | Spawns a child sub-assembly WorkOrder + ProductionOrder |
-| `intermediate_hold_active` | Intermediate | Links to an active intermediate production run |
-| `intermediate_partial_batch` | Intermediate | Down-scales the production batch to available stock |
-
----
-
-## RESTful JSON API
-
-All API endpoints return standardized JSON payloads:
-
-```json
-// Success
-{ "status": "success", "data": [...] }
-
-// Error (via ApiExceptionMiddleware)
-{ "status": "error", "message": "...", "errors": {...} }
-```
-
-### Endpoints
-
-| Method | URL | Description |
-|---|---|---|
-| `GET` | `/api/products/` | List all products (filter by `?type=RAW\|FINISHED\|INTERMEDIATE`) |
-| `POST` | `/api/products/` | Create a product (validated via `ProductSerializer`) |
-| `GET` | `/api/work-orders/` | List all Work Orders with material lines |
-| `GET` | `/api/inventory/` | List all inventory stock levels |
-| `GET` | `/api/production-orders/` | List all Production Orders |
-| `GET` | `/api/sales-orders/` | List all Sales Orders with items |
-| `GET` | `/api/procurements/` | List all Procurement Orders |
-
-### API Middleware
-
-`ApiExceptionMiddleware` (`core/middleware.py`) intercepts exceptions on `/api/` routes and AJAX requests, returning structured JSON error responses instead of Django HTML error pages.
-
-### Client-Side API Module
-
-`static/core/js/api.js` provides an `APIClient` JavaScript class for browser-side consumption:
-
-```javascript
-const api = new APIClient();
-
-// GET request
-const products = await api.get('/api/products/?type=FINISHED');
-
-// POST request with automatic CSRF token injection
-const newProduct = await api.post('/api/products/', {
-    name: 'Widget',
-    product_type: 'FINISHED',
-    category: 'Widgets',
-    unit_of_measurement: 'pcs',
-    selling_price: 29.99
-});
-```
-
-Features: automatic CSRF token extraction from cookies, standardized promise handling, and animated floating toast notifications.
-
----
-
-## Executive Reporting Dashboard
-
-Accessible at `/reports/` (staff-only), the reporting dashboard provides consolidated operational metrics powered by `core/reports.py`:
-
-| Report | Metrics |
-|---|---|
-| **Profit & Loss** | Total Revenue, Sales Revenue, COGS, Gross Profit, Operating Expenses, Net Income, Gross Margin % |
-| **Cost of Goods Manufactured** | Raw Material Cost, Scrap/Variance Impact, Labor Cost (standard rate), Total COGM |
-| **Yield & Scrap** | Completed Runs, Target vs Produced Quantity, Yield Rate %, Variance Breakdowns, Machine Utilization |
-| **Inventory Health** | Total SKUs, Total Valuation, Low-Stock Alerts (≤10 units), Supplier OTIF % |
-| **A/R Aging** | Receivable balances bucketed by age (0–30, 31–60, 61–90, 90+ days) |
-| **A/P Aging** | Payable balances bucketed by age (0–30, 31–60, 61–90, 90+ days) |
-
-All reports support optional date range filtering via `?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD` query parameters.
-
----
-
-## Django Admin Customizations
-
-The Django Admin interface (`core/admin.py`) includes extensive customizations:
-
-- **Optimized Querysets** — `select_related()` and `prefetch_related()` on all admin list views to eliminate N+1 queries.
-- **CSV Export Action** — Generic `export_as_csv` action available on all model admin pages.
-- **Inline Editing** — `PurchaseOrderItem` inline on PurchaseOrders, `WorkOrderInstruction` and `WorkOrderMaterialLine` inlines on WorkOrders, `SalesOrderItem` inline on SalesOrders, payment inlines on invoices.
-- **Dynamic Product Filter** — Client-side JS (`procurement_product_filter.js`) dynamically filters the Product dropdown on Procurement Order forms based on the selected Purchase Order.
-- **MRP Shortage Dashboard** — Read-only shortage analysis panel on Production Order change forms with one-click resolution action buttons.
-- **Work Order Viewer** — Detailed read-only production summary with material lines, variance records, and instruction steps.
 
 ---
 
 ## Getting Started
 
 ### Prerequisites
+- **Python 3.11+**
+- **pip** and **virtualenv**
 
-- Python 3.10+
-- pip
-
-### Installation
+### Installation Steps
 
 1. **Clone the repository:**
    ```bash
@@ -345,18 +344,18 @@ The Django Admin interface (`core/admin.py`) includes extensive customizations:
 
 2. **Create and activate a virtual environment:**
    ```bash
+   # Windows (PowerShell)
    python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
 
-   # Windows
-   .venv\Scripts\activate
-
-   # macOS / Linux
+   # Linux / macOS
+   python3 -m venv .venv
    source .venv/bin/activate
    ```
 
 3. **Install dependencies:**
    ```bash
-   pip install django
+   pip install -r requirements.txt
    ```
 
 4. **Apply database migrations:**
@@ -364,60 +363,51 @@ The Django Admin interface (`core/admin.py`) includes extensive customizations:
    python manage.py migrate
    ```
 
-5. **Create a superuser for Django Admin access:**
+5. **Create a superuser for admin access:**
    ```bash
    python manage.py createsuperuser
    ```
 
-6. **Run the development server:**
+6. **Start the development server:**
    ```bash
    python manage.py runserver
    ```
 
-7. **Access the application:**
-   - **Django Admin:** [http://127.0.0.1:8000/admin/](http://127.0.0.1:8000/admin/)
-   - **Reports Dashboard:** [http://127.0.0.1:8000/reports/](http://127.0.0.1:8000/reports/)
-   - **API Endpoints:** [http://127.0.0.1:8000/api/products/](http://127.0.0.1:8000/api/products/)
+7. **Access the web interfaces:**
+   - **Enterprise Admin Command Center:** [http://127.0.0.1:8000/admin/](http://127.0.0.1:8000/admin/)
+   - **Executive Reporting Dashboard:** [http://127.0.0.1:8000/reports/](http://127.0.0.1:8000/reports/)
+   - **DRF Browsable API Root:** [http://127.0.0.1:8000/api/](http://127.0.0.1:8000/api/)
 
 ---
 
-## Running Tests
+## Running Automated Tests
 
-Execute the full test suite:
+Run the complete test suite across all 220+ test cases:
 
 ```bash
-python manage.py test
+python manage.py test core
 ```
 
-The test suite (`core/tests.py`) includes:
+### Targeted Test Suites
 
-- **MRP Engine Tests** — BOM explosion, shortage evaluation, resolution pathways.
-- **Two-Stage Manufacturing Tests** — Sequence lock validation, auto-spawning, yield scaling.
-- **Reporting Engine Tests** — P&L, COGM, and aging bucket calculations.
-- **API & Serializer Tests** — Serialization accuracy, payload validation, endpoint responses, middleware error trapping.
+```bash
+# Sales & Billing Subsystem (Milestones 1, 2, 3)
+python manage.py test core.tests.test_sales_billing_models
+python manage.py test core.tests.test_sales_billing_admin
+python manage.py test core.tests.test_sales_billing_api
 
----
+# Two-Stage Manufacturing & Shop-Floor APIs
+python manage.py test core.tests.test_core
+python manage.py test core.tests.test_reconciliation
+python manage.py test core.tests.test_shopfloor_api
 
-## Configuration Reference
-
-Key settings in `djangosystem/settings.py`:
-
-| Setting | Value | Notes |
-|---|---|---|
-| `DEBUG` | `True` | Set to `False` in production |
-| `DATABASES` | SQLite3 | Swap to PostgreSQL for production workloads |
-| `MIDDLEWARE` | Includes `core.middleware.ApiExceptionMiddleware` | Handles `/api/` error responses |
-| `INSTALLED_APPS` | Includes `django.contrib.humanize`, `core` | Humanize for template number formatting |
-| `STATIC_URL` | `/static/` | Serve via `collectstatic` in production |
-
-### Environment Considerations
-
-- **Secret Key:** Replace the development `SECRET_KEY` with a securely generated key for production.
-- **Allowed Hosts:** Configure `ALLOWED_HOSTS` with your production domain(s).
-- **Database:** For production, migrate to PostgreSQL or MySQL and configure connection pooling.
+# Inventory Category Filters & Supplier Management
+python manage.py test core.tests.test_inventory_product_type_filter
+python manage.py test core.tests.test_supplier
+```
 
 ---
 
 ## License
 
-This project is proprietary. All rights reserved.
+This project is proprietary and confidential. All rights reserved.

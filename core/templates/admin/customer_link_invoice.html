@@ -1,0 +1,130 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block breadcrumbs %}
+<div class="px-4 py-3 bg-gray-50 border-b border-gray-200 text-sm text-gray-600 flex items-center gap-2">
+    <a href="{% url 'admin:index' %}" class="hover:text-blue-600">Home</a>
+    <span>&rsaquo;</span>
+    <a href="{% url 'admin:core_customer_changelist' %}" class="hover:text-blue-600">Customers</a>
+    <span>&rsaquo;</span>
+    <a href="{% url 'admin:core_customer_change' customer.pk %}" class="hover:text-blue-600">{{ customer.customer_name }}</a>
+    <span>&rsaquo;</span>
+    <span class="text-gray-900 font-semibold">Link Sales Invoice by Number</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto p-6 space-y-6">
+
+    <!-- Header & AR Summary Banner -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+            <span class="text-xs font-bold uppercase tracking-wider text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded">Accounts Receivable & Invoicing</span>
+            <h1 class="text-2xl font-bold text-gray-900 mt-2">{{ customer.customer_name }}</h1>
+            <p class="text-sm text-gray-500 mt-1">
+                Contact: {{ customer.contact_info|default:"N/A" }} &bull; Address: {{ customer.shipping_address|default:"N/A" }}
+            </p>
+        </div>
+        <div class="flex items-center gap-4 bg-gray-50 p-4 rounded-lg border border-gray-200">
+            <div class="text-right">
+                <span class="text-xs font-medium text-gray-500 uppercase">Current Open Invoices</span>
+                <div class="text-2xl font-bold text-gray-900">{{ current_invoices_count }}</div>
+            </div>
+            <div class="h-10 w-px bg-gray-300"></div>
+            <div class="text-right">
+                <span class="text-xs font-medium text-gray-500 uppercase">Outstanding Receivables</span>
+                <div class="text-2xl font-bold text-red-600">${{ total_debt|floatformat:2 }}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Direct Invoice Number Linking Form -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+        <h2 class="text-base font-semibold text-gray-900 mb-2">Link Invoice by Number</h2>
+        <p class="text-sm text-gray-500 mb-6">
+            Enter the exact invoice number (e.g., <code class="bg-gray-100 px-1.5 py-0.5 rounded text-gray-800 font-mono">SINV-202608-0001</code>) or numeric ID to attach it to <strong>{{ customer.customer_name }}</strong>.
+        </p>
+
+        <form method="POST" action="{% url 'admin:customer-link-invoice' customer.pk %}" class="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
+            {% csrf_token %}
+            <div class="w-full sm:w-96">
+                <label for="id_invoice_number" class="sr-only">Invoice Number</label>
+                <input type="text" name="invoice_number" id="id_invoice_number" required
+                       placeholder="Enter Invoice # (e.g. SINV-202608-0001)"
+                       class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 font-mono shadow-sm" />
+            </div>
+            <button type="submit"
+                    class="inline-flex items-center justify-center px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-sm rounded-lg shadow-sm transition-colors">
+                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
+                </svg>
+                Link Invoice to Customer
+            </button>
+            <a href="{% url 'admin:core_customer_change' customer.pk %}"
+               class="px-4 py-2.5 border border-gray-300 text-gray-700 hover:bg-gray-50 font-medium text-sm rounded-lg transition-colors">
+                Cancel
+            </a>
+        </form>
+    </div>
+
+    <!-- Available Unassigned Invoices (Optional 1-Click Link) -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+        <div class="px-6 py-4 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
+            <div>
+                <h2 class="text-base font-semibold text-gray-900">Unassigned Sales Invoices</h2>
+                <p class="text-xs text-gray-500 mt-0.5">Invoices in the system currently without an assigned customer</p>
+            </div>
+            <span class="text-xs font-semibold bg-gray-200 text-gray-700 px-2.5 py-1 rounded-full">
+                {{ unassigned_invoices|length }} available
+            </span>
+        </div>
+
+        {% if unassigned_invoices %}
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200 text-sm">
+                <thead class="bg-gray-50 text-gray-600 font-medium">
+                    <tr>
+                        <th class="px-6 py-3 text-left">Invoice #</th>
+                        <th class="px-6 py-3 text-left">Invoice Date</th>
+                        <th class="px-6 py-3 text-right">Total Amount</th>
+                        <th class="px-6 py-3 text-right">Outstanding Balance</th>
+                        <th class="px-6 py-3 text-center">Status</th>
+                        <th class="px-6 py-3 text-right">Action</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200 bg-white">
+                    {% for inv in unassigned_invoices %}
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 font-mono font-medium text-gray-900">{{ inv.invoice_number }}</td>
+                        <td class="px-6 py-4 text-gray-600">{{ inv.invoice_date }}</td>
+                        <td class="px-6 py-4 text-right font-medium text-gray-900">${{ inv.total_amount|floatformat:2 }}</td>
+                        <td class="px-6 py-4 text-right font-semibold text-red-600">${{ inv.remaining_balance|floatformat:2 }}</td>
+                        <td class="px-6 py-4 text-center">
+                            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                                {{ inv.get_status_display }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 text-right">
+                            <form method="POST" action="{% url 'admin:customer-link-invoice' customer.pk %}" class="inline">
+                                {% csrf_token %}
+                                <input type="hidden" name="invoice_number" value="{{ inv.invoice_number }}" />
+                                <button type="submit"
+                                        class="inline-flex items-center px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 font-medium text-xs rounded-md transition-colors">
+                                    + Attach to Customer
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="p-8 text-center text-gray-500">
+            <p class="text-sm">No unassigned invoices currently in the system. Use the form above to link any invoice by its number.</p>
+        </div>
+        {% endif %}
+    </div>
+
+</div>
+{% endblock %}
