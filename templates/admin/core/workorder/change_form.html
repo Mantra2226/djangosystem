@@ -2,9 +2,9 @@
 {% load i18n admin_urls %}
 
 {% block object-tools-items %}
-    {% if original.pk and original.status == 'DRAFT' %}
+    {% if original.status == 'DRAFT' or original.status == 'PENDING' or original.status == 'READY_TO_START' %}
         <li>
-            <a href="{% url 'admin:workorder-start-production' original.pk %}" class="button" style="background:#28a745; color:white !important; font-weight:bold; padding: 6px 14px; border-radius: 4px; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <a href="{% url 'admin:workorder-preflight-start' original.pk %}" class="button" style="background:#28a745; color:white !important; font-weight:bold; padding: 6px 14px; border-radius: 4px; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
                 Start Production
             </a>
         </li>

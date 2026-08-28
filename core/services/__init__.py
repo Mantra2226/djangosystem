@@ -23,6 +23,11 @@ from .mrp_services import (
     resolve_intermediate_hold_active,
     resolve_intermediate_partial_batch,
     check_and_auto_resume_on_hold_orders,
+    get_preflight_production_summary,
+)
+from .logging_service import (
+    log_execution_event,
+    bulk_log_execution_events,
 )
 from .billing_services import (
     preview_customer_bulk_allocation,
@@ -32,6 +37,8 @@ from .billing_services import (
 )
 
 __all__ = [
+    'log_execution_event',
+    'bulk_log_execution_events',
     'ProductionReconciliationError',
     'ProductionReconciliationEngine',
     'explode_material_requirements',
@@ -45,6 +52,7 @@ __all__ = [
     'resolve_intermediate_hold_active',
     'resolve_intermediate_partial_batch',
     'check_and_auto_resume_on_hold_orders',
+    'get_preflight_production_summary',
     'preview_customer_bulk_allocation',
     'execute_customer_bulk_allocation',
     'apply_customer_credit_notes_to_invoice',

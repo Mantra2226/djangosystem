@@ -16,6 +16,7 @@ from django.core.exceptions import ValidationError, ObjectDoesNotExist, Permissi
 from django.db import models
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
@@ -30,7 +31,7 @@ from .models import (
     StockTransaction, Employee, ProductionOrder, ProductionOrderItem, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
     SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction,
     BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine,
-    DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
+    DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine, ProcessExecutionLog
 )
 from .forms import WorkOrderForm
 from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf, generate_finance_entry_pdf
@@ -555,6 +556,95 @@ class ProductionOrderItemInline(TabularInline):
         return format_html('<span class="text-xs text-gray-500 font-medium">{}</span>', obj.get_resolution_status_display())
 
 
+class ProcessExecutionLogInline(TabularInline):
+    model = ProcessExecutionLog
+    extra = 0
+    can_delete = False
+    max_num = 0
+    ordering = ['-created_at']
+    fields = (
+        'created_at_display',
+        'level_badge',
+        'process_type_badge',
+        'message_display',
+        'details_display',
+        'logged_by_display',
+    )
+    readonly_fields = (
+        'created_at_display',
+        'level_badge',
+        'process_type_badge',
+        'message_display',
+        'details_display',
+        'logged_by_display',
+    )
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @display(description='Timestamp')
+    def created_at_display(self, obj):
+        if not obj or not obj.created_at:
+            return "-"
+        return obj.created_at.strftime('%Y-%m-%d %H:%M:%S')
+
+    @display(description='Level')
+    def level_badge(self, obj):
+        color_map = {
+            'DEBUG': ('#64748b', '#ffffff'),
+            'INFO': ('#10b981', '#ffffff'),
+            'WARNING': ('#f59e0b', '#ffffff'),
+            'ERROR': ('#ef4444', '#ffffff'),
+        }
+        bg, fg = color_map.get(obj.level, ('#64748b', '#ffffff'))
+        return render_status_badge(obj.get_level_display(), bg, text_color=fg)
+
+    @display(description='Process Type')
+    def process_type_badge(self, obj):
+        type_color_map = {
+            'MRP_EVALUATION': '#0284c7',      # Sky Blue
+            'PO_DRAFT': '#8b5cf6',            # Violet
+            'BATCH_DOWNSCALE': '#d97706',      # Amber Orange
+            'AUTO_RESUME': '#059669',          # Emerald Teal
+            'RECONCILIATION': '#2563eb',       # Royal Blue
+            'ORDER_SYNC': '#4f46e5',           # Indigo
+            'AVCO_RECALCULATION': '#7c3aed',   # Purple
+        }
+        bg = type_color_map.get(obj.process_type, '#64748b')
+        return render_status_badge(obj.get_process_type_display(), bg)
+
+    @display(description='Message')
+    def message_display(self, obj):
+        if not obj:
+            return "-"
+        return format_html(
+            '<div style="max-width: 420px; word-break: break-word; font-size: 12px; color: #334155; line-height: 1.4;">{}</div>',
+            obj.message
+        )
+
+    @display(description='Structured Details')
+    def details_display(self, obj):
+        if not obj or not obj.details:
+            return "-"
+        import json
+        formatted = json.dumps(obj.details, indent=2)
+        return format_html(
+            '<details><summary style="cursor: pointer; color: #2563eb; font-size: 11px; font-weight: 600;">View JSON</summary>'
+            '<pre style="max-width: 320px; max-height: 150px; overflow: auto; font-size: 10px; background: #f8fafc; padding: 6px; border-radius: 4px; border: 1px solid #e2e8f0;">{}</pre>'
+            '</details>',
+            formatted
+        )
+
+    @display(description='Logged By')
+    def logged_by_display(self, obj):
+        if obj.logged_by:
+            return obj.logged_by.get_full_name() or obj.logged_by.username
+        return mark_safe('<span style="color: #94a3b8; font-style: italic;">System Event</span>')
+
+
 @admin.register(ProductionOrderItem)
 class ProductionOrderItemAdmin(ModelAdmin):
     list_display = ('raw_material', 'production_order', 'planned_quantity', 'shortage_quantity', 'resolution_status_badge', 'linked_purchase_order', 'resolved_at')
@@ -598,12 +688,12 @@ class ProductionOrderItemAdmin(ModelAdmin):
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(ModelAdmin):
     form = ProductionOrderAdminForm
-    inlines = [ProductionOrderItemInline]
+    inlines = [ProductionOrderItemInline, ProcessExecutionLogInline]
     list_display = ('production_order_code', 'product', 'work_order_link', 'quantity', 'status_badge', 'mrp_status_badge', 'get_unit_cost', 'created_at')
     list_filter = ['status', ('created_at', RangeDateFilter)]
     search_fields = ('production_order_code', 'work_order__work_order_code', 'employee__employee_name', 'product__name')
     filter_horizontal = ('employee',)
-    readonly_fields = ['production_order_code', 'status', 'is_mrp_resolved', 'resolution_applied', 'resolved_at', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
+    readonly_fields = ['production_order_code', 'milestone_stepper', 'status', 'is_mrp_resolved', 'resolution_applied', 'resolved_at', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
     autocomplete_fields = ['product', 'work_order']
     actions = [export_as_csv, 'trigger_mrp_auto_resume']
     actions_detail = ['action_trigger_mrp_resume', 'action_evaluate_mrp_button']
@@ -837,10 +927,149 @@ class ProductionOrderAdmin(ModelAdmin):
         return obj.quantity or "0.00"
 
     @display(description='Batch Unit Cost')
+    @display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
         return f"${obj.unit_cost:,.2f}"
 
+    @display(description='Manufacturing Lifecycle Milestone Stepper')
+    def milestone_stepper(self, obj):
+        if not obj or not obj.pk:
+            return mark_safe('<div style="color: #94a3b8; font-style: italic;">Save Production Order to render execution milestones.</div>')
+
+        status = (obj.status or '').upper().strip()
+        wo = obj.work_order
+        wo_status = (wo.status or '').upper().strip() if wo else ''
+
+        # Step 1: MRP Check
+        has_shortages = obj.has_unresolved_shortages or status in ['ON_HOLD_SHORTAGE', 'PARTIALLY_RESOLVED']
+        is_mrp_ok = (obj.is_mrp_resolved or status in ['READY_TO_START', 'MRP_RESOLVED', 'IN_PROGRESS', 'COMPLETED']) and not has_shortages
+
+        if is_mrp_ok:
+            s1_title = 'MRP Verified'
+            s1_desc = 'No shortages or all items resolved'
+            s1_bg = '#10b981'  # Emerald Green
+            s1_badge = 'VERIFIED'
+        elif status == 'AWAITING_PROCUREMENT':
+            s1_title = 'MRP Planned'
+            s1_desc = 'Shortages routed to procurement'
+            s1_bg = '#8b5cf6'  # Violet
+            s1_badge = 'PLANNED'
+        elif has_shortages:
+            s1_title = 'MRP Shortage'
+            s1_desc = 'Unresolved material shortages detected'
+            s1_bg = '#f59e0b'  # Amber
+            s1_badge = 'SHORTAGE DETECTED'
+        else:
+            s1_title = 'MRP Check'
+            s1_desc = 'Pending BOM evaluation'
+            s1_bg = '#64748b'  # Slate
+            s1_badge = 'PENDING'
+
+        # Step 2: Procurement Gate
+        if status == 'AWAITING_PROCUREMENT':
+            s2_title = 'Procurement Gate'
+            s2_desc = 'Awaiting delivery of drafted PO stock'
+            s2_bg = '#8b5cf6'  # Violet
+            s2_badge = 'AWAITING PROCUREMENT'
+        elif status in ['READY_TO_START', 'MRP_RESOLVED', 'IN_PROGRESS', 'COMPLETED']:
+            s2_title = 'Procurement Cleared'
+            s2_desc = 'Stock verified in warehouse'
+            s2_bg = '#10b981'  # Emerald Green
+            s2_badge = 'READY TO START'
+        elif has_shortages:
+            s2_title = 'Procurement Gate'
+            s2_desc = 'Blocked by unresolved shortages'
+            s2_bg = '#ef4444'  # Red
+            s2_badge = 'ACTION REQUIRED'
+        else:
+            s2_title = 'Procurement Gate'
+            s2_desc = 'Pending clearance'
+            s2_bg = '#64748b'  # Slate
+            s2_badge = 'PENDING'
+
+        # Step 3: Production Run
+        if status == 'COMPLETED' or wo_status == 'COMPLETED':
+            s3_title = 'Production Run'
+            s3_desc = 'Reconciled & output posted to ledger'
+            s3_bg = '#10b981'  # Emerald Green
+            s3_badge = 'COMPLETED'
+        elif status == 'IN_PROGRESS' or wo_status == 'IN_PROGRESS':
+            s3_title = 'Production Run'
+            s3_desc = 'Shop floor execution in progress'
+            s3_bg = '#2563eb'  # Royal Blue
+            s3_badge = 'IN PROGRESS'
+        elif status in ['READY_TO_START', 'MRP_RESOLVED']:
+            s3_title = 'Production Run'
+            s3_desc = 'Ready for floor commencement'
+            s3_bg = '#059669'  # Teal
+            s3_badge = 'READY'
+        else:
+            s3_title = 'Production Run'
+            s3_desc = 'Queued behind procurement'
+            s3_bg = '#64748b'  # Slate
+            s3_badge = 'QUEUED'
+
+        html = f"""
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; border-bottom: 1px solid #f1f5f9; padding-bottom: 12px;">
+                <div style="font-size: 13px; font-weight: 700; color: #1e293b; text-transform: uppercase; letter-spacing: 0.05em; display: flex; align-items: center; gap: 8px;">
+                    <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #2563eb;"></span>
+                    Manufacturing Lifecycle Milestone Stepper
+                </div>
+                <div style="font-size: 12px; color: #64748b; font-weight: 500;">
+                    Order: <strong style="color: #0f172a;">{obj.production_order_code or f'#{obj.pk}'}</strong> | Status: <strong style="color: #0f172a;">{obj.get_status_display()}</strong>
+                </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 12px;">
+                <!-- STEP 1: MRP CHECK -->
+                <div style="background: #f8fafc; border: 1.5px solid {s1_bg}; border-radius: 10px; padding: 14px 16px; position: relative;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Step 1</span>
+                        <span style="background: {s1_bg}; color: #ffffff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase;">{s1_badge}</span>
+                    </div>
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 2px;">{s1_title}</div>
+                    <div style="font-size: 11px; color: #64748b; line-height: 1.3;">{s1_desc}</div>
+                </div>
+
+                <!-- CONNECTOR 1 -->
+                <div style="display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 18px; font-weight: 700;">
+                    ➔
+                </div>
+
+                <!-- STEP 2: PROCUREMENT GATE -->
+                <div style="background: #f8fafc; border: 1.5px solid {s2_bg}; border-radius: 10px; padding: 14px 16px; position: relative;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Step 2</span>
+                        <span style="background: {s2_bg}; color: #ffffff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase;">{s2_badge}</span>
+                    </div>
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 2px;">{s2_title}</div>
+                    <div style="font-size: 11px; color: #64748b; line-height: 1.3;">{s2_desc}</div>
+                </div>
+
+                <!-- CONNECTOR 2 -->
+                <div style="display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 18px; font-weight: 700;">
+                    ➔
+                </div>
+
+                <!-- STEP 3: PRODUCTION RUN -->
+                <div style="background: #f8fafc; border: 1.5px solid {s3_bg}; border-radius: 10px; padding: 14px 16px; position: relative;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Step 3</span>
+                        <span style="background: {s3_bg}; color: #ffffff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase;">{s3_badge}</span>
+                    </div>
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 2px;">{s3_title}</div>
+                    <div style="font-size: 11px; color: #64748b; line-height: 1.3;">{s3_desc}</div>
+                </div>
+            </div>
+        </div>
+        """
+        return mark_safe(html)
+
     fieldsets = (
+        ('Manufacturing Milestones', {
+            'fields': ('milestone_stepper',)
+        }),
         ('Order Information', {
             'fields': ('production_order_code', 'product', 'work_order', 'quantity', 'status')
         }),
@@ -2068,7 +2297,7 @@ class WorkOrderAdmin(ModelAdmin):
     list_display = ('work_order_code', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
     list_display_links = ('work_order_code',)
     readonly_fields = ['work_order_code', 'category', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
-    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
+    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline, ProcessExecutionLogInline]
     autocomplete_fields = ['product', 'bill_of_material', 'parent_work_order']
     list_filter = ['category', 'status', 'is_inventory_updated', ('production_start_date', RangeDateFilter)]
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
@@ -2267,6 +2496,11 @@ class WorkOrderAdmin(ModelAdmin):
         urls = super().get_urls()
         custom_urls = [
             path(
+                '<int:object_id>/preflight-start/',
+                self.admin_site.admin_view(self.preflight_start_view),
+                name='workorder-preflight-start',
+            ),
+            path(
                 '<int:object_id>/start-production/',
                 self.admin_site.admin_view(self.start_production_view),
                 name='workorder-start-production',
@@ -2298,6 +2532,47 @@ class WorkOrderAdmin(ModelAdmin):
             ),
         ]
         return custom_urls + urls
+
+    def preflight_start_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_start_production')):
+            raise PermissionDenied("You do not have permission to start production on work orders.")
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+
+        if request.method == 'POST':
+            try:
+                success, message = work_order.start_production()
+                if success:
+                    self.message_user(request, message, level=messages.SUCCESS)
+                else:
+                    self.message_user(request, message, level=messages.WARNING)
+            except ValidationError as e:
+                if hasattr(e, 'message_dict'):
+                    for field, msgs in e.message_dict.items():
+                        for msg in msgs:
+                            field_label = field.replace('_', ' ').title() if field != '__all__' else 'Validation Error'
+                            self.message_user(request, f"{field_label}: {msg}", level=messages.ERROR)
+                elif hasattr(e, 'messages'):
+                    for msg in e.messages:
+                        self.message_user(request, msg, level=messages.ERROR)
+                else:
+                    self.message_user(request, str(e), level=messages.ERROR)
+            except Exception as e:
+                self.message_user(request, f"Failed to start work order: {str(e)}", level=messages.ERROR)
+
+            return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
+        from .services import get_preflight_production_summary
+        summary = get_preflight_production_summary(work_order)
+
+        context = {
+            **self.admin_site.each_context(request),
+            'opts': self.model._meta,
+            'original': work_order,
+            'title': f"Pre-Flight Production Start: {work_order.work_order_code or f'WO #{work_order.pk}'}",
+            'summary': summary,
+            'object_id': object_id,
+        }
+        return TemplateResponse(request, 'admin/core/workorder/preflight_start_confirmation.html', context)
 
     def resolve_shortage_view(self, request, object_id, choice):
         if not (request.user.is_superuser or request.user.has_perm('core.can_resolve_shortage')):
@@ -2455,3 +2730,61 @@ class MaterialVarianceRecordAdmin(ModelAdmin):
         }
         bg = color_map.get(obj.variance_classification, '#64748b')
         return render_status_badge(obj.get_variance_classification_display(), bg)
+
+
+@admin.register(ProcessExecutionLog)
+class ProcessExecutionLogAdmin(ModelAdmin):
+    list_display = ('log_id', 'created_at', 'level_badge', 'process_type_badge', 'message_snippet', 'order_link', 'logged_by')
+    list_filter = ['process_type', 'level', ('created_at', RangeDateFilter)]
+    search_fields = ('message', 'production_order__production_order_code', 'work_order__work_order_code')
+    readonly_fields = [f.name for f in ProcessExecutionLog._meta.fields]
+    actions = [export_as_csv]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    @display(description='Level')
+    def level_badge(self, obj):
+        color_map = {
+            'DEBUG': ('#64748b', '#ffffff'),
+            'INFO': ('#10b981', '#ffffff'),
+            'WARNING': ('#f59e0b', '#ffffff'),
+            'ERROR': ('#ef4444', '#ffffff'),
+        }
+        bg, fg = color_map.get(obj.level, ('#64748b', '#ffffff'))
+        return render_status_badge(obj.get_level_display(), bg, text_color=fg)
+
+    @display(description='Process Type')
+    def process_type_badge(self, obj):
+        type_color_map = {
+            'MRP_EVALUATION': '#0284c7',
+            'PO_DRAFT': '#8b5cf6',
+            'BATCH_DOWNSCALE': '#d97706',
+            'AUTO_RESUME': '#059669',
+            'RECONCILIATION': '#2563eb',
+            'ORDER_SYNC': '#4f46e5',
+            'AVCO_RECALCULATION': '#7c3aed',
+        }
+        bg = type_color_map.get(obj.process_type, '#64748b')
+        return render_status_badge(obj.get_process_type_display(), bg)
+
+    @display(description='Message')
+    def message_snippet(self, obj):
+        return obj.message[:100] + ('...' if len(obj.message) > 100 else '')
+
+    @display(description='Linked Order')
+    def order_link(self, obj):
+        if obj.production_order:
+            url = reverse('admin:core_productionorder_change', args=[obj.production_order.pk])
+            return format_html('<a href="{}" style="color: #2563eb; font-weight: 600;">PO #{}</a>', url, obj.production_order.production_order_code or obj.production_order.pk)
+        elif obj.work_order:
+            url = reverse('admin:core_workorder_change', args=[obj.work_order.pk])
+            return format_html('<a href="{}" style="color: #2563eb; font-weight: 600;">WO #{}</a>', url, obj.work_order.work_order_code or obj.work_order.pk)
+        return "-"
+

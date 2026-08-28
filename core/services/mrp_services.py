@@ -4,15 +4,17 @@ Handles BOM explosion, shortage evaluation, auto-drafting POs, and MRP state man
 """
 
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Sum, Q
 from django.utils import timezone
 from core.models import (
     Product, BillOfMaterial, BOMItem, Inventory, ProductionOrder, ProductionOrderItem,
-    WorkOrder, PurchaseOrder, PurchaseOrderItem, ProcurementOrder
+    WorkOrder, WorkOrderMaterialLine, PurchaseOrder, PurchaseOrderItem, ProcurementOrder,
+    ProcessExecutionLog
 )
+from core.services.logging_service import log_execution_event
 
 
 def explode_material_requirements(product, target_quantity=Decimal('1.0000'), visited=None):
@@ -145,6 +147,46 @@ def evaluate_mrp_shortages(production_order):
             'supplier': getattr(component, 'supplier', None),
         })
 
+    # Log MRP Evaluation summary
+    shortage_count = sum(1 for s in shortage_report if s['has_shortage'])
+    shortfall_items = [
+        f"{s['component'].name}: needed={s['required_qty']}, avail={s['available_qty']}, short={s['shortfall_qty']}"
+        for s in shortage_report if s['shortfall_qty'] > Decimal('0.00')
+    ]
+    log_level = 'WARNING' if shortage_count > 0 else 'INFO'
+    summary_msg = (
+        f"MRP Evaluation completed for {production_order.production_order_code or f'PO #{production_order.pk}'}: "
+        f"{len(shortage_report)} components scanned, {shortage_count} shortage line(s) detected."
+    )
+    if shortfall_items:
+        summary_msg += f" Details: {'; '.join(shortfall_items)}"
+
+    log_execution_event(
+        process_type='MRP_EVALUATION',
+        message=summary_msg,
+        level=log_level,
+        details={
+            'production_order_id': production_order.pk,
+            'production_order_code': production_order.production_order_code,
+            'target_quantity': float(target_qty),
+            'scanned_components_count': len(shortage_report),
+            'shortage_lines_count': shortage_count,
+            'lines': [
+                {
+                    'component_id': s['component'].pk,
+                    'component_name': s['component'].name,
+                    'required_qty': float(s['required_qty']),
+                    'available_qty': float(s['available_qty']),
+                    'shortfall_qty': float(s['shortfall_qty']),
+                    'resolution_status': s['resolution_status'],
+                }
+                for s in shortage_report
+            ]
+        },
+        production_order=production_order,
+        work_order=work_order
+    )
+
     return shortage_report
 
 
@@ -209,6 +251,22 @@ def resolve_raw_autodraft_po(production_order, component_id, shortfall_qty):
             note_msg = f"[MRP RESOLVED] Appended {shortfall} units of {component.name} to Draft PO #{po.po_number}."
             production_order.notes = f"{production_order.notes or ''}\n{note_msg}".strip()
             production_order.save(update_fields=['notes'])
+
+            log_execution_event(
+                process_type='PO_DRAFT',
+                message=f"Auto-drafted Purchase Order #{po.po_number or po.pk} for {component.name} ({shortfall} {component.unit_of_measurement or 'units'}) from supplier {component.supplier.name}.",
+                level='INFO',
+                details={
+                    'component_id': component.pk,
+                    'component_name': component.name,
+                    'shortfall_quantity': float(shortfall),
+                    'purchase_order_id': po.pk,
+                    'po_number': po.po_number,
+                    'supplier_id': component.supplier.pk,
+                    'supplier_name': component.supplier.name,
+                },
+                production_order=production_order
+            )
 
     po.refresh_from_db()
     return po
@@ -359,6 +417,20 @@ def resolve_batch_downscale(production_order, bottleneck_component_id):
 
         production_order.update_mrp_resolution_state()
         production_order.refresh_from_db()
+
+        log_execution_event(
+            process_type='BATCH_DOWNSCALE',
+            message=f"Downscaled batch target for {production_order.production_order_code or f'PO #{production_order.pk}'} to {max_producible} units based on available stock of {component.name} ({avail:.2f} available).",
+            level='INFO',
+            details={
+                'bottleneck_component_id': component.pk,
+                'bottleneck_component_name': component.name,
+                'available_stock': float(avail),
+                'new_target_quantity': float(max_producible),
+            },
+            production_order=production_order,
+            work_order=production_order.work_order
+        )
 
     return production_order
 
@@ -556,4 +628,179 @@ def check_and_auto_resume_on_hold_orders(product=None):
                 po.save(update_fields=['notes'])
                 resumed_orders.append(po)
 
+                log_execution_event(
+                    process_type='AUTO_RESUME',
+                    message=f"Stock replenishment verified. Auto-resumed Production Order {po.production_order_code or po.pk} to {po.get_status_display()}.",
+                    level='INFO',
+                    details={
+                        'production_order_id': po.pk,
+                        'production_order_code': po.production_order_code,
+                        'new_status': po.status,
+                        'resolution_applied': po.resolution_applied,
+                    },
+                    production_order=po,
+                    work_order=po.work_order
+                )
+
     return resumed_orders
+
+
+# =========================================================================
+# PRE-FLIGHT PRODUCTION START DIAGNOSTIC SUMMARY SERVICE
+# =========================================================================
+
+def get_preflight_production_summary(work_order):
+    """
+    PRE-FLIGHT PRODUCTION DIAGNOSTIC SUMMARY SERVICE
+    Generates a pre-flight production diagnostic summary for a WorkOrder prior to commitment.
+
+    Evaluates:
+    1. Per-component BOM requirements against unallocated warehouse inventory.
+    2. Accounts for supervisor-authorized OVERRIDDEN (or resolved) ProductionOrderItems,
+       which permit is_ready=True even if raw physical stock is short.
+    3. Scans concurrent IN_PROGRESS WorkOrders holding active material allocations for shared components.
+    4. Retrieves recent ProcessExecutionLog entries linked to the WorkOrder and linked ProductionOrders.
+    5. Determines holistic readiness verdict (is_ready).
+    """
+    if not work_order:
+        return {
+            'work_order': None,
+            'target_quantity': Decimal('0.00'),
+            'bill_of_material': None,
+            'product_name': "N/A",
+            'component_readiness': [],
+            'concurrent_runs': [],
+            'recent_logs': [],
+            'is_ready': False,
+            'has_shortages': False,
+            'po_unresolved_shortages': False,
+        }
+
+    target_qty = getattr(work_order, 'target_quantity', Decimal('0.00')) or Decimal('0.00')
+    bom = work_order.bill_of_material or (work_order.product.boms.filter(is_active=True).first() if work_order.product else None)
+
+    linked_pos = list(work_order.production_runs.all()) if work_order.pk else []
+
+    overridden_product_ids = set()
+    po_unresolved_shortages = False
+    for po in linked_pos:
+        if po.has_unresolved_shortages or po.status in ['ON_HOLD_SHORTAGE', 'PARTIALLY_RESOLVED', 'AWAITING_RESOLUTION']:
+            po_unresolved_shortages = True
+        for item in po.items.all():
+            if item.resolution_status in ['OVERRIDDEN', 'RESOLVED', 'NO_SHORTAGE', 'DOWNSCALED']:
+                overridden_product_ids.add(item.raw_material_id)
+
+    component_readiness = []
+    if bom:
+        for item in bom.items.select_related('component').all():
+            component = item.component
+            per_unit_req = item.quantity_required or Decimal('0.00')
+            required_qty = (per_unit_req * target_qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            available_qty = Inventory.objects.filter(
+                product=component
+            ).aggregate(total=Sum('quantity_available'))['total'] or Decimal('0.00')
+
+            shortfall_qty = max(Decimal('0.00'), required_qty - available_qty)
+            is_overridden = component.pk in overridden_product_ids
+            is_sufficient = (available_qty >= required_qty) or is_overridden
+
+            if is_overridden:
+                status_label = 'Overridden (Authorized)'
+                status_color = '#0284c7'
+            elif available_qty >= required_qty:
+                status_label = 'Sufficient'
+                status_color = '#10b981'
+            else:
+                status_label = 'Shortage'
+                status_color = '#ef4444'
+
+            component_readiness.append({
+                'component': component,
+                'component_id': component.pk,
+                'component_name': component.name,
+                'sku': component.sku,
+                'product_type': component.product_type,
+                'product_type_display': component.get_product_type_display(),
+                'quantity_required_per_unit': per_unit_req,
+                'required_qty': required_qty,
+                'available_qty': available_qty,
+                'shortfall_qty': shortfall_qty,
+                'is_sufficient': is_sufficient,
+                'is_overridden': is_overridden,
+                'status_label': status_label,
+                'status_color': status_color,
+            })
+
+    # Concurrent active run allocation scan
+    component_ids = [c['component_id'] for c in component_readiness]
+    concurrent_runs = []
+    if component_ids and work_order.pk:
+        active_wos = WorkOrder.objects.filter(
+            status='IN_PROGRESS'
+        ).exclude(pk=work_order.pk).prefetch_related(
+            'material_lines__component',
+            'bill_of_material__items__component',
+            'product'
+        )
+
+        for act_wo in active_wos:
+            shared_components_map = {}
+            for mat_line in act_wo.material_lines.all():
+                if mat_line.component_id in component_ids:
+                    alloc = mat_line.quantity_allocated or mat_line.quantity_expected
+                    shared_components_map[mat_line.component.name] = alloc
+
+            if not shared_components_map and act_wo.bill_of_material:
+                act_target = act_wo.target_quantity
+                for b_item in act_wo.bill_of_material.items.all():
+                    if b_item.component_id in component_ids:
+                        alloc = (b_item.quantity_required * act_target).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        shared_components_map[b_item.component.name] = alloc
+
+            if shared_components_map:
+                total_alloc = sum(shared_components_map.values(), Decimal('0.00'))
+                concurrent_runs.append({
+                    'work_order': act_wo,
+                    'work_order_id': act_wo.pk,
+                    'work_order_code': act_wo.work_order_code or f"WO #{act_wo.pk}",
+                    'product_name': act_wo.product.name if act_wo.product else "N/A",
+                    'target_quantity': act_wo.target_quantity,
+                    'shared_components': list(shared_components_map.keys()),
+                    'shared_components_breakdown': shared_components_map,
+                    'total_allocated_qty': total_alloc,
+                })
+
+    # Recent Process Execution Logs
+    recent_logs = []
+    if work_order.pk:
+        log_query = Q(work_order=work_order)
+        if linked_pos:
+            log_query = log_query | Q(production_order__in=linked_pos)
+        recent_logs = list(
+            ProcessExecutionLog.objects.filter(log_query)
+            .select_related('logged_by', 'production_order', 'work_order')
+            .order_by('-created_at')[:10]
+        )
+
+    has_shortages = any(not c['is_sufficient'] for c in component_readiness)
+    is_ready = bool(
+        bom and
+        component_readiness and
+        target_qty > Decimal('0.00') and
+        not has_shortages and
+        not po_unresolved_shortages
+    )
+
+    return {
+        'work_order': work_order,
+        'target_quantity': target_qty,
+        'bill_of_material': bom,
+        'product_name': work_order.product.name if work_order.product else "N/A",
+        'component_readiness': component_readiness,
+        'concurrent_runs': concurrent_runs,
+        'recent_logs': recent_logs,
+        'is_ready': is_ready,
+        'has_shortages': has_shortages,
+        'po_unresolved_shortages': po_unresolved_shortages,
+    }
+

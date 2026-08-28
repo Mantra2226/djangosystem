@@ -1309,6 +1309,22 @@ class WorkOrder(models.Model):
                             child_po.save(update_fields=['status'])
                         print(f"[AUTO-RESUME] Child Packaging WorkOrder #{child_wo.pk} auto-resumed to IN_PROGRESS and stock allocated.", flush=True)
 
+            try:
+                from core.services.logging_service import log_execution_event
+                log_execution_event(
+                    process_type='ORDER_SYNC',
+                    message=f"Synced Stage 1 Bulk yield ({bulk_yield} units) to child packaging order(s) for WorkOrder #{self.pk}.",
+                    level='INFO',
+                    details={
+                        'parent_work_order_id': self.pk,
+                        'bulk_yield': float(bulk_yield),
+                        'product_id': self.product_id,
+                    },
+                    work_order=self
+                )
+            except Exception:
+                pass
+
     def sync_material_lines(self):
         """
         Ensures a WorkOrderMaterialLine exists for every BOM item in the selected BillOfMaterial.
@@ -1810,12 +1826,34 @@ class ProductionOrder(models.Model):
             self.is_mrp_resolved = False
 
         if self.pk:
+            old_st = current_status
             ProductionOrder.objects.filter(pk=self.pk).update(
                 status=self.status,
                 is_mrp_resolved=self.is_mrp_resolved,
                 resolution_applied=self.resolution_applied,
                 resolved_at=self.resolved_at
             )
+            try:
+                from core.services.logging_service import log_execution_event
+                log_execution_event(
+                    process_type='ORDER_SYNC',
+                    message=f"Production Order {self.production_order_code or self.pk} state updated: {old_st} -> {self.status} (Resolution: {self.resolution_applied or 'N/A'}).",
+                    level='INFO',
+                    details={
+                        'production_order_id': self.pk,
+                        'production_order_code': self.production_order_code,
+                        'old_status': old_st,
+                        'new_status': self.status,
+                        'is_mrp_resolved': self.is_mrp_resolved,
+                        'resolution_applied': self.resolution_applied,
+                        'unresolved_count': unresolved_count,
+                        'shortage_count': shortage_count,
+                    },
+                    production_order=self,
+                    work_order=self.work_order
+                )
+            except Exception:
+                pass
 
     def evaluate_mrp(self):
         """
@@ -1919,6 +1957,26 @@ class ProductionOrder(models.Model):
             new_weighted_cost = (current_value + batch_value) / total_qty
             inventory.unit_cost = new_weighted_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             inventory.save()
+
+            try:
+                from core.services.logging_service import log_execution_event
+                log_execution_event(
+                    process_type='AVCO_RECALCULATION',
+                    message=f"Recalculated AVCO for {self.product.name}: ${current_cost:,.2f} -> ${inventory.unit_cost:,.2f} (Batch: {batch_qty} @ ${batch_cost:,.2f}).",
+                    level='INFO',
+                    details={
+                        'product_id': self.product_id,
+                        'product_name': self.product.name,
+                        'old_avco': float(current_cost),
+                        'new_avco': float(inventory.unit_cost),
+                        'batch_quantity': float(batch_qty),
+                        'batch_unit_cost': float(batch_cost),
+                    },
+                    production_order=self,
+                    work_order=self.work_order
+                )
+            except Exception:
+                pass
 
     def clean(self):
         super().clean()
@@ -3287,3 +3345,67 @@ class FinanceEntry(models.Model):
 
     def __str__(self):
         return f"{self.entry_code or f'FE-#{self.finance_entry_id}'} - {self.get_entry_type_display()} (KES {self.amount:,.2f})"
+
+
+class ProcessExecutionLog(models.Model):
+    PROCESS_TYPE_CHOICES = [
+        ('MRP_EVALUATION', 'MRP Shortage Evaluation'),
+        ('PO_DRAFT', 'Auto-Draft Purchase Order'),
+        ('BATCH_DOWNSCALE', 'Batch Downscale Target'),
+        ('AUTO_RESUME', 'Auto-Resume On-Hold Order'),
+        ('RECONCILIATION', 'Stock & Consumption Reconciliation'),
+        ('ORDER_SYNC', 'Database & Order Synchronization'),
+        ('AVCO_RECALCULATION', 'AVCO Recalculation'),
+    ]
+
+    LEVEL_CHOICES = [
+        ('DEBUG', 'Debug'),
+        ('INFO', 'Information'),
+        ('WARNING', 'Warning'),
+        ('ERROR', 'Error'),
+    ]
+
+    log_id = models.AutoField(primary_key=True)
+    process_type = models.CharField(max_length=40, choices=PROCESS_TYPE_CHOICES, db_index=True)
+    level = models.CharField(max_length=10, choices=LEVEL_CHOICES, default='INFO', db_index=True)
+    message = models.TextField(help_text="Human-readable operational execution summary.")
+    details = models.JSONField(default=dict, blank=True, help_text="Structured operational metadata, component IDs, and delta metrics.")
+    logged_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='execution_logs',
+        help_text="User/Supervisor attributing this operational execution event."
+    )
+    production_order = models.ForeignKey(
+        'ProductionOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='execution_logs',
+        help_text="Associated Production Order."
+    )
+    work_order = models.ForeignKey(
+        'WorkOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='execution_logs',
+        help_text="Associated Work Order blueprint."
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Process Execution Log"
+        verbose_name_plural = "Process Execution Logs"
+
+    def __str__(self):
+        code_ref = ""
+        if self.production_order:
+            code_ref = f" [PO: {self.production_order.production_order_code or self.production_order_id}]"
+        elif self.work_order:
+            code_ref = f" [WO: {self.work_order.work_order_code or self.work_order_id}]"
+        return f"[{self.level}] {self.get_process_type_display()}{code_ref} - {self.message[:60]}"
+
