@@ -179,6 +179,48 @@
             font-size: 12px;
             color: var(--text-muted);
             margin-top: 4px;
+            transition: color 0.15s ease;
+        }
+
+        .kpi-card-link {
+            display: block;
+            text-decoration: none !important;
+            color: inherit;
+            border-radius: 10px;
+            outline: none;
+            transition: transform 0.15s ease;
+            cursor: pointer;
+        }
+
+        .kpi-card-link:hover {
+            transform: translateY(-2px);
+        }
+
+        .kpi-card-link:hover .kpi-card {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+            border-color: #cbd5e1;
+        }
+
+        .kpi-card-link:focus-visible {
+            outline: 2px solid var(--brand-blue);
+            outline-offset: 2px;
+            border-radius: 10px;
+        }
+
+        .kpi-card-link:hover .kpi-subtext {
+            color: var(--brand-blue);
+        }
+
+        .kpi-arrow {
+            display: inline-block;
+            transition: transform 0.15s ease, opacity 0.15s ease;
+            margin-left: 4px;
+            opacity: 0.4;
+        }
+
+        .kpi-card-link:hover .kpi-arrow {
+            transform: translateX(3px);
+            opacity: 1;
         }
 
         .section-grid {
@@ -306,41 +348,75 @@
 
     <!-- Executive KPI Grid -->
     <div class="kpi-grid">
-        <div class="kpi-card green">
-            <div class="kpi-label">Total Revenue</div>
-            <div class="kpi-value">${{ pnl.total_revenue|floatformat:2 }}</div>
-            <div class="kpi-subtext">Sales Invoices & Revenue Ledger</div>
-        </div>
-        <div class="kpi-card green">
-            <div class="kpi-label">Gross Profit</div>
-            <div class="kpi-value">${{ pnl.gross_profit|floatformat:2 }}</div>
-            <div class="kpi-subtext">Margin Rate: <strong>{{ pnl.gross_margin_pct }}%</strong></div>
-        </div>
-        <div class="kpi-card red">
-            <div class="kpi-label">COGS</div>
-            <div class="kpi-value">${{ pnl.cogs|floatformat:2 }}</div>
-            <div class="kpi-subtext">Cost of Goods Sold (Dispatches)</div>
-        </div>
-        <div class="kpi-card purple">
-            <div class="kpi-label">Total COGM</div>
-            <div class="kpi-value">${{ cogm.total_cogm|floatformat:2 }}</div>
-            <div class="kpi-subtext">Completed Builds: {{ cogm.completed_orders_count }}</div>
-        </div>
-        <div class="kpi-card amber">
-            <div class="kpi-label">Yield Efficiency</div>
-            <div class="kpi-value">{{ yield_scrap.yield_rate_pct }}%</div>
-            <div class="kpi-subtext">Produced vs Target Ratio</div>
-        </div>
-        <div class="kpi-card {% if inventory_otif.low_stock_count > 0 %}red{% else %}green{% endif %}">
-            <div class="kpi-label">Low-Stock Alerts</div>
-            <div class="kpi-value">{{ inventory_otif.low_stock_count }}</div>
-            <div class="kpi-subtext">Stock &le; 10 Units</div>
-        </div>
-        <div class="kpi-card green">
-            <div class="kpi-label">Supplier OTIF %</div>
-            <div class="kpi-value">{{ inventory_otif.otif_pct }}%</div>
-            <div class="kpi-subtext">On-Time In-Full Delivery</div>
-        </div>
+        <a href="{% url 'admin:core_salesinvoice_changelist' %}{% if start_date or end_date %}?{% if start_date %}invoice_date__gte={{ start_date }}{% if end_date %}&{% endif %}{% endif %}{% if end_date %}invoice_date__lte={{ end_date }}{% endif %}{% endif %}"
+           class="kpi-card-link"
+           title="View Sales Invoices & Revenue Ledger">
+            <div class="kpi-card green">
+                <div class="kpi-label">Total Revenue</div>
+                <div class="kpi-value">${{ pnl.total_revenue|floatformat:2 }}</div>
+                <div class="kpi-subtext">Sales Invoices & Revenue Ledger <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_salesinvoice_changelist' %}{% if start_date or end_date %}?{% if start_date %}invoice_date__gte={{ start_date }}{% if end_date %}&{% endif %}{% endif %}{% if end_date %}invoice_date__lte={{ end_date }}{% endif %}{% endif %}"
+           class="kpi-card-link"
+           title="View Sales Invoices & Margin Analysis">
+            <div class="kpi-card green">
+                <div class="kpi-label">Gross Profit</div>
+                <div class="kpi-value">${{ pnl.gross_profit|floatformat:2 }}</div>
+                <div class="kpi-subtext">Margin Rate: <strong>{{ pnl.gross_margin_pct }}%</strong> <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_stocktransaction_changelist' %}?transaction_type=SHIPMENT{% if start_date %}&created_at__gte={{ start_date }}{% endif %}{% if end_date %}&created_at__lte={{ end_date }}{% endif %}"
+           class="kpi-card-link"
+           title="View Cost of Goods Sold (Dispatches)">
+            <div class="kpi-card red">
+                <div class="kpi-label">COGS</div>
+                <div class="kpi-value">${{ pnl.cogs|floatformat:2 }}</div>
+                <div class="kpi-subtext">Cost of Goods Sold (Dispatches) <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_workorder_changelist' %}?status__exact=COMPLETED{% if start_date %}&production_start_date__gte={{ start_date }}{% endif %}{% if end_date %}&production_start_date__lte={{ end_date }}{% endif %}"
+           class="kpi-card-link"
+           title="View Completed Work Orders (COGM)">
+            <div class="kpi-card purple">
+                <div class="kpi-label">Total COGM</div>
+                <div class="kpi-value">${{ cogm.total_cogm|floatformat:2 }}</div>
+                <div class="kpi-subtext">Completed Builds: {{ cogm.completed_orders_count }} <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_materialvariancerecord_changelist' %}{% if start_date or end_date %}?{% if start_date %}recorded_at__gte={{ start_date }}{% if end_date %}&{% endif %}{% endif %}{% if end_date %}recorded_at__lte={{ end_date }}{% endif %}{% endif %}"
+           class="kpi-card-link"
+           title="View Production Yield & Material Variances">
+            <div class="kpi-card amber">
+                <div class="kpi-label">Yield Efficiency</div>
+                <div class="kpi-value">{{ yield_scrap.yield_rate_pct }}%</div>
+                <div class="kpi-subtext">Produced vs Target Ratio <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_inventory_changelist' %}?low_stock=true"
+           class="kpi-card-link"
+           title="View Low-Stock Inventory Alerts">
+            <div class="kpi-card {% if inventory_otif.low_stock_count > 0 %}red{% else %}green{% endif %}">
+                <div class="kpi-label">Low-Stock Alerts</div>
+                <div class="kpi-value">{{ inventory_otif.low_stock_count }}</div>
+                <div class="kpi-subtext">Stock &le; 10 Units <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_purchaseorder_changelist' %}?status__exact=RECEIVED{% if start_date %}&order_date__gte={{ start_date }}{% endif %}{% if end_date %}&order_date__lte={{ end_date }}{% endif %}"
+           class="kpi-card-link"
+           title="View Received Purchase Orders (OTIF)">
+            <div class="kpi-card green">
+                <div class="kpi-label">Supplier OTIF %</div>
+                <div class="kpi-value">{{ inventory_otif.otif_pct }}%</div>
+                <div class="kpi-subtext">On-Time In-Full Delivery <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
     </div>
 
     <!-- Section Grid: P&L & COGM -->

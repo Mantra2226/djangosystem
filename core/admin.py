@@ -357,6 +357,21 @@ class InventoryProductTypeFilter(admin.SimpleListFilter):
         return queryset
 
 
+class LowStockFilter(admin.SimpleListFilter):
+    title = 'Stock Level'
+    parameter_name = 'low_stock'
+
+    def lookups(self, request, model_admin):
+        return [
+            ('true', 'Low Stock (≤ 10 Units)'),
+        ]
+
+    def queryset(self, request, queryset):
+        if self.value() == 'true':
+            return queryset.filter(quantity_available__lte=10)
+        return queryset
+
+
 @admin.register(Inventory)
 class InventoryAdmin(ModelAdmin):
     list_display = (
@@ -365,6 +380,7 @@ class InventoryAdmin(ModelAdmin):
         'get_unit_cost', 'get_total_valuation', 'last_updated'
     )
     list_filter = [
+        LowStockFilter,
         InventoryProductTypeFilter,
         'location',
         ('last_updated', RangeDateFilter),
