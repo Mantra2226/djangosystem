@@ -76,7 +76,7 @@ class CustomerDepositAdminTests(TestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Nairobi Glass")
-        self.assertContains(response, "$50,000.00")
+        self.assertContains(response, "KSh 50,000.00")
         self.assertContains(response, "2")
 
     def test_customer_admin_change_form_renders_ar_summary_and_action_button(self):
@@ -86,7 +86,7 @@ class CustomerDepositAdminTests(TestCase):
         self.assertEqual(response.status_code, 200)
 
         # Verify Debt amount and Action links are rendered
-        self.assertContains(response, "$50,000.00")
+        self.assertContains(response, "KSh 50,000.00")
         self.assertContains(response, "Outstanding Debt Pool")
         self.assertContains(response, "Receive Customer Deposit (FIFO)")
         self.assertContains(response, reverse('admin:customer-receive-deposit', args=[self.customer.pk]))
@@ -116,8 +116,8 @@ class CustomerDepositAdminTests(TestCase):
 
         self.assertContains(response, "Projected FIFO Allocation Breakdown")
         self.assertContains(response, "Simulated Dry-Run")
-        self.assertContains(response, "+$20000.00") # Full Inv 1
-        self.assertContains(response, "+$15000.00") # Partial Inv 2
+        self.assertContains(response, "+KSh 20,000.00") # Full Inv 1
+        self.assertContains(response, "+KSh 15,000.00") # Partial Inv 2
 
         # Ensure NO payments were recorded in database
         self.assertEqual(SalesInvoicePayments.objects.filter(invoice__customer=self.customer).count(), 0)
@@ -160,5 +160,5 @@ class CustomerDepositAdminTests(TestCase):
         # Follow redirect and verify success banner with surplus notification
         follow_resp = self.client.get(response.url)
         self.assertEqual(follow_resp.status_code, 200)
-        self.assertContains(follow_resp, "Successfully executed bulk deposit of $60,000.00 across 2 invoice(s)")
-        self.assertContains(follow_resp, "Surplus credit balance: $10,000.00")
+        self.assertContains(follow_resp, "Successfully executed bulk deposit of KSh 60,000.00 across 2 invoice(s)")
+        self.assertContains(follow_resp, "Surplus credit balance: KSh 10,000.00")

@@ -25,6 +25,8 @@ urlpatterns = [
     path('mrp_resolve_action/', views.mrp_resolve_action, name='mrp_resolve_action'),
     path('reports/', views.reports_dashboard_view, name='reports_dashboard'),
     path('admin/reports-dashboard/', views.reports_dashboard_view, name='admin_reports_dashboard'),
+    path('analytics/export/financial/', views.export_financial_analytics_excel, name='export_financial_analytics_excel'),
+    path('analytics/export/shopfloor/', views.export_shopfloor_analytics_excel, name='export_shopfloor_analytics_excel'),
 
     # Backward-compatible URL aliases
     path('home/', views.index, name='home'),

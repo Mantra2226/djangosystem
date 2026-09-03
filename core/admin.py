@@ -16,6 +16,7 @@ from django.core.exceptions import ValidationError, ObjectDoesNotExist, Permissi
 from django.db import models
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
@@ -30,10 +31,35 @@ from .models import (
     StockTransaction, Employee, ProductionOrder, ProductionOrderItem, Customer, SalesOrder, SalesOrderItem, DispatchRecord,
     SalesInvoice, Return, MaterialVarianceRecord, FinanceEntry, WorkOrder, WorkOrderInstruction,
     BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine,
-    DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine
+    DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine, ProcessExecutionLog
 )
+from django.conf import settings
 from .forms import WorkOrderForm
 from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf, generate_finance_entry_pdf
+from .admin_mixins import OpenPyXLExportMixin
+
+
+def format_admin_currency(amount, show_plus=False):
+    """
+    Standardized admin currency formatter referencing settings.CURRENCY_SYMBOL.
+    Formats positive values as: 'KSh 1,250.00'
+    Formats negative values as: '-KSh 137.55'
+    Formats zero/none values as: 'KSh 0.00'
+    """
+    symbol = getattr(settings, 'CURRENCY_SYMBOL', 'KSh')
+    if amount is None:
+        return f"{symbol} 0.00"
+    try:
+        val = Decimal(str(amount))
+    except Exception:
+        return f"{symbol} 0.00"
+
+    if val < 0:
+        return f"-{symbol} {abs(val):,.2f}"
+    elif val > 0 and show_plus:
+        return f"+{symbol} {val:,.2f}"
+    else:
+        return f"{symbol} {val:,.2f}"
 
 
 def export_as_csv(modeladmin, request, queryset):
@@ -145,14 +171,14 @@ class SalesOrderItemInline(TabularInline):
     @display(description='Catalog Unit Price')
     def get_unit_price(self, obj):
         if obj.unit_price is not None:
-            return f"${obj.unit_price:,.2f}"
-        return "$0.00"
+            return format_admin_currency(obj.unit_price)
+        return format_admin_currency(0)
 
     @display(description='Line Total')
     def get_total_price(self, obj):
         if obj.total_price:
-            return f"${obj.total_price:,.2f}"
-        return "$0.00"
+            return format_admin_currency(obj.total_price)
+        return format_admin_currency(0)
 
     def has_add_permission(self, request, obj=None):
         if obj and obj.status != 'draft' and not request.user.is_superuser:
@@ -233,8 +259,8 @@ class PurchaseOrderItemInline(TabularInline):
     @display(description='Total Cost')
     def get_total(self, obj):
         if obj.pk:
-            return f"${obj.total_price:.2f}"
-        return "$0.00"
+            return format_admin_currency(obj.total_price)
+        return format_admin_currency(0)
 
 
 # =============================================================================
@@ -297,7 +323,7 @@ class ProductAdmin(ModelAdmin):
     @display(description='Selling Price')
     def get_selling_price(self, obj):
         if obj.selling_price is not None:
-            return f"${obj.selling_price:,.2f}"
+            return format_admin_currency(obj.selling_price)
         return "-"
 
 
@@ -356,14 +382,30 @@ class InventoryProductTypeFilter(admin.SimpleListFilter):
         return queryset
 
 
+class LowStockFilter(admin.SimpleListFilter):
+    title = 'Stock Level'
+    parameter_name = 'low_stock'
+
+    def lookups(self, request, model_admin):
+        return [
+            ('true', 'Low Stock (≤ 10 Units)'),
+        ]
+
+    def queryset(self, request, queryset):
+        if self.value() == 'true':
+            return queryset.filter(quantity_available__lte=10)
+        return queryset
+
+
 @admin.register(Inventory)
-class InventoryAdmin(ModelAdmin):
+class InventoryAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = (
         'product', 'product_type_badge', 'product_category_display',
         'quantity_available', 'quantity_allocated', 'location',
         'get_unit_cost', 'get_total_valuation', 'last_updated'
     )
     list_filter = [
+        LowStockFilter,
         InventoryProductTypeFilter,
         'location',
         ('last_updated', RangeDateFilter),
@@ -372,7 +414,18 @@ class InventoryAdmin(ModelAdmin):
     search_fields = ('product__name', 'product__sku', 'product__category', 'location')
     readonly_fields = ['get_total_valuation', 'quantity_allocated']
     autocomplete_fields = ['product']
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'inventory_catalog'
+    export_fields_map = [
+        ('product.name', 'Item Name', 'text'),
+        ('product.sku', 'SKU', 'text'),
+        ('product.category', 'Category', 'text'),
+        ('quantity_available', 'Available Qty', 'decimal'),
+        ('quantity_allocated', 'Allocated Qty', 'decimal'),
+        ('unit_cost', 'Unit Cost', 'currency'),
+        ('total_valuation', 'Total Valuation', 'currency'),
+        ('location', 'Location', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('product', 'product__supplier')
@@ -401,20 +454,31 @@ class InventoryAdmin(ModelAdmin):
 
     @display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
-        return f"${obj.unit_cost:,.2f}"
+        return format_admin_currency(obj.unit_cost)
 
     @display(description='Total Valuation')
     def get_total_valuation(self, obj):
-        return f"${obj.total_valuation:,.2f}"
+        return format_admin_currency(obj.total_valuation)
 
 
 @admin.register(StockTransaction)
-class StockTransactionAdmin(ModelAdmin):
+class StockTransactionAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('product', 'quantity', 'transaction_type_badge', 'get_work_order_code', 'created_at')
     list_filter = ['transaction_type', ('created_at', RangeDateFilter)]
     search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('created_at', 'work_order', 'get_work_order_code', 'dispatch_record')
     autocomplete_fields = ['product', 'work_order', 'dispatch_record']
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'stock_movements'
+    export_fields_map = [
+        ('transaction_id', 'Transaction ID', 'integer'),
+        ('created_at', 'Timestamp', 'datetime'),
+        ('product.name', 'Product Name', 'text'),
+        ('product.sku', 'SKU', 'text'),
+        ('get_transaction_type_display', 'Transaction Type', 'text'),
+        ('quantity', 'Quantity', 'decimal'),
+        ('work_order_code', 'Work Order / Reference', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('product', 'work_order')
@@ -555,6 +619,95 @@ class ProductionOrderItemInline(TabularInline):
         return format_html('<span class="text-xs text-gray-500 font-medium">{}</span>', obj.get_resolution_status_display())
 
 
+class ProcessExecutionLogInline(TabularInline):
+    model = ProcessExecutionLog
+    extra = 0
+    can_delete = False
+    max_num = 0
+    ordering = ['-created_at']
+    fields = (
+        'created_at_display',
+        'level_badge',
+        'process_type_badge',
+        'message_display',
+        'details_display',
+        'logged_by_display',
+    )
+    readonly_fields = (
+        'created_at_display',
+        'level_badge',
+        'process_type_badge',
+        'message_display',
+        'details_display',
+        'logged_by_display',
+    )
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @display(description='Timestamp')
+    def created_at_display(self, obj):
+        if not obj or not obj.created_at:
+            return "-"
+        return obj.created_at.strftime('%Y-%m-%d %H:%M:%S')
+
+    @display(description='Level')
+    def level_badge(self, obj):
+        color_map = {
+            'DEBUG': ('#64748b', '#ffffff'),
+            'INFO': ('#10b981', '#ffffff'),
+            'WARNING': ('#f59e0b', '#ffffff'),
+            'ERROR': ('#ef4444', '#ffffff'),
+        }
+        bg, fg = color_map.get(obj.level, ('#64748b', '#ffffff'))
+        return render_status_badge(obj.get_level_display(), bg, text_color=fg)
+
+    @display(description='Process Type')
+    def process_type_badge(self, obj):
+        type_color_map = {
+            'MRP_EVALUATION': '#0284c7',      # Sky Blue
+            'PO_DRAFT': '#8b5cf6',            # Violet
+            'BATCH_DOWNSCALE': '#d97706',      # Amber Orange
+            'AUTO_RESUME': '#059669',          # Emerald Teal
+            'RECONCILIATION': '#2563eb',       # Royal Blue
+            'ORDER_SYNC': '#4f46e5',           # Indigo
+            'AVCO_RECALCULATION': '#7c3aed',   # Purple
+        }
+        bg = type_color_map.get(obj.process_type, '#64748b')
+        return render_status_badge(obj.get_process_type_display(), bg)
+
+    @display(description='Message')
+    def message_display(self, obj):
+        if not obj:
+            return "-"
+        return format_html(
+            '<div style="max-width: 420px; word-break: break-word; font-size: 12px; color: #334155; line-height: 1.4;">{}</div>',
+            obj.message
+        )
+
+    @display(description='Structured Details')
+    def details_display(self, obj):
+        if not obj or not obj.details:
+            return "-"
+        import json
+        formatted = json.dumps(obj.details, indent=2)
+        return format_html(
+            '<details><summary style="cursor: pointer; color: #2563eb; font-size: 11px; font-weight: 600;">View JSON</summary>'
+            '<pre style="max-width: 320px; max-height: 150px; overflow: auto; font-size: 10px; background: #f8fafc; padding: 6px; border-radius: 4px; border: 1px solid #e2e8f0;">{}</pre>'
+            '</details>',
+            formatted
+        )
+
+    @display(description='Logged By')
+    def logged_by_display(self, obj):
+        if obj.logged_by:
+            return obj.logged_by.get_full_name() or obj.logged_by.username
+        return mark_safe('<span style="color: #94a3b8; font-style: italic;">System Event</span>')
+
+
 @admin.register(ProductionOrderItem)
 class ProductionOrderItemAdmin(ModelAdmin):
     list_display = ('raw_material', 'production_order', 'planned_quantity', 'shortage_quantity', 'resolution_status_badge', 'linked_purchase_order', 'resolved_at')
@@ -598,12 +751,12 @@ class ProductionOrderItemAdmin(ModelAdmin):
 @admin.register(ProductionOrder)
 class ProductionOrderAdmin(ModelAdmin):
     form = ProductionOrderAdminForm
-    inlines = [ProductionOrderItemInline]
+    inlines = [ProductionOrderItemInline, ProcessExecutionLogInline]
     list_display = ('production_order_code', 'product', 'work_order_link', 'quantity', 'status_badge', 'mrp_status_badge', 'get_unit_cost', 'created_at')
     list_filter = ['status', ('created_at', RangeDateFilter)]
     search_fields = ('production_order_code', 'work_order__work_order_code', 'employee__employee_name', 'product__name')
     filter_horizontal = ('employee',)
-    readonly_fields = ['production_order_code', 'status', 'is_mrp_resolved', 'resolution_applied', 'resolved_at', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
+    readonly_fields = ['production_order_code', 'milestone_stepper', 'status', 'is_mrp_resolved', 'resolution_applied', 'resolved_at', 'mrp_resolution_pathways_viewer', 'work_order_details_viewer', 'created_at', 'completed_at']
     autocomplete_fields = ['product', 'work_order']
     actions = [export_as_csv, 'trigger_mrp_auto_resume']
     actions_detail = ['action_trigger_mrp_resume', 'action_evaluate_mrp_button']
@@ -838,9 +991,147 @@ class ProductionOrderAdmin(ModelAdmin):
 
     @display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
-        return f"${obj.unit_cost:,.2f}"
+        return format_admin_currency(obj.unit_cost)
+
+    @display(description='Manufacturing Lifecycle Milestone Stepper')
+    def milestone_stepper(self, obj):
+        if not obj or not obj.pk:
+            return mark_safe('<div style="color: #94a3b8; font-style: italic;">Save Production Order to render execution milestones.</div>')
+
+        status = (obj.status or '').upper().strip()
+        wo = obj.work_order
+        wo_status = (wo.status or '').upper().strip() if wo else ''
+
+        # Step 1: MRP Check
+        has_shortages = obj.has_unresolved_shortages or status in ['ON_HOLD_SHORTAGE', 'PARTIALLY_RESOLVED']
+        is_mrp_ok = (obj.is_mrp_resolved or status in ['READY_TO_START', 'MRP_RESOLVED', 'IN_PROGRESS', 'COMPLETED']) and not has_shortages
+
+        if is_mrp_ok:
+            s1_title = 'MRP Verified'
+            s1_desc = 'No shortages or all items resolved'
+            s1_bg = '#10b981'  # Emerald Green
+            s1_badge = 'VERIFIED'
+        elif status == 'AWAITING_PROCUREMENT':
+            s1_title = 'MRP Planned'
+            s1_desc = 'Shortages routed to procurement'
+            s1_bg = '#8b5cf6'  # Violet
+            s1_badge = 'PLANNED'
+        elif has_shortages:
+            s1_title = 'MRP Shortage'
+            s1_desc = 'Unresolved material shortages detected'
+            s1_bg = '#f59e0b'  # Amber
+            s1_badge = 'SHORTAGE DETECTED'
+        else:
+            s1_title = 'MRP Check'
+            s1_desc = 'Pending BOM evaluation'
+            s1_bg = '#64748b'  # Slate
+            s1_badge = 'PENDING'
+
+        # Step 2: Procurement Gate
+        if status == 'AWAITING_PROCUREMENT':
+            s2_title = 'Procurement Gate'
+            s2_desc = 'Awaiting delivery of drafted PO stock'
+            s2_bg = '#8b5cf6'  # Violet
+            s2_badge = 'AWAITING PROCUREMENT'
+        elif status in ['READY_TO_START', 'MRP_RESOLVED', 'IN_PROGRESS', 'COMPLETED']:
+            s2_title = 'Procurement Cleared'
+            s2_desc = 'Stock verified in warehouse'
+            s2_bg = '#10b981'  # Emerald Green
+            s2_badge = 'READY TO START'
+        elif has_shortages:
+            s2_title = 'Procurement Gate'
+            s2_desc = 'Blocked by unresolved shortages'
+            s2_bg = '#ef4444'  # Red
+            s2_badge = 'ACTION REQUIRED'
+        else:
+            s2_title = 'Procurement Gate'
+            s2_desc = 'Pending clearance'
+            s2_bg = '#64748b'  # Slate
+            s2_badge = 'PENDING'
+
+        # Step 3: Production Run
+        if status == 'COMPLETED' or wo_status == 'COMPLETED':
+            s3_title = 'Production Run'
+            s3_desc = 'Reconciled & output posted to ledger'
+            s3_bg = '#10b981'  # Emerald Green
+            s3_badge = 'COMPLETED'
+        elif status == 'IN_PROGRESS' or wo_status == 'IN_PROGRESS':
+            s3_title = 'Production Run'
+            s3_desc = 'Shop floor execution in progress'
+            s3_bg = '#2563eb'  # Royal Blue
+            s3_badge = 'IN PROGRESS'
+        elif status in ['READY_TO_START', 'MRP_RESOLVED']:
+            s3_title = 'Production Run'
+            s3_desc = 'Ready for floor commencement'
+            s3_bg = '#059669'  # Teal
+            s3_badge = 'READY'
+        else:
+            s3_title = 'Production Run'
+            s3_desc = 'Queued behind procurement'
+            s3_bg = '#64748b'  # Slate
+            s3_badge = 'QUEUED'
+
+        html = f"""
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; border-bottom: 1px solid #f1f5f9; padding-bottom: 12px;">
+                <div style="font-size: 13px; font-weight: 700; color: #1e293b; text-transform: uppercase; letter-spacing: 0.05em; display: flex; align-items: center; gap: 8px;">
+                    <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #2563eb;"></span>
+                    Manufacturing Lifecycle Milestone Stepper
+                </div>
+                <div style="font-size: 12px; color: #64748b; font-weight: 500;">
+                    Order: <strong style="color: #0f172a;">{obj.production_order_code or f'#{obj.pk}'}</strong> | Status: <strong style="color: #0f172a;">{obj.get_status_display()}</strong>
+                </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 12px;">
+                <!-- STEP 1: MRP CHECK -->
+                <div style="background: #f8fafc; border: 1.5px solid {s1_bg}; border-radius: 10px; padding: 14px 16px; position: relative;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Step 1</span>
+                        <span style="background: {s1_bg}; color: #ffffff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase;">{s1_badge}</span>
+                    </div>
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 2px;">{s1_title}</div>
+                    <div style="font-size: 11px; color: #64748b; line-height: 1.3;">{s1_desc}</div>
+                </div>
+
+                <!-- CONNECTOR 1 -->
+                <div style="display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 18px; font-weight: 700;">
+                    ➔
+                </div>
+
+                <!-- STEP 2: PROCUREMENT GATE -->
+                <div style="background: #f8fafc; border: 1.5px solid {s2_bg}; border-radius: 10px; padding: 14px 16px; position: relative;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Step 2</span>
+                        <span style="background: {s2_bg}; color: #ffffff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase;">{s2_badge}</span>
+                    </div>
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 2px;">{s2_title}</div>
+                    <div style="font-size: 11px; color: #64748b; line-height: 1.3;">{s2_desc}</div>
+                </div>
+
+                <!-- CONNECTOR 2 -->
+                <div style="display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 18px; font-weight: 700;">
+                    ➔
+                </div>
+
+                <!-- STEP 3: PRODUCTION RUN -->
+                <div style="background: #f8fafc; border: 1.5px solid {s3_bg}; border-radius: 10px; padding: 14px 16px; position: relative;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase;">Step 3</span>
+                        <span style="background: {s3_bg}; color: #ffffff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase;">{s3_badge}</span>
+                    </div>
+                    <div style="font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 2px;">{s3_title}</div>
+                    <div style="font-size: 11px; color: #64748b; line-height: 1.3;">{s3_desc}</div>
+                </div>
+            </div>
+        </div>
+        """
+        return mark_safe(html)
 
     fieldsets = (
+        ('Manufacturing Milestones', {
+            'fields': ('milestone_stepper',)
+        }),
         ('Order Information', {
             'fields': ('production_order_code', 'product', 'work_order', 'quantity', 'status')
         }),
@@ -1138,11 +1429,11 @@ class OpenSalesInvoiceInline(TabularInline):
 
     @display(description='Total Paid')
     def get_total_paid(self, obj):
-        return f"${obj.total_paid:,.2f}"
+        return format_admin_currency(obj.total_paid)
 
     @display(description='Outstanding Balance')
     def get_remaining_balance(self, obj):
-        return f"${obj.remaining_balance:,.2f}"
+        return format_admin_currency(obj.remaining_balance)
 
     @display(description='Status')
     def status_badge(self, obj):
@@ -1178,18 +1469,18 @@ class CustomerAdmin(ModelAdmin):
         open_invoices = obj.sales_invoices.filter(status__in=['POSTED', 'PARTIALLY_PAID'])
         total_debt = sum(inv.remaining_balance for inv in open_invoices)
         if total_debt > 0:
-            formatted_debt = f"${total_debt:,.2f}"
+            formatted_debt = format_admin_currency(total_debt)
             return format_html("<span style='color: #dc2626; font-weight: bold;'>{}</span>", formatted_debt)
-        return "$0.00"
+        return format_admin_currency(0)
 
     @display(description='Available Credit')
     def get_available_credit(self, obj):
         open_cns = obj.credit_notes.filter(status='POSTED')
         total_credit = sum(cn.remaining_credit for cn in open_cns)
         if total_credit > 0:
-            formatted_credit = f"${total_credit:,.2f}"
+            formatted_credit = format_admin_currency(total_credit)
             return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted_credit)
-        return "$0.00"
+        return format_admin_currency(0)
 
     @display(description='Open Invoices')
     def get_open_invoices_count(self, obj):
@@ -1214,7 +1505,7 @@ class CustomerAdmin(ModelAdmin):
                     <div>
                         <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.5px;">Outstanding Debt Pool</div>
                         <div style="font-size: 24px; font-weight: 800; color: {'#dc2626' if total_debt > 0 else '#16a34a'}; margin-top: 2px;">
-                            ${total_debt:,.2f}
+                            {format_admin_currency(total_debt)}
                         </div>
                         <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
                             <strong>{count}</strong> open invoice(s) awaiting settlement
@@ -1223,7 +1514,7 @@ class CustomerAdmin(ModelAdmin):
                     <div style="border-left: 1px solid #e2e8f0; padding-left: 32px;">
                         <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.5px;">Available Credit Notes Pool</div>
                         <div style="font-size: 24px; font-weight: 800; color: {'#16a34a' if total_credit > 0 else '#64748b'}; margin-top: 2px;">
-                            ${total_credit:,.2f}
+                            {format_admin_currency(total_credit)}
                         </div>
                         <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
                             <strong>{open_cns.count()}</strong> active credit note(s)
@@ -1334,7 +1625,7 @@ class CustomerAdmin(ModelAdmin):
             credit_info = f" and automatically applied {len(applied)} open Credit Note(s)" if applied else ""
             self.message_user(
                 request,
-                f"Successfully linked Invoice '{invoice.invoice_number}' (Balance: ${invoice.remaining_balance:,.2f}) to {customer.customer_name}{reassigned_info}{credit_info}.",
+                f"Successfully linked Invoice '{invoice.invoice_number}' (Balance: {format_admin_currency(invoice.remaining_balance)}) to {customer.customer_name}{reassigned_info}{credit_info}.",
                 level=messages.SUCCESS
             )
             return redirect(reverse('admin:core_customer_change', args=[object_id]))
@@ -1404,9 +1695,9 @@ class CustomerAdmin(ModelAdmin):
                     )
                     count_settled = len(result.get('allocations', []))
                     unallocated = result.get('unallocated_amount', Decimal('0.00'))
-                    msg = f"Successfully executed bulk deposit of ${amount:,.2f} across {count_settled} invoice(s) for {customer.customer_name}."
+                    msg = f"Successfully executed bulk deposit of {format_admin_currency(amount)} across {count_settled} invoice(s) for {customer.customer_name}."
                     if unallocated > Decimal('0.00'):
-                        msg += f" Surplus credit balance: ${unallocated:,.2f}."
+                        msg += f" Surplus credit balance: {format_admin_currency(unallocated)}."
                     self.message_user(request, msg, level=messages.SUCCESS)
                     return redirect(reverse('admin:core_customer_change', args=[customer.pk]))
                 except Exception as e:
@@ -1484,9 +1775,9 @@ class SalesOrderAdmin(ModelAdmin):
             <tr style="border-bottom: 1px solid #e2e8f0;">
                 <td style="padding: 10px 12px; font-family: monospace; font-weight: 600;"><a href="{url}" style="color: #2563eb; text-decoration: underline;">{inv.invoice_number}</a></td>
                 <td style="padding: 10px 12px; color: #475569;">{inv.invoice_date}</td>
-                <td style="padding: 10px 12px; text-align: right; font-weight: 600;">${inv.total_amount:,.2f}</td>
-                <td style="padding: 10px 12px; text-align: right; color: #16a34a;">${inv.total_paid:,.2f}</td>
-                <td style="padding: 10px 12px; text-align: right; font-weight: 700; color: {'#dc2626' if inv.remaining_balance > 0 else '#16a34a'};">${inv.remaining_balance:,.2f}</td>
+                <td style="padding: 10px 12px; text-align: right; font-weight: 600;">{format_admin_currency(inv.total_amount)}</td>
+                <td style="padding: 10px 12px; text-align: right; color: #16a34a;">{format_admin_currency(inv.total_paid)}</td>
+                <td style="padding: 10px 12px; text-align: right; font-weight: 700; color: {'#dc2626' if inv.remaining_balance > 0 else '#16a34a'};">{format_admin_currency(inv.remaining_balance)}</td>
                 <td style="padding: 10px 12px; text-align: center;">
                     <span style="background: {status_color}15; color: {status_color}; border: 1px solid {status_color}40; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; text-transform: uppercase;">
                         {inv.get_status_display()}
@@ -1578,7 +1869,7 @@ class SalesOrderAdmin(ModelAdmin):
     @display(description='Order Total')
     def get_order_total(self, obj):
         total = sum(item.total_price for item in obj.items.all())
-        return f"${total:,.2f}"
+        return format_admin_currency(total)
 
     def get_urls(self):
         urls = super().get_urls()
@@ -1618,15 +1909,26 @@ class SalesOrderAdmin(ModelAdmin):
 
 
 @admin.register(SalesInvoice)
-class SalesInvoiceAdmin(ModelAdmin):
+class SalesInvoiceAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('invoice_number', 'customer', 'sales_order', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status_badge')
     list_filter = ['status', ('invoice_date', RangeDateFilter), 'customer']
     search_fields = ('invoice_number', 'customer__customer_name', 'sales_order__order_number', 'dispatch__dispatch_code')
     inlines = [SalesInvoiceLineInline, SalesInvoicePaymentsInline]
     autocomplete_fields = ['customer', 'sales_order', 'dispatch']
     readonly_fields = ('invoice_number', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance')
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
     actions_detail = ['action_download_pdf']
+    export_filename_prefix = 'sales_invoices'
+    export_fields_map = [
+        ('invoice_number', 'Invoice #', 'text'),
+        ('customer.customer_name', 'Customer', 'text'),
+        ('get_status_display', 'Status', 'text'),
+        ('invoice_date', 'Invoice Date', 'date'),
+        ('due_date', 'Due Date', 'date'),
+        ('subtotal', 'Subtotal', 'currency'),
+        ('tax_amount', 'Tax Amount', 'currency'),
+        ('total_amount', 'Total Amount', 'currency'),
+    ]
 
     fieldsets = (
         ('Invoice Details', {
@@ -1664,14 +1966,11 @@ class SalesInvoiceAdmin(ModelAdmin):
 
     @display(description='Total Paid')
     def get_total_paid(self, obj):
-        return f"${obj.total_paid:,.2f}"
+        return format_admin_currency(obj.total_paid)
 
     @display(description='Remaining Balance')
     def get_remaining_balance(self, obj):
-        bal = obj.remaining_balance
-        if bal > 0:
-            return f"${bal:,.2f}"
-        return "$0.00"
+        return format_admin_currency(obj.remaining_balance)
 
     @action(description="Download Commercial Invoice PDF", url_path="download-pdf")
     def action_download_pdf(self, request, object_id):
@@ -1707,15 +2006,15 @@ class CreditNoteAdmin(ModelAdmin):
     @display(description='Applied Credit')
     def get_applied_amount(self, obj):
         applied = obj.applied_amount or Decimal('0.00')
-        return f"${applied:,.2f}"
+        return format_admin_currency(applied)
 
     @display(description='Remaining Credit')
     def get_remaining_credit(self, obj):
         rem = obj.remaining_credit
         if rem > 0:
-            formatted = f"${rem:,.2f}"
+            formatted = format_admin_currency(rem)
             return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted)
-        return "$0.00"
+        return format_admin_currency(0)
 
     @display(description='Status')
     def status_badge(self, obj):
@@ -1931,15 +2230,30 @@ class BillOfMaterialAdmin(ModelAdmin):
         return obj.items.count()
 
 
+def get_po_total_amount(obj):
+    if not obj or not obj.pk:
+        return Decimal('0.00')
+    return sum(((item.quantity_ordered or Decimal('0.00')) * (item.price_per_unit or Decimal('0.00')) for item in obj.items.all()), Decimal('0.00'))
+
+
 @admin.register(PurchaseOrder)
-class PurchaseOrderAdmin(ModelAdmin):
+class PurchaseOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('po_number', 'supplier', 'order_date', 'status_badge')
     list_filter = ('status', ('order_date', RangeDateFilter), 'supplier')
     search_fields = ('po_number', 'supplier__name', 'supplier__supplier_code')
     autocomplete_fields = ['supplier']
     inlines = [PurchaseOrderItemInline]
     readonly_fields = ('po_number', 'order_date', 'status')
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'purchase_orders'
+    export_fields_map = [
+        ('po_number', 'PO #', 'text'),
+        ('supplier.name', 'Supplier', 'text'),
+        ('get_status_display', 'Status', 'text'),
+        ('order_date', 'Order Date', 'date'),
+        (get_po_total_amount, 'Total Amount', 'currency'),
+        ('notes', 'Notes', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('supplier').prefetch_related('items__product')
@@ -2063,17 +2377,28 @@ class DispatchRecordAdmin(ModelAdmin):
 
 
 @admin.register(WorkOrder)
-class WorkOrderAdmin(ModelAdmin):
+class WorkOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
     form = WorkOrderForm
     list_display = ('work_order_code', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
     list_display_links = ('work_order_code',)
     readonly_fields = ['work_order_code', 'category', 'status', 'is_inventory_allocated', 'is_inventory_updated', 'production_end_date']
-    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline]
+    inlines = [WorkOrderInstructionInline, WorkOrderMaterialLineInline, ChildPackagingInline, ProcessExecutionLogInline]
     autocomplete_fields = ['product', 'bill_of_material', 'parent_work_order']
     list_filter = ['category', 'status', 'is_inventory_updated', ('production_start_date', RangeDateFilter)]
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
-    actions = [export_as_csv, 'action_reconcile_production_stock', 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
+    actions = [export_as_csv, 'action_reconcile_production_stock', 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing', 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'work_orders'
+    export_fields_map = [
+        ('work_order_code', 'Order #', 'text'),
+        ('product.name', 'Product', 'text'),
+        ('get_category_display', 'Category', 'text'),
+        ('target_quantity', 'Planned Batch Size', 'decimal'),
+        ('actual_quantity_produced', 'Actual Output', 'decimal'),
+        ('get_status_display', 'Status', 'text'),
+        ('production_start_date', 'Start Date', 'date'),
+        ('production_end_date', 'Completion Date', 'datetime'),
+    ]
 
     class Media:
         js = ('admin/js/workorder_toggle.js', 'admin/js/work_order_category_toggle.js')
@@ -2212,7 +2537,7 @@ class WorkOrderAdmin(ModelAdmin):
         skipped_count = 0
         for wo in queryset:
             try:
-                result = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+                result = ProductionReconciliationEngine.reconcile_work_order_completion(wo, user=request.user)
                 if result.get('skipped'):
                     skipped_count += 1
                 else:
@@ -2267,6 +2592,11 @@ class WorkOrderAdmin(ModelAdmin):
         urls = super().get_urls()
         custom_urls = [
             path(
+                '<int:object_id>/preflight-start/',
+                self.admin_site.admin_view(self.preflight_start_view),
+                name='workorder-preflight-start',
+            ),
+            path(
                 '<int:object_id>/start-production/',
                 self.admin_site.admin_view(self.start_production_view),
                 name='workorder-start-production',
@@ -2296,8 +2626,54 @@ class WorkOrderAdmin(ModelAdmin):
                 self.admin_site.admin_view(self.check_stock_resume_view),
                 name='workorder-check-stock-resume',
             ),
+            path(
+                '<int:object_id>/execution-history/',
+                self.admin_site.admin_view(self.execution_history_view),
+                name='core_workorder_execution_history',
+            ),
         ]
         return custom_urls + urls
+
+    def preflight_start_view(self, request, object_id):
+        if not (request.user.is_superuser or request.user.has_perm('core.can_start_production')):
+            raise PermissionDenied("You do not have permission to start production on work orders.")
+        work_order = get_object_or_404(WorkOrder, pk=object_id)
+
+        if request.method == 'POST':
+            try:
+                success, message = work_order.start_production()
+                if success:
+                    self.message_user(request, message, level=messages.SUCCESS)
+                else:
+                    self.message_user(request, message, level=messages.WARNING)
+            except ValidationError as e:
+                if hasattr(e, 'message_dict'):
+                    for field, msgs in e.message_dict.items():
+                        for msg in msgs:
+                            field_label = field.replace('_', ' ').title() if field != '__all__' else 'Validation Error'
+                            self.message_user(request, f"{field_label}: {msg}", level=messages.ERROR)
+                elif hasattr(e, 'messages'):
+                    for msg in e.messages:
+                        self.message_user(request, msg, level=messages.ERROR)
+                else:
+                    self.message_user(request, str(e), level=messages.ERROR)
+            except Exception as e:
+                self.message_user(request, f"Failed to start work order: {str(e)}", level=messages.ERROR)
+
+            return redirect(reverse('admin:core_workorder_change', args=[object_id]))
+
+        from .services import get_preflight_production_summary
+        summary = get_preflight_production_summary(work_order)
+
+        context = {
+            **self.admin_site.each_context(request),
+            'opts': self.model._meta,
+            'original': work_order,
+            'title': f"Pre-Flight Production Start: {work_order.work_order_code or f'WO #{work_order.pk}'}",
+            'summary': summary,
+            'object_id': object_id,
+        }
+        return TemplateResponse(request, 'admin/core/workorder/preflight_start_confirmation.html', context)
 
     def resolve_shortage_view(self, request, object_id, choice):
         if not (request.user.is_superuser or request.user.has_perm('core.can_resolve_shortage')):
@@ -2419,14 +2795,113 @@ class WorkOrderAdmin(ModelAdmin):
             return HttpResponseRedirect(referer)
         return redirect(reverse('admin:core_workorder_change', args=[object_id]))
 
+    def execution_history_view(self, request, object_id):
+        work_order = get_object_or_404(
+            WorkOrder.objects.select_related('product', 'bill_of_material', 'parent_work_order').prefetch_related(
+                'employee', 'production_runs', 'material_lines__component'
+            ),
+            pk=object_id
+        )
+
+        # 1. Fetch all related execution logs in chronological order
+        logs_qs = ProcessExecutionLog.objects.filter(
+            models.Q(work_order=work_order) | models.Q(production_order__work_order=work_order)
+        ).select_related('logged_by', 'production_order', 'work_order').order_by('created_at', 'log_id')
+        logs = list(logs_qs)
+
+        # 2. Gather active competing work orders holding allocations for the same ingredients
+        comp_ids = list(work_order.material_lines.values_list('component_id', flat=True))
+        if not comp_ids and work_order.bill_of_material:
+            comp_ids = list(work_order.bill_of_material.items.values_list('component_id', flat=True))
+
+        competing_runs_dict = {}
+        if comp_ids:
+            active_competing_lines = WorkOrderMaterialLine.objects.filter(
+                component_id__in=comp_ids,
+                work_order__status='IN_PROGRESS'
+            ).exclude(work_order=work_order).select_related('work_order', 'component')
+
+            for pal in active_competing_lines:
+                wo = pal.work_order
+                p_code = wo.work_order_code or f"WO #{wo.pk}"
+                alloc_qty = float(pal.quantity_allocated or pal.quantity_expected or Decimal('0.00'))
+                if p_code not in competing_runs_dict:
+                    competing_runs_dict[p_code] = {
+                        'work_order': wo,
+                        'order_code': p_code,
+                        'product_name': wo.product.name if wo.product else 'N/A',
+                        'target_quantity': float(wo.target_quantity or 0.0),
+                        'components': [],
+                    }
+                competing_runs_dict[p_code]['components'].append({
+                    'component_name': pal.component.name,
+                    'allocated_qty': alloc_qty,
+                    'unit': pal.component.unit_of_measurement or 'units',
+                })
+
+        competing_runs = list(competing_runs_dict.values())
+
+        # 3. Categorize logs into milestones
+        phase1_log = next((l for l in reversed(logs) if l.process_type == 'STOCK_ALLOCATION'), None)
+        phase2_logs = [l for l in logs if l.process_type == 'RECONCILIATION' and l.details.get('phase') == 'PHASE_2_CONSUMPTION']
+        phase3_log = next((l for l in reversed(logs) if l.process_type == 'RECONCILIATION' and (l.level == 'SUCCESS' or l.details.get('phase') == 'PHASE_3_RECONCILIATION_COMPLETION')), None)
+        other_logs = [l for l in logs if l != phase1_log and l not in phase2_logs and l != phase3_log]
+
+        milestones = {
+            'phase1': {
+                'title': 'Phase 1: Stock Allocation & Component Reservation',
+                'completed': bool(work_order.is_inventory_allocated or phase1_log),
+                'log': phase1_log,
+            },
+            'phase2': {
+                'title': 'Phase 2: Incremental Consumption & Floor Updates',
+                'completed': bool(phase2_logs or work_order.is_inventory_updated),
+                'in_progress': work_order.status == 'IN_PROGRESS' and not work_order.is_inventory_updated,
+                'logs': phase2_logs,
+            },
+            'phase3': {
+                'title': 'Phase 3: Final Reconciliation & Output Shift',
+                'completed': bool(work_order.is_inventory_updated or phase3_log),
+                'log': phase3_log,
+            },
+        }
+
+        context = {
+            **self.admin_site.each_context(request),
+            'title': f"Execution History & Timeline: {work_order.work_order_code or work_order.pk}",
+            'work_order': work_order,
+            'original': work_order,
+            'logs': logs,
+            'competing_runs': competing_runs,
+            'milestones': milestones,
+            'other_logs': other_logs,
+            'opts': self.model._meta,
+            'has_view_permission': self.has_view_permission(request, work_order),
+            'has_change_permission': self.has_change_permission(request, work_order),
+        }
+        return TemplateResponse(request, 'admin/core/workorder/execution_history.html', context)
+
 
 @admin.register(MaterialVarianceRecord)
-class MaterialVarianceRecordAdmin(ModelAdmin):
+class MaterialVarianceRecordAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('variance_code', 'work_order', 'get_production_run_type', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'classification_badge', 'recorded_at')
     list_filter = ['work_order__category', 'variance_classification', ('recorded_at', RangeDateFilter)]
     search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('variance_code', 'get_production_run_type', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'material_variances'
+    export_fields_map = [
+        ('variance_code', 'Variance Code', 'text'),
+        ('work_order.work_order_code', 'Work Order', 'text'),
+        ('product.name', 'Component', 'text'),
+        ('product.sku', 'SKU', 'text'),
+        ('quantity_expected', 'Standard Qty', 'decimal'),
+        ('quantity_actual', 'Actual Consumed', 'decimal'),
+        ('quantity_variance', 'Variance Qty', 'decimal'),
+        ('unit_cost', 'Unit Cost', 'currency'),
+        ('financial_impact', 'Variance Cost', 'currency'),
+        ('get_variance_classification_display', 'Classification', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')
@@ -2440,11 +2915,7 @@ class MaterialVarianceRecordAdmin(ModelAdmin):
     @display(description='Financial Impact')
     def get_financial_impact(self, obj):
         cost = obj.financial_impact or Decimal('0.00')
-        if cost > 0:
-            return f"+${cost:,.2f}"
-        elif cost < 0:
-            return f"-${abs(cost):,.2f}"
-        return "$0.00"
+        return format_admin_currency(cost, show_plus=True)
 
     @display(description='Classification')
     def classification_badge(self, obj):
@@ -2455,3 +2926,74 @@ class MaterialVarianceRecordAdmin(ModelAdmin):
         }
         bg = color_map.get(obj.variance_classification, '#64748b')
         return render_status_badge(obj.get_variance_classification_display(), bg)
+
+
+@admin.register(ProcessExecutionLog)
+class ProcessExecutionLogAdmin(ModelAdmin):
+    list_display = ('log_code', 'created_at', 'level_badge', 'process_type_badge', 'message_snippet', 'order_link', 'logged_by')
+    list_display_links = ('log_code',)
+    list_filter = ['process_type', 'level', ('created_at', RangeDateFilter)]
+    search_fields = ('log_code', 'event_title', 'message', 'production_order__production_order_code', 'work_order__work_order_code')
+    readonly_fields = [f.name for f in ProcessExecutionLog._meta.fields]
+    actions = [export_as_csv]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    @display(description='Level')
+    def level_badge(self, obj):
+        color_map = {
+            'DEBUG': ('#64748b', '#ffffff'),
+            'INFO': ('#0284c7', '#ffffff'),
+            'SUCCESS': ('#10b981', '#ffffff'),
+            'WARNING': ('#f59e0b', '#ffffff'),
+            'ERROR': ('#ef4444', '#ffffff'),
+        }
+        bg, fg = color_map.get(obj.level, ('#64748b', '#ffffff'))
+        return render_status_badge(obj.get_level_display(), bg, text_color=fg)
+
+    @display(description='Process Type')
+    def process_type_badge(self, obj):
+        type_color_map = {
+            'STOCK_ALLOCATION': '#059669',
+            'MRP_EVALUATION': '#0284c7',
+            'PO_DRAFT': '#8b5cf6',
+            'BATCH_DOWNSCALE': '#d97706',
+            'AUTO_RESUME': '#059669',
+            'RECONCILIATION': '#2563eb',
+            'ORDER_SYNC': '#4f46e5',
+            'AVCO_RECALCULATION': '#7c3aed',
+        }
+        bg = type_color_map.get(obj.process_type, '#64748b')
+        return render_status_badge(obj.get_process_type_display(), bg)
+
+    @display(description='Message')
+    def message_snippet(self, obj):
+        return obj.message[:100] + ('...' if len(obj.message) > 100 else '')
+
+    @display(description='Linked Order')
+    def order_link(self, obj):
+        parts = []
+        if obj.production_order:
+            url = reverse('admin:core_productionorder_change', args=[obj.production_order.pk])
+            parts.append(format_html('<a href="{}" style="color: #2563eb; font-weight: 600;">PO #{}</a>', url, obj.production_order.production_order_code or obj.production_order.pk))
+
+        wo = obj.work_order or (obj.production_order.work_order if obj.production_order else None)
+        if wo:
+            timeline_url = reverse('admin:core_workorder_execution_history', args=[wo.pk])
+            parts.append(format_html(
+                '<a href="{}" style="color: #4f46e5; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;" title="View Execution History & Timeline">'
+                '<span>WO #{}</span> '
+                '<span style="font-size: 10px; background: #e0e7ff; color: #4338ca; padding: 1px 5px; border-radius: 4px; font-weight: 700;">TIMELINE</span>'
+                '</a>',
+                timeline_url,
+                wo.work_order_code or wo.pk
+            ))
+        return format_html(" &middot; ".join(parts)) if parts else "-"
+

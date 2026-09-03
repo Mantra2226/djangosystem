@@ -53,6 +53,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'core.middleware.ProcessExecutionUserMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'core.middleware.ApiExceptionMiddleware',
@@ -180,11 +181,6 @@ UNFOLD = {
                         "title": "Bills of Material (BOM)",
                         "icon": "schema",
                         "link": reverse_lazy("admin:core_billofmaterial_changelist"),
-                    },
-                    {
-                        "title": "Material Variances",
-                        "icon": "analytics",
-                        "link": reverse_lazy("admin:core_materialvariancerecord_changelist"),
                     },
                 ],
             },
@@ -333,6 +329,28 @@ UNFOLD = {
                     },
                 ],
             },
+            {
+                "title": "Operations Audit & Logs",
+                "icon": "fact_check",
+                "items": [
+                    {
+                        "title": "Process Execution Logs",
+                        "icon": "terminal",
+                        "link": reverse_lazy("admin:core_processexecutionlog_changelist"),
+                    },
+                    {
+                        "title": "Material Variances",
+                        "icon": "analytics",
+                        "link": reverse_lazy("admin:core_materialvariancerecord_changelist"),
+                    },
+                ],
+            },
         ],
     },
 }
+
+# =============================================================================
+# SYSTEM-WIDE CURRENCY CONFIGURATION (KENYAN SHILLINGS)
+# =============================================================================
+CURRENCY_SYMBOL = "KSh"
+CURRENCY_CODE = "KES"

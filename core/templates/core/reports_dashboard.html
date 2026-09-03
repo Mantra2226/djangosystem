@@ -1,3 +1,4 @@
+{% load currency_filters %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -95,6 +96,272 @@
             background-color: #f1f5f9;
         }
 
+        .btn-excel-financial {
+            background-color: var(--accent-green);
+            color: white;
+        }
+
+        .btn-excel-financial:hover {
+            background-color: #059669;
+        }
+
+        .btn-excel-shopfloor {
+            background-color: var(--accent-purple);
+            color: white;
+        }
+
+        .btn-excel-shopfloor:hover {
+            background-color: #7c3aed;
+        }
+
+        /* Spreadsheet Preview Modal Styles */
+        .excel-preview-modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 9999;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            animation: fadeIn 0.15s ease-out;
+        }
+
+        .excel-preview-modal-overlay.active {
+            display: flex;
+        }
+
+        .excel-preview-modal-dialog {
+            background: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
+            border: 1px solid #cbd5e1;
+            width: 100%;
+            max-width: 1120px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            animation: slideUp 0.2s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes slideUp {
+            from { transform: translateY(12px); opacity: 0.95; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .excel-preview-modal-header {
+            padding: 16px 24px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .excel-preview-modal-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #0f172a;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .excel-preview-date-badge {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            background: #e2e8f0;
+            color: #475569;
+            border-radius: 6px;
+        }
+
+        .excel-preview-modal-close {
+            background: transparent;
+            border: none;
+            font-size: 24px;
+            line-height: 1;
+            color: #64748b;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            transition: color 0.15s ease;
+        }
+
+        .excel-preview-modal-close:hover {
+            color: #0f172a;
+        }
+
+        .excel-preview-modal-tabs {
+            padding: 8px 24px 0;
+            background: #f1f5f9;
+            border-bottom: 1px solid #cbd5e1;
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+        }
+
+        .excel-tab-btn {
+            padding: 8px 16px;
+            border-radius: 6px 6px 0 0;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid transparent;
+            border-bottom: none;
+            background: transparent;
+            color: #64748b;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.15s ease;
+        }
+
+        .excel-tab-btn:hover {
+            color: #0f172a;
+            background: rgba(255, 255, 255, 0.5);
+        }
+
+        .excel-tab-btn.active {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            border-bottom: 1px solid #ffffff;
+            margin-bottom: -1px;
+            color: #0f172a;
+        }
+
+        .excel-tab-count {
+            background: #e2e8f0;
+            color: #475569;
+            border-radius: 10px;
+            padding: 1px 6px;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        .excel-tab-btn.active .excel-tab-count {
+            background: #0284c7;
+            color: #ffffff;
+        }
+
+        .excel-preview-modal-body {
+            padding: 0;
+            flex: 1;
+            overflow: auto;
+            max-height: 56vh;
+            background: #ffffff;
+        }
+
+        .excel-spreadsheet-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            font-family: Calibri, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .excel-spreadsheet-table th {
+            background: #1e293b;
+            color: #ffffff;
+            font-weight: 600;
+            padding: 10px 14px;
+            border: 1px solid #cbd5e1;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            white-space: nowrap;
+        }
+
+        .excel-spreadsheet-table td {
+            padding: 7px 12px;
+            border: 1px solid #e2e8f0;
+            color: #0f172a;
+            white-space: nowrap;
+        }
+
+        .excel-spreadsheet-table tbody tr:nth-child(even) {
+            background: #f8fafc;
+        }
+
+        .excel-spreadsheet-table tbody tr:hover {
+            background: #f1f5f9;
+        }
+
+        .cell-currency, .cell-decimal, .cell-integer {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .cell-date, .cell-datetime {
+            text-align: center;
+        }
+
+        .cell-text {
+            text-align: left;
+        }
+
+        .excel-preview-modal-footer {
+            padding: 14px 24px;
+            background: #f8fafc;
+            border-top: 1px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .excel-preview-status {
+            font-size: 12px;
+            color: #64748b;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .excel-preview-file-tag {
+            font-family: monospace;
+            background: #e2e8f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #334155;
+        }
+
+        .excel-preview-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .excel-preview-loading {
+            padding: 60px 20px;
+            text-align: center;
+            color: #64748b;
+            font-size: 14px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .excel-spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid #e2e8f0;
+            border-top-color: #0284c7;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
         .filter-card {
             background: var(--bg-card);
             padding: 16px 24px;
@@ -179,6 +446,48 @@
             font-size: 12px;
             color: var(--text-muted);
             margin-top: 4px;
+            transition: color 0.15s ease;
+        }
+
+        .kpi-card-link {
+            display: block;
+            text-decoration: none !important;
+            color: inherit;
+            border-radius: 10px;
+            outline: none;
+            transition: transform 0.15s ease;
+            cursor: pointer;
+        }
+
+        .kpi-card-link:hover {
+            transform: translateY(-2px);
+        }
+
+        .kpi-card-link:hover .kpi-card {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+            border-color: #cbd5e1;
+        }
+
+        .kpi-card-link:focus-visible {
+            outline: 2px solid var(--brand-blue);
+            outline-offset: 2px;
+            border-radius: 10px;
+        }
+
+        .kpi-card-link:hover .kpi-subtext {
+            color: var(--brand-blue);
+        }
+
+        .kpi-arrow {
+            display: inline-block;
+            transition: transform 0.15s ease, opacity 0.15s ease;
+            margin-left: 4px;
+            opacity: 0.4;
+        }
+
+        .kpi-card-link:hover .kpi-arrow {
+            transform: translateX(3px);
+            opacity: 1;
         }
 
         .section-grid {
@@ -300,47 +609,93 @@
             {% if start_date or end_date %}
                 <a href="/reports/" class="btn btn-outline">Reset Filter</a>
             {% endif %}
+            <button type="button"
+                    class="btn btn-excel-financial"
+                    onclick="openExcelPreview('financial')"
+                    title="Preview & Export Financial Analytics (.xlsx)">
+                📊 Export Financials (Excel)
+            </button>
+            <button type="button"
+                    class="btn btn-excel-shopfloor"
+                    onclick="openExcelPreview('shopfloor')"
+                    title="Preview & Export Shop-Floor Analytics (.xlsx)">
+                🏭 Export Shop-Floor (Excel)
+            </button>
         </form>
         <span style="font-size: 12px; color: var(--text-muted);">Showing live system analytics as of {% now "Y-m-d H:i" %}</span>
     </div>
 
     <!-- Executive KPI Grid -->
     <div class="kpi-grid">
-        <div class="kpi-card green">
-            <div class="kpi-label">Total Revenue</div>
-            <div class="kpi-value">${{ pnl.total_revenue|floatformat:2 }}</div>
-            <div class="kpi-subtext">Sales Invoices & Revenue Ledger</div>
-        </div>
-        <div class="kpi-card green">
-            <div class="kpi-label">Gross Profit</div>
-            <div class="kpi-value">${{ pnl.gross_profit|floatformat:2 }}</div>
-            <div class="kpi-subtext">Margin Rate: <strong>{{ pnl.gross_margin_pct }}%</strong></div>
-        </div>
-        <div class="kpi-card red">
-            <div class="kpi-label">COGS</div>
-            <div class="kpi-value">${{ pnl.cogs|floatformat:2 }}</div>
-            <div class="kpi-subtext">Cost of Goods Sold (Dispatches)</div>
-        </div>
-        <div class="kpi-card purple">
-            <div class="kpi-label">Total COGM</div>
-            <div class="kpi-value">${{ cogm.total_cogm|floatformat:2 }}</div>
-            <div class="kpi-subtext">Completed Builds: {{ cogm.completed_orders_count }}</div>
-        </div>
-        <div class="kpi-card amber">
-            <div class="kpi-label">Yield Efficiency</div>
-            <div class="kpi-value">{{ yield_scrap.yield_rate_pct }}%</div>
-            <div class="kpi-subtext">Produced vs Target Ratio</div>
-        </div>
-        <div class="kpi-card {% if inventory_otif.low_stock_count > 0 %}red{% else %}green{% endif %}">
-            <div class="kpi-label">Low-Stock Alerts</div>
-            <div class="kpi-value">{{ inventory_otif.low_stock_count }}</div>
-            <div class="kpi-subtext">Stock &le; 10 Units</div>
-        </div>
-        <div class="kpi-card green">
-            <div class="kpi-label">Supplier OTIF %</div>
-            <div class="kpi-value">{{ inventory_otif.otif_pct }}%</div>
-            <div class="kpi-subtext">On-Time In-Full Delivery</div>
-        </div>
+        <a href="{% url 'admin:core_salesinvoice_changelist' %}{% if start_date or end_date %}?{% if start_date %}invoice_date__gte={{ start_date }}{% if end_date %}&{% endif %}{% endif %}{% if end_date %}invoice_date__lte={{ end_date }}{% endif %}{% endif %}"
+           class="kpi-card-link"
+           title="View Sales Invoices & Revenue Ledger">
+            <div class="kpi-card green">
+                <div class="kpi-label">Total Revenue</div>
+                <div class="kpi-value">{{ pnl.total_revenue|currency }}</div>
+                <div class="kpi-subtext">Sales Invoices & Revenue Ledger <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_salesinvoice_changelist' %}{% if start_date or end_date %}?{% if start_date %}invoice_date__gte={{ start_date }}{% if end_date %}&{% endif %}{% endif %}{% if end_date %}invoice_date__lte={{ end_date }}{% endif %}{% endif %}"
+           class="kpi-card-link"
+           title="View Sales Invoices & Margin Analysis">
+            <div class="kpi-card green">
+                <div class="kpi-label">Gross Profit</div>
+                <div class="kpi-value">{{ pnl.gross_profit|currency }}</div>
+                <div class="kpi-subtext">Margin Rate: <strong>{{ pnl.gross_margin_pct }}%</strong> <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_stocktransaction_changelist' %}?transaction_type=SHIPMENT{% if start_date %}&created_at__gte={{ start_date }}{% endif %}{% if end_date %}&created_at__lte={{ end_date }}{% endif %}"
+           class="kpi-card-link"
+           title="View Cost of Goods Sold (Dispatches)">
+            <div class="kpi-card red">
+                <div class="kpi-label">COGS</div>
+                <div class="kpi-value">{{ pnl.cogs|currency }}</div>
+                <div class="kpi-subtext">Cost of Goods Sold (Dispatches) <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_workorder_changelist' %}?status__exact=COMPLETED{% if start_date %}&production_start_date__gte={{ start_date }}{% endif %}{% if end_date %}&production_start_date__lte={{ end_date }}{% endif %}"
+           class="kpi-card-link"
+           title="View Completed Work Orders (COGM)">
+            <div class="kpi-card purple">
+                <div class="kpi-label">Total COGM</div>
+                <div class="kpi-value">{{ cogm.total_cogm|currency }}</div>
+                <div class="kpi-subtext">Completed Builds: {{ cogm.completed_orders_count }} <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_materialvariancerecord_changelist' %}{% if start_date or end_date %}?{% if start_date %}recorded_at__gte={{ start_date }}{% if end_date %}&{% endif %}{% endif %}{% if end_date %}recorded_at__lte={{ end_date }}{% endif %}{% endif %}"
+           class="kpi-card-link"
+           title="View Production Yield & Material Variances">
+            <div class="kpi-card amber">
+                <div class="kpi-label">Yield Efficiency</div>
+                <div class="kpi-value">{{ yield_scrap.yield_rate_pct }}%</div>
+                <div class="kpi-subtext">Produced vs Target Ratio <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_inventory_changelist' %}?low_stock=true"
+           class="kpi-card-link"
+           title="View Low-Stock Inventory Alerts">
+            <div class="kpi-card {% if inventory_otif.low_stock_count > 0 %}red{% else %}green{% endif %}">
+                <div class="kpi-label">Low-Stock Alerts</div>
+                <div class="kpi-value">{{ inventory_otif.low_stock_count }}</div>
+                <div class="kpi-subtext">Stock &le; 10 Units <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
+
+        <a href="{% url 'admin:core_purchaseorder_changelist' %}?status__exact=RECEIVED{% if start_date %}&order_date__gte={{ start_date }}{% endif %}{% if end_date %}&order_date__lte={{ end_date }}{% endif %}"
+           class="kpi-card-link"
+           title="View Received Purchase Orders (OTIF)">
+            <div class="kpi-card green">
+                <div class="kpi-label">Supplier OTIF %</div>
+                <div class="kpi-value">{{ inventory_otif.otif_pct }}%</div>
+                <div class="kpi-subtext">On-Time In-Full Delivery <span class="kpi-arrow">→</span></div>
+            </div>
+        </a>
     </div>
 
     <!-- Section Grid: P&L & COGM -->
@@ -353,23 +708,23 @@
             </div>
             <div class="metric-row">
                 <span>Sales Invoice Revenue</span>
-                <span>${{ pnl.sales_revenue|floatformat:2 }}</span>
+                <span>{{ pnl.sales_revenue|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>Cost of Goods Sold (COGS)</span>
-                <span style="color: var(--accent-red);">-${{ pnl.cogs|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ pnl.cogs|currency:"neg" }}</span>
             </div>
             <div class="metric-row total">
                 <span>Gross Profit</span>
-                <span>${{ pnl.gross_profit|floatformat:2 }}</span>
+                <span>{{ pnl.gross_profit|currency }}</span>
             </div>
             <div class="metric-row" style="margin-top: 8px;">
                 <span>Operating Expenses (Ledger)</span>
-                <span style="color: var(--accent-red);">-${{ pnl.operating_expenses|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ pnl.operating_expenses|currency:"neg" }}</span>
             </div>
             <div class="metric-row total" style="color: var(--brand-blue);">
                 <span>Net Operating Income</span>
-                <span>${{ pnl.net_income|floatformat:2 }}</span>
+                <span>{{ pnl.net_income|currency }}</span>
             </div>
         </div>
 
@@ -381,23 +736,23 @@
             </div>
             <div class="metric-row">
                 <span>Direct Raw Materials Consumed</span>
-                <span>${{ cogm.raw_material_cost|floatformat:2 }}</span>
+                <span>{{ cogm.raw_material_cost|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>Unfavourable Scrap &amp; Waste Variance</span>
-                <span style="color: var(--accent-red);">+${{ cogm.unfavourable_scrap|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">+{{ cogm.unfavourable_scrap|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>Favourable Material Savings</span>
-                <span style="color: var(--accent-green);">-${{ cogm.favourable_savings|floatformat:2 }}</span>
+                <span style="color: var(--accent-green);">{{ cogm.favourable_savings|currency:"neg" }}</span>
             </div>
             <div class="metric-row">
-                <span>Direct Labor Cost ({{ cogm.total_labor_hours }} Hours @ $25/hr)</span>
-                <span>${{ cogm.labor_cost|floatformat:2 }}</span>
+                <span>Direct Labor Cost ({{ cogm.total_labor_hours }} Hours @ KSh 25/hr)</span>
+                <span>{{ cogm.labor_cost|currency }}</span>
             </div>
             <div class="metric-row total">
                 <span>Total Manufactured Output Cost (COGM)</span>
-                <span>${{ cogm.total_cogm|floatformat:2 }}</span>
+                <span>{{ cogm.total_cogm|currency }}</span>
             </div>
         </div>
     </div>
@@ -461,7 +816,7 @@
             </div>
             <div class="metric-row">
                 <span>Total Warehouse Valuation</span>
-                <span><strong>${{ inventory_otif.total_valuation|floatformat:2 }}</strong></span>
+                <span><strong>{{ inventory_otif.total_valuation|currency }}</strong></span>
             </div>
             <div class="metric-row" style="margin-bottom: 12px;">
                 <span>Total Inventory Items Tracked</span>
@@ -506,23 +861,23 @@
             </div>
             <div class="metric-row">
                 <span>Current (0-30 Days)</span>
-                <span>${{ ar_aging.current_30|floatformat:2 }}</span>
+                <span>{{ ar_aging.current_30|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>31-60 Days Overdue</span>
-                <span style="color: var(--accent-amber);">${{ ar_aging.days_31_60|floatformat:2 }}</span>
+                <span style="color: var(--accent-amber);">{{ ar_aging.days_31_60|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>61-90 Days Overdue</span>
-                <span style="color: var(--accent-red);">${{ ar_aging.days_61_90|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ ar_aging.days_61_90|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>90+ Days Critical</span>
-                <span style="color: var(--accent-red); font-weight: 700;">${{ ar_aging.days_90_plus|floatformat:2 }}</span>
+                <span style="color: var(--accent-red); font-weight: 700;">{{ ar_aging.days_90_plus|currency }}</span>
             </div>
             <div class="metric-row total">
                 <span>Total Outstanding Receivables</span>
-                <span>${{ ar_aging.total_ar|floatformat:2 }}</span>
+                <span>{{ ar_aging.total_ar|currency }}</span>
             </div>
         </div>
 
@@ -534,26 +889,262 @@
             </div>
             <div class="metric-row">
                 <span>Current (0-30 Days)</span>
-                <span>${{ ap_aging.current_30|floatformat:2 }}</span>
+                <span>{{ ap_aging.current_30|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>31-60 Days Owed</span>
-                <span style="color: var(--accent-amber);">${{ ap_aging.days_31_60|floatformat:2 }}</span>
+                <span style="color: var(--accent-amber);">{{ ap_aging.days_31_60|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>61-90 Days Owed</span>
-                <span style="color: var(--accent-red);">${{ ap_aging.days_61_90|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ ap_aging.days_61_90|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>90+ Days Overdue</span>
-                <span style="color: var(--accent-red); font-weight: 700;">${{ ap_aging.days_90_plus|floatformat:2 }}</span>
+                <span style="color: var(--accent-red); font-weight: 700;">{{ ap_aging.days_90_plus|currency }}</span>
             </div>
             <div class="metric-row total">
                 <span>Total Outstanding Payables</span>
-                <span>${{ ap_aging.total_ap|floatformat:2 }}</span>
+                <span>{{ ap_aging.total_ap|currency }}</span>
             </div>
         </div>
     </div>
 
+    <!-- Spreadsheet Preview Modal -->
+    <div id="excelPreviewModal" class="excel-preview-modal-overlay" onclick="handleOverlayClick(event)">
+        <div class="excel-preview-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modalStreamTitle">
+            <div class="excel-preview-modal-header">
+                <div class="excel-preview-modal-title">
+                    <span id="modalStreamIcon">📊</span>
+                    <span id="modalStreamTitle">Workbook Preview</span>
+                    <span id="modalDateBadge" class="excel-preview-date-badge">All Dates</span>
+                </div>
+                <button type="button" class="excel-preview-modal-close" onclick="closeExcelPreview()" title="Close Preview">&times;</button>
+            </div>
+
+            <div id="modalTabsBar" class="excel-preview-modal-tabs">
+                <!-- Dynamically populated sheet tabs -->
+            </div>
+
+            <div id="modalTableBody" class="excel-preview-modal-body">
+                <!-- Dynamically populated spreadsheet table or loading spinner -->
+            </div>
+
+            <div class="excel-preview-modal-footer">
+                <div class="excel-preview-status">
+                    <span>Exporting:</span>
+                    <span id="modalFilenameTag" class="excel-preview-file-tag">report.xlsx</span>
+                    <span id="modalActiveRowsTag" style="font-size: 11px; color: #64748b;">(0 rows)</span>
+                </div>
+                <div class="excel-preview-actions">
+                    <button type="button" class="btn btn-outline" onclick="closeExcelPreview()">Cancel</button>
+                    <a id="modalDownloadBtn" href="#" class="btn btn-primary" download>
+                        ⬇️ Download Excel (.xlsx)
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentStreamData = null;
+        let activeSheetIndex = 0;
+
+        function openExcelPreview(stream) {
+            const modal = document.getElementById('excelPreviewModal');
+            const titleSpan = document.getElementById('modalStreamTitle');
+            const iconSpan = document.getElementById('modalStreamIcon');
+            const dateBadge = document.getElementById('modalDateBadge');
+            const tableBody = document.getElementById('modalTableBody');
+            const tabsBar = document.getElementById('modalTabsBar');
+            const downloadBtn = document.getElementById('modalDownloadBtn');
+            const filenameTag = document.getElementById('modalFilenameTag');
+
+            // Read active date filters from form inputs
+            const startDate = document.getElementById('start_date') ? document.getElementById('start_date').value : '';
+            const endDate = document.getElementById('end_date') ? document.getElementById('end_date').value : '';
+
+            // Update title & button colors
+            if (stream === 'financial') {
+                titleSpan.textContent = 'Financial Analytics Workbook Preview';
+                iconSpan.textContent = '📊';
+                downloadBtn.className = 'btn btn-excel-financial';
+            } else {
+                titleSpan.textContent = 'Shop-Floor Analytics Workbook Preview';
+                iconSpan.textContent = '🏭';
+                downloadBtn.className = 'btn btn-excel-shopfloor';
+            }
+
+            // Set date badge
+            if (startDate && endDate) {
+                dateBadge.textContent = `${startDate} to ${endDate}`;
+            } else if (startDate) {
+                dateBadge.textContent = `From ${startDate}`;
+            } else if (endDate) {
+                dateBadge.textContent = `To ${endDate}`;
+            } else {
+                dateBadge.textContent = 'Full History (Unfiltered)';
+            }
+
+            // Build API & Download URLs
+            const baseUrl = stream === 'financial' ? '/analytics/export/financial/' : '/analytics/export/shopfloor/';
+            const params = new URLSearchParams();
+            if (startDate) params.append('start_date', startDate);
+            if (endDate) params.append('end_date', endDate);
+
+            // Set direct download link
+            const downloadUrl = baseUrl + (params.toString() ? '?' + params.toString() : '');
+            downloadBtn.href = downloadUrl;
+
+            // Show modal & loading state
+            modal.classList.add('active');
+            tabsBar.innerHTML = '';
+            tableBody.innerHTML = `
+                <div class="excel-preview-loading">
+                    <div class="excel-spinner"></div>
+                    <div>Generating spreadsheet preview...</div>
+                </div>
+            `;
+
+            // Append preview=1 for JSON payload
+            params.append('preview', '1');
+            const previewUrl = baseUrl + '?' + params.toString();
+
+            fetch(previewUrl, {
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            })
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to load export preview.`);
+                return res.json();
+            })
+            .then(data => {
+                currentStreamData = data;
+                filenameTag.textContent = data.filename || 'export.xlsx';
+                renderSheetTabs(data.sheets);
+                switchPreviewTab(0);
+            })
+            .catch(err => {
+                tableBody.innerHTML = `
+                    <div class="excel-preview-loading" style="color: var(--accent-red);">
+                        <div style="font-size: 24px;">⚠️</div>
+                        <div style="font-weight: 600;">Unable to load preview</div>
+                        <div style="font-size: 12px; color: #64748b;">${err.message}</div>
+                    </div>
+                `;
+            });
+        }
+
+        function renderSheetTabs(sheets) {
+            const tabsBar = document.getElementById('modalTabsBar');
+            tabsBar.innerHTML = '';
+            sheets.forEach((sheet, idx) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'excel-tab-btn' + (idx === 0 ? ' active' : '');
+                btn.innerHTML = `
+                    <span>${sheet.title}</span>
+                    <span class="excel-tab-count">${sheet.row_count}</span>
+                `;
+                btn.onclick = () => switchPreviewTab(idx);
+                tabsBar.appendChild(btn);
+            });
+        }
+
+        function switchPreviewTab(index) {
+            if (!currentStreamData || !currentStreamData.sheets[index]) return;
+            activeSheetIndex = index;
+            const sheet = currentStreamData.sheets[index];
+
+            // Update tab active states
+            const tabButtons = document.querySelectorAll('#modalTabsBar .excel-tab-btn');
+            tabButtons.forEach((btn, idx) => {
+                btn.classList.toggle('active', idx === index);
+            });
+
+            // Update footer row count indicator
+            document.getElementById('modalActiveRowsTag').textContent = `(${sheet.row_count} rows in ${sheet.title})`;
+
+            // Render table
+            const tableBody = document.getElementById('modalTableBody');
+            if (sheet.rows.length === 0) {
+                tableBody.innerHTML = `
+                    <div class="excel-preview-loading">
+                        <div style="font-size: 24px;">📄</div>
+                        <div style="font-weight: 600;">No records found for active filters</div>
+                        <div style="font-size: 12px; color: #64748b;">The exported Excel sheet will contain column headers with 0 data rows.</div>
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '<table class="excel-spreadsheet-table"><thead><tr>';
+            sheet.headers.forEach(h => {
+                html += `<th>${escapeHtml(h)}</th>`;
+            });
+            html += '</tr></thead><tbody>';
+
+            sheet.rows.forEach(row => {
+                html += '<tr>';
+                row.forEach((cell, cellIdx) => {
+                    const fmt = (sheet.formats[cellIdx] || 'text').toLowerCase();
+                    const cls = 'cell-' + fmt;
+                    html += `<td class="${cls}">${formatCellValue(cell, fmt)}</td>`;
+                });
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+            tableBody.innerHTML = html;
+        }
+
+        function formatCellValue(val, fmt) {
+            if (val === null || val === undefined || val === '') return '-';
+            if (fmt === 'currency') {
+                const num = parseFloat(val);
+                if (!isNaN(num)) {
+                    if (num < 0) {
+                        return '-KSh ' + Math.abs(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    }
+                    return 'KSh ' + num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                }
+            } else if (fmt === 'decimal' || fmt === 'quantity' || fmt === 'float') {
+                const num = parseFloat(val);
+                if (!isNaN(num)) {
+                    return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                }
+            } else if (fmt === 'integer' || fmt === 'int') {
+                const num = parseInt(val, 10);
+                if (!isNaN(num)) {
+                    return num.toLocaleString('en-US');
+                }
+            }
+            return escapeHtml(String(val));
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        function closeExcelPreview() {
+            const modal = document.getElementById('excelPreviewModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleOverlayClick(e) {
+            if (e.target && e.target.id === 'excelPreviewModal') {
+                closeExcelPreview();
+            }
+        }
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeExcelPreview();
+            }
+        });
+    </script>
 </body>
 </html>
