@@ -1,4 +1,4 @@
-# Glass Putty Manufacturing Command Center (ERP / MES / WMS)
+# Manufacturing Command Center (ERP / MES / WMS)
 
 An enterprise-grade manufacturing execution and resource planning system engineered for industrial glass putty production, built on **Django 5.2**, **Django Unfold**, **PostgreSQL / SQLite**, **Django REST Framework (DRF)**, **ReportLab**, and **OpenPyXL**.
 
