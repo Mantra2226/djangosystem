@@ -35,6 +35,13 @@ from .billing_services import (
     apply_customer_credit_notes_to_invoice,
     apply_credit_note_to_open_invoices,
 )
+from .excel_export_service import (
+    export_queryset_to_excel,
+    build_multi_sheet_workbook,
+    apply_worksheet_styling,
+    resolve_attribute,
+    serialize_sheets_for_preview,
+)
 
 __all__ = [
     'log_execution_event',
@@ -57,4 +64,9 @@ __all__ = [
     'execute_customer_bulk_allocation',
     'apply_customer_credit_notes_to_invoice',
     'apply_credit_note_to_open_invoices',
+    'export_queryset_to_excel',
+    'build_multi_sheet_workbook',
+    'apply_worksheet_styling',
+    'resolve_attribute',
+    'serialize_sheets_for_preview',
 ]

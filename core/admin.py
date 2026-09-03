@@ -35,6 +35,7 @@ from .models import (
 )
 from .forms import WorkOrderForm
 from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf, generate_finance_entry_pdf
+from .admin_mixins import OpenPyXLExportMixin
 
 
 def export_as_csv(modeladmin, request, queryset):
@@ -373,7 +374,7 @@ class LowStockFilter(admin.SimpleListFilter):
 
 
 @admin.register(Inventory)
-class InventoryAdmin(ModelAdmin):
+class InventoryAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = (
         'product', 'product_type_badge', 'product_category_display',
         'quantity_available', 'quantity_allocated', 'location',
@@ -389,7 +390,18 @@ class InventoryAdmin(ModelAdmin):
     search_fields = ('product__name', 'product__sku', 'product__category', 'location')
     readonly_fields = ['get_total_valuation', 'quantity_allocated']
     autocomplete_fields = ['product']
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'inventory_catalog'
+    export_fields_map = [
+        ('product.name', 'Item Name', 'text'),
+        ('product.sku', 'SKU', 'text'),
+        ('product.category', 'Category', 'text'),
+        ('quantity_available', 'Available Qty', 'decimal'),
+        ('quantity_allocated', 'Allocated Qty', 'decimal'),
+        ('unit_cost', 'Unit Cost', 'currency'),
+        ('total_valuation', 'Total Valuation', 'currency'),
+        ('location', 'Location', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('product', 'product__supplier')
@@ -426,12 +438,23 @@ class InventoryAdmin(ModelAdmin):
 
 
 @admin.register(StockTransaction)
-class StockTransactionAdmin(ModelAdmin):
+class StockTransactionAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('product', 'quantity', 'transaction_type_badge', 'get_work_order_code', 'created_at')
     list_filter = ['transaction_type', ('created_at', RangeDateFilter)]
     search_fields = ('product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('created_at', 'work_order', 'get_work_order_code', 'dispatch_record')
     autocomplete_fields = ['product', 'work_order', 'dispatch_record']
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'stock_movements'
+    export_fields_map = [
+        ('transaction_id', 'Transaction ID', 'integer'),
+        ('created_at', 'Timestamp', 'datetime'),
+        ('product.name', 'Product Name', 'text'),
+        ('product.sku', 'SKU', 'text'),
+        ('get_transaction_type_display', 'Transaction Type', 'text'),
+        ('quantity', 'Quantity', 'decimal'),
+        ('work_order_code', 'Work Order / Reference', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('product', 'work_order')
@@ -1863,15 +1886,26 @@ class SalesOrderAdmin(ModelAdmin):
 
 
 @admin.register(SalesInvoice)
-class SalesInvoiceAdmin(ModelAdmin):
+class SalesInvoiceAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('invoice_number', 'customer', 'sales_order', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance', 'invoice_date', 'status_badge')
     list_filter = ['status', ('invoice_date', RangeDateFilter), 'customer']
     search_fields = ('invoice_number', 'customer__customer_name', 'sales_order__order_number', 'dispatch__dispatch_code')
     inlines = [SalesInvoiceLineInline, SalesInvoicePaymentsInline]
     autocomplete_fields = ['customer', 'sales_order', 'dispatch']
     readonly_fields = ('invoice_number', 'subtotal', 'tax_amount', 'total_amount', 'get_total_paid', 'get_remaining_balance')
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
     actions_detail = ['action_download_pdf']
+    export_filename_prefix = 'sales_invoices'
+    export_fields_map = [
+        ('invoice_number', 'Invoice #', 'text'),
+        ('customer.customer_name', 'Customer', 'text'),
+        ('get_status_display', 'Status', 'text'),
+        ('invoice_date', 'Invoice Date', 'date'),
+        ('due_date', 'Due Date', 'date'),
+        ('subtotal', 'Subtotal', 'currency'),
+        ('tax_amount', 'Tax Amount', 'currency'),
+        ('total_amount', 'Total Amount', 'currency'),
+    ]
 
     fieldsets = (
         ('Invoice Details', {
@@ -2176,15 +2210,30 @@ class BillOfMaterialAdmin(ModelAdmin):
         return obj.items.count()
 
 
+def get_po_total_amount(obj):
+    if not obj or not obj.pk:
+        return Decimal('0.00')
+    return sum(((item.quantity_ordered or Decimal('0.00')) * (item.price_per_unit or Decimal('0.00')) for item in obj.items.all()), Decimal('0.00'))
+
+
 @admin.register(PurchaseOrder)
-class PurchaseOrderAdmin(ModelAdmin):
+class PurchaseOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('po_number', 'supplier', 'order_date', 'status_badge')
     list_filter = ('status', ('order_date', RangeDateFilter), 'supplier')
     search_fields = ('po_number', 'supplier__name', 'supplier__supplier_code')
     autocomplete_fields = ['supplier']
     inlines = [PurchaseOrderItemInline]
     readonly_fields = ('po_number', 'order_date', 'status')
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'purchase_orders'
+    export_fields_map = [
+        ('po_number', 'PO #', 'text'),
+        ('supplier.name', 'Supplier', 'text'),
+        ('get_status_display', 'Status', 'text'),
+        ('order_date', 'Order Date', 'date'),
+        (get_po_total_amount, 'Total Amount', 'currency'),
+        ('notes', 'Notes', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('supplier').prefetch_related('items__product')
@@ -2308,7 +2357,7 @@ class DispatchRecordAdmin(ModelAdmin):
 
 
 @admin.register(WorkOrder)
-class WorkOrderAdmin(ModelAdmin):
+class WorkOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
     form = WorkOrderForm
     list_display = ('work_order_code', 'category_badge', 'product', 'display_employees', 'display_target_quantity', 'actual_quantity_produced', 'production_start_date', 'production_end_date', 'status_badge', 'is_inventory_updated')
     list_display_links = ('work_order_code',)
@@ -2318,7 +2367,18 @@ class WorkOrderAdmin(ModelAdmin):
     list_filter = ['category', 'status', 'is_inventory_updated', ('production_start_date', RangeDateFilter)]
     search_fields = ('work_order_code', 'product__name', 'product__sku', 'employee__employee_name')
     filter_horizontal = ('employee',)
-    actions = [export_as_csv, 'action_reconcile_production_stock', 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing']
+    actions = [export_as_csv, 'action_reconcile_production_stock', 'action_top_up_bulk', 'action_downscale_target', 'action_hold_for_existing', 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'work_orders'
+    export_fields_map = [
+        ('work_order_code', 'Order #', 'text'),
+        ('product.name', 'Product', 'text'),
+        ('get_category_display', 'Category', 'text'),
+        ('target_quantity', 'Planned Batch Size', 'decimal'),
+        ('actual_quantity_produced', 'Actual Output', 'decimal'),
+        ('get_status_display', 'Status', 'text'),
+        ('production_start_date', 'Start Date', 'date'),
+        ('production_end_date', 'Completion Date', 'datetime'),
+    ]
 
     class Media:
         js = ('admin/js/workorder_toggle.js', 'admin/js/work_order_category_toggle.js')
@@ -2712,12 +2772,25 @@ class WorkOrderAdmin(ModelAdmin):
 
 
 @admin.register(MaterialVarianceRecord)
-class MaterialVarianceRecordAdmin(ModelAdmin):
+class MaterialVarianceRecordAdmin(OpenPyXLExportMixin, ModelAdmin):
     list_display = ('variance_code', 'work_order', 'get_production_run_type', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'get_financial_impact', 'classification_badge', 'recorded_at')
     list_filter = ['work_order__category', 'variance_classification', ('recorded_at', RangeDateFilter)]
     search_fields = ('variance_code', 'product__name', 'product__sku', 'work_order__work_order_code')
     readonly_fields = ('variance_code', 'get_production_run_type', 'work_order_material_line', 'work_order', 'product', 'quantity_expected', 'quantity_actual', 'quantity_variance', 'unit_cost', 'financial_impact', 'variance_percentage', 'efficiency_rate', 'variance_classification', 'notes', 'recorded_at')
-    actions = [export_as_csv]
+    actions = [export_as_csv, 'action_bulk_export_selected_to_excel']
+    export_filename_prefix = 'material_variances'
+    export_fields_map = [
+        ('variance_code', 'Variance Code', 'text'),
+        ('work_order.work_order_code', 'Work Order', 'text'),
+        ('product.name', 'Component', 'text'),
+        ('product.sku', 'SKU', 'text'),
+        ('quantity_expected', 'Standard Qty', 'decimal'),
+        ('quantity_actual', 'Actual Consumed', 'decimal'),
+        ('quantity_variance', 'Variance Qty', 'decimal'),
+        ('unit_cost', 'Unit Cost', 'currency'),
+        ('financial_impact', 'Variance Cost', 'currency'),
+        ('get_variance_classification_display', 'Classification', 'text'),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('work_order', 'product', 'work_order_material_line')

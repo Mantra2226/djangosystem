@@ -405,6 +405,288 @@ def reports_dashboard_view(request):
     return render(request, 'core/reports_dashboard.html', context)
 
 
+@staff_member_required
+def export_financial_analytics_excel(request):
+    """
+    Dual-Stream Executive Dashboard Export: Financial Analytics (.xlsx)
+    Includes:
+    - Tab 1: P&L Summary (Revenue, COGS, Gross Profit, Operating Expenses, Net Income)
+    - Tab 2: Sales Invoices (Itemized invoices with subtotal, tax, paid, remaining balance)
+    - Tab 3: COGS Dispatches (Delivered dispatch records reconciled with P&L COGS headline)
+    """
+    from datetime import datetime
+    from decimal import Decimal
+    from .reports import get_profit_and_loss_summary
+    from .services.excel_export_service import build_multi_sheet_workbook
+
+    start_date_str = request.GET.get('start_date')
+    end_date_str = request.GET.get('end_date')
+
+    start_date = None
+    end_date = None
+
+    if start_date_str:
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    if end_date_str:
+        try:
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    pnl = get_profit_and_loss_summary(start_date, end_date)
+
+    # Sheet 1: P&L Summary
+    sheet1_rows = [
+        ['Sales Invoice Revenue', pnl['sales_revenue'], 'Revenue from issued customer sales invoices'],
+        ['Other Operating Income', pnl['total_revenue'] - pnl['sales_revenue'], 'Financial ledger income entries'],
+        ['Total Revenue', pnl['total_revenue'], 'Gross revenue inflow'],
+        ['Cost of Goods Sold (COGS)', pnl['cogs'], 'Evaluated cost of delivered product dispatches'],
+        ['Gross Profit', pnl['gross_profit'], 'Total Revenue minus Cost of Goods Sold'],
+        ['Gross Margin Rate', f"{pnl['gross_margin_pct']}%", 'Gross Profit as a percentage of Total Revenue'],
+        ['Operating Expenses', pnl['operating_expenses'], 'Operating ledger expenses'],
+        ['Net Operating Income', pnl['net_income'], 'Gross Profit minus Operating Expenses'],
+    ]
+    sheet1 = {
+        'title': 'P&L Summary',
+        'headers': ['Financial Statement Line', 'Amount / Value', 'Classification / Notes'],
+        'formats': ['text', 'currency', 'text'],
+        'rows': sheet1_rows
+    }
+
+    # Sheet 2: Sales Invoices
+    inv_qs = SalesInvoice.objects.all().select_related('customer', 'sales_order')
+    if start_date:
+        inv_qs = inv_qs.filter(invoice_date__gte=start_date)
+    if end_date:
+        inv_qs = inv_qs.filter(invoice_date__lte=end_date)
+    inv_qs = inv_qs.order_by('-invoice_date')
+
+    sheet2_rows = []
+    for inv in inv_qs:
+        cust_name = inv.customer.customer_name if inv.customer else 'N/A'
+        so_num = inv.sales_order.order_number if inv.sales_order else '-'
+        sheet2_rows.append([
+            inv.invoice_number,
+            cust_name,
+            so_num,
+            inv.get_status_display(),
+            inv.invoice_date,
+            inv.due_date,
+            inv.subtotal,
+            inv.tax_amount,
+            inv.total_amount,
+            inv.total_paid,
+            inv.remaining_balance,
+        ])
+    sheet2 = {
+        'title': 'Sales Invoices',
+        'headers': ['Invoice #', 'Customer', 'Sales Order', 'Status', 'Invoice Date', 'Due Date', 'Subtotal', 'Tax Amount', 'Total Amount', 'Total Paid', 'Remaining Balance'],
+        'formats': ['text', 'text', 'text', 'text', 'date', 'date', 'currency', 'currency', 'currency', 'currency', 'currency'],
+        'rows': sheet2_rows
+    }
+
+    # Sheet 3: COGS Dispatches (Itemized lines strictly reconciled with P&L COGS)
+    disp_qs = DispatchRecord.objects.filter(status='delivered').select_related('customer', 'product', 'sales_order_item__sales_order')
+    if start_date:
+        disp_qs = disp_qs.filter(dispatch_date__gte=start_date)
+    if end_date:
+        disp_qs = disp_qs.filter(dispatch_date__lte=end_date)
+    disp_qs = disp_qs.order_by('-dispatch_date')
+
+    sheet3_rows = []
+    for disp in disp_qs:
+        cust_name = disp.customer.customer_name if disp.customer else (disp.sales_order_item.sales_order.customer.customer_name if (disp.sales_order_item and disp.sales_order_item.sales_order and disp.sales_order_item.sales_order.customer) else 'N/A')
+        so_num = disp.sales_order_item.sales_order.order_number if (disp.sales_order_item and disp.sales_order_item.sales_order) else '-'
+        prod_name = disp.product.name if disp.product else 'N/A'
+        sku = disp.product.sku if disp.product else '-'
+        
+        inv = disp.product.stock.first() if disp.product else None
+        prod_cost = inv.unit_cost if (inv and inv.unit_cost) else Decimal('0.00')
+        line_cogs = ((disp.quantity_dispatched or Decimal('0.00')) * prod_cost).quantize(Decimal('0.01'))
+
+        sheet3_rows.append([
+            disp.dispatch_code or f"DISP-{disp.dispatch_id}",
+            cust_name,
+            so_num,
+            prod_name,
+            sku,
+            disp.quantity_dispatched,
+            prod_cost,
+            line_cogs,
+            disp.dispatch_date,
+            disp.delivery_date,
+        ])
+    sheet3 = {
+        'title': 'COGS Dispatches',
+        'headers': ['Dispatch Code', 'Customer', 'Sales Order', 'Product', 'SKU', 'Quantity Dispatched', 'Unit Cost', 'COGS Line Valuation', 'Dispatch Date', 'Delivery Date'],
+        'formats': ['text', 'text', 'text', 'text', 'text', 'decimal', 'currency', 'currency', 'date', 'date'],
+        'rows': sheet3_rows
+    }
+
+    sheets = [sheet1, sheet2, sheet3]
+    if request.GET.get('preview') == '1':
+        from .services.excel_export_service import serialize_sheets_for_preview
+        from django.utils import timezone
+        return JsonResponse({
+            'stream': 'financial',
+            'stream_title': 'Financial Analytics Workbook',
+            'filename': f"financial_analytics_{timezone.now().strftime('%Y-%m-%d')}.xlsx",
+            'sheets': serialize_sheets_for_preview(sheets),
+            'start_date': start_date_str or '',
+            'end_date': end_date_str or '',
+        })
+
+    return build_multi_sheet_workbook(sheets, filename_prefix='financial_analytics')
+
+
+@staff_member_required
+def export_shopfloor_analytics_excel(request):
+    """
+    Dual-Stream Executive Dashboard Export: Shop-Floor Analytics (.xlsx)
+    Includes:
+    - Tab 1: Completed Builds (Work Orders completed in range, cycle dates, output)
+    - Tab 2: Material Variances & Scrap (Component over/under consumption and financial impact)
+    - Tab 3: Low-Stock Buffer Alerts (Inventory items <= 10 units with reorder thresholds)
+    """
+    from datetime import datetime
+    from decimal import Decimal
+    from .services.excel_export_service import build_multi_sheet_workbook
+
+    start_date_str = request.GET.get('start_date')
+    end_date_str = request.GET.get('end_date')
+
+    start_date = None
+    end_date = None
+
+    if start_date_str:
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    if end_date_str:
+        try:
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    # Sheet 1: Completed Builds
+    wo_qs = WorkOrder.objects.filter(status='COMPLETED').select_related('product', 'bill_of_material')
+    if start_date:
+        wo_qs = wo_qs.filter(production_start_date__gte=start_date)
+    if end_date:
+        wo_qs = wo_qs.filter(production_start_date__lte=end_date)
+    wo_qs = wo_qs.order_by('-production_start_date')
+
+    sheet1_rows = []
+    for wo in wo_qs:
+        prod_name = wo.product.name if wo.product else 'N/A'
+        sheet1_rows.append([
+            wo.work_order_code,
+            prod_name,
+            wo.get_category_display(),
+            wo.target_quantity,
+            wo.actual_quantity_produced if wo.actual_quantity_produced is not None else wo.quantity_produced,
+            wo.scrap_quantity or Decimal('0.00'),
+            wo.get_status_display(),
+            wo.production_start_date,
+            wo.production_end_date,
+        ])
+    sheet1 = {
+        'title': 'Completed Builds',
+        'headers': ['Work Order #', 'Product', 'Category', 'Target Quantity', 'Actual Output', 'Scrap Quantity', 'Status', 'Start Date', 'Completion Date'],
+        'formats': ['text', 'text', 'text', 'decimal', 'decimal', 'decimal', 'text', 'date', 'datetime'],
+        'rows': sheet1_rows
+    }
+
+    # Sheet 2: Material Variances & Scrap
+    mvr_qs = MaterialVarianceRecord.objects.all().select_related('work_order', 'product')
+    if start_date:
+        mvr_qs = mvr_qs.filter(recorded_at__gte=start_date)
+    if end_date:
+        mvr_qs = mvr_qs.filter(recorded_at__lte=end_date)
+    mvr_qs = mvr_qs.order_by('-recorded_at')
+
+    sheet2_rows = []
+    for mvr in mvr_qs:
+        wo_code = mvr.work_order.work_order_code if mvr.work_order else '-'
+        comp_name = mvr.product.name if mvr.product else 'N/A'
+        sku = mvr.product.sku if mvr.product else '-'
+        sheet2_rows.append([
+            mvr.variance_code,
+            wo_code,
+            comp_name,
+            sku,
+            mvr.quantity_expected,
+            mvr.quantity_actual,
+            mvr.quantity_variance,
+            mvr.unit_cost,
+            mvr.financial_impact,
+            mvr.get_variance_classification_display(),
+            mvr.efficiency_rate,
+            mvr.recorded_at,
+        ])
+    sheet2 = {
+        'title': 'Material Variances',
+        'headers': ['Variance Code', 'Work Order #', 'Component', 'SKU', 'Expected Qty', 'Actual Qty', 'Variance Qty', 'Unit Cost', 'Financial Impact', 'Classification', 'Efficiency Rate %', 'Recorded Timestamp'],
+        'formats': ['text', 'text', 'text', 'text', 'decimal', 'decimal', 'decimal', 'currency', 'currency', 'text', 'decimal', 'datetime'],
+        'rows': sheet2_rows
+    }
+
+    # Sheet 3: Low-Stock Buffer Alerts
+    inv_qs = Inventory.objects.filter(quantity_available__lte=10).select_related('product', 'product__supplier').order_by('quantity_available')
+
+    sheet3_rows = []
+    reorder_threshold = Decimal('10.00')
+    for inv in inv_qs:
+        prod_name = inv.product.name if inv.product else 'N/A'
+        sku = inv.product.sku if inv.product else '-'
+        cat = inv.product.category if (inv.product and inv.product.category) else '-'
+        supp_name = inv.product.supplier.name if (inv.product and inv.product.supplier) else 'N/A'
+        avail = inv.quantity_available or Decimal('0.00')
+        deficit = max(Decimal('0.00'), reorder_threshold - avail)
+        val = (avail * (inv.unit_cost or Decimal('0.00'))).quantize(Decimal('0.01'))
+
+        sheet3_rows.append([
+            prod_name,
+            sku,
+            cat,
+            avail,
+            inv.quantity_allocated or Decimal('0.00'),
+            reorder_threshold,
+            deficit,
+            inv.unit_cost or Decimal('0.00'),
+            val,
+            inv.location,
+            supp_name,
+        ])
+    sheet3 = {
+        'title': 'Low-Stock Alerts',
+        'headers': ['Product Name', 'SKU', 'Category', 'Available Stock', 'Allocated Stock', 'Reorder Threshold', 'Stock Deficit', 'Unit Cost', 'Total Valuation', 'Location', 'Supplier'],
+        'formats': ['text', 'text', 'text', 'decimal', 'decimal', 'decimal', 'decimal', 'currency', 'currency', 'text', 'text'],
+        'rows': sheet3_rows
+    }
+
+    sheets = [sheet1, sheet2, sheet3]
+    if request.GET.get('preview') == '1':
+        from .services.excel_export_service import serialize_sheets_for_preview
+        from django.utils import timezone
+        return JsonResponse({
+            'stream': 'shopfloor',
+            'stream_title': 'Shop-Floor Analytics Workbook',
+            'filename': f"shopfloor_analytics_{timezone.now().strftime('%Y-%m-%d')}.xlsx",
+            'sheets': serialize_sheets_for_preview(sheets),
+            'start_date': start_date_str or '',
+            'end_date': end_date_str or '',
+        })
+
+    return build_multi_sheet_workbook(sheets, filename_prefix='shopfloor_analytics')
+
+
 # =============================================================================
 # RESTFUL JSON API ENDPOINTS (Utilizing core/serializers.py)
 # =============================================================================
