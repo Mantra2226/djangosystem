@@ -13,6 +13,7 @@ register = template.Library()
 
 
 @register.filter(name='currency')
+@register.filter(name='format_currency')
 def currency(value, arg=None):
     """
     Formats a numeric value into a currency string with thousands separators

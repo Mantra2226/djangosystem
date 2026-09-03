@@ -1,0 +1,444 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static currency_filters %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="px-4 lg:px-8 py-3 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 text-sm flex items-center gap-2" style="padding: 12px 24px; background: #ffffff; border-bottom: 1px solid #e2e8f0; font-size: 13px;">
+    <a href="{% url 'admin:index' %}" style="color: #2563eb; text-decoration: none;">{% trans 'Home' %}</a>
+    <span style="color: #94a3b8;">/</span>
+    <a href="{% url 'admin:core_workorder_changelist' %}" style="color: #2563eb; text-decoration: none;">{% trans 'Work Orders' %}</a>
+    <span style="color: #94a3b8;">/</span>
+    <a href="{% url 'admin:core_workorder_change' work_order.pk %}" style="color: #2563eb; text-decoration: none;">{{ work_order.work_order_code|default:work_order.pk }}</a>
+    <span style="color: #94a3b8;">/</span>
+    <span style="color: #1e293b; font-weight: 600;">{% trans 'Execution History & Audit' %}</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div style="max-width: 1320px; margin: 0 auto; padding: 24px 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b;">
+
+    <!-- TOP HEADER WITH ACTION CONTROLS -->
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px; margin-bottom: 24px;">
+        <div>
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+                <span style="background: #4f46e5; color: #ffffff; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px;">
+                    OPERATIONAL AUDIT TIMELINE
+                </span>
+                <span style="font-size: 13px; color: #64748b; font-weight: 500;">Hybrid Inventory Engine Execution Log</span>
+            </div>
+            <h1 style="font-size: 26px; font-weight: 800; color: #0f172a; margin: 0 0 6px 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                Work Order: {{ work_order.work_order_code|default:work_order.pk }}
+                {% if work_order.status == 'COMPLETED' %}
+                    <span style="background: #10b981; color: #ffffff; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 9999px;">COMPLETED</span>
+                {% elif work_order.status == 'IN_PROGRESS' %}
+                    <span style="background: #2563eb; color: #ffffff; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 9999px;">IN PROGRESS</span>
+                {% elif work_order.status == 'ON_HOLD_SHORTAGE' %}
+                    <span style="background: #ef4444; color: #ffffff; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 9999px;">ON HOLD</span>
+                {% else %}
+                    <span style="background: #64748b; color: #ffffff; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 9999px;">{{ work_order.status }}</span>
+                {% endif %}
+            </h1>
+            <p style="margin: 0; font-size: 14px; color: #64748b;">
+                Manufactured Item: <strong style="color: #334155;">{{ work_order.product.name }}</strong> (SKU: {{ work_order.product.sku|default:"N/A" }}) &bull; Target Batch: <strong style="color: #4f46e5;">{{ work_order.target_quantity|default:work_order.quantity_produced }} units</strong>
+            </p>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <a href="{% url 'admin:core_workorder_change' work_order.pk %}" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #ffffff; color: #475569; border-radius: 6px; font-size: 13px; font-weight: 600; text-decoration: none; border: 1px solid #cbd5e1; box-shadow: 0 1px 2px rgba(0,0,0,0.05); transition: all 0.15s ease;">
+                &larr; Back to Order Edit Form
+            </a>
+            <a href="{% url 'admin:core_processexecutionlog_changelist' %}?work_order__id__exact={{ work_order.pk }}" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #ede9fe; color: #5b21b6; border-radius: 6px; font-size: 13px; font-weight: 700; text-decoration: none; border: 1px solid #ddd6fe;">
+                View in Audit Changelist &rarr;
+            </a>
+        </div>
+    </div>
+
+    <!-- WORK ORDER EXECUTIVE SUMMARY CARD -->
+    <div style="background: #ffffff; border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 20px; margin-bottom: 24px;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px;">
+            <div style="border-left: 4px solid #4f46e5; padding-left: 12px;">
+                <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b;">Operational Category</div>
+                <div style="font-size: 15px; font-weight: 700; color: #1e293b; margin-top: 3px;">
+                    {{ work_order.get_category_display|default:work_order.category }}
+                </div>
+                <div style="font-size: 11px; color: #94a3b8; margin-top: 2px;">
+                    Recipe: {{ work_order.bill_of_material.name|default:"No Active BOM" }}
+                </div>
+            </div>
+
+            <div style="border-left: 4px solid #0284c7; padding-left: 12px;">
+                <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b;">Target vs. Produced Yield</div>
+                <div style="font-size: 15px; font-weight: 700; color: #0369a1; margin-top: 3px;">
+                    {{ work_order.target_quantity|default:work_order.quantity_produced }} target &rarr; {{ work_order.actual_quantity_produced|default:"0.00" }} actual
+                </div>
+                <div style="font-size: 11px; color: #94a3b8; margin-top: 2px;">
+                    Scrap Yield: {{ work_order.scrap_quantity|default:"0.00" }} units
+                </div>
+            </div>
+
+            <div style="border-left: 4px solid #10b981; padding-left: 12px;">
+                <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b;">Inventory Safety Gates</div>
+                <div style="display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap;">
+                    <span style="font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; {% if work_order.is_inventory_allocated %}background: #dcfce7; color: #166534;{% else %}background: #fee2e2; color: #991b1b;{% endif %}">
+                        Phase 1 Alloc: {% if work_order.is_inventory_allocated %}PASSED{% else %}PENDING{% endif %}
+                    </span>
+                    <span style="font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; {% if work_order.is_inventory_updated %}background: #dcfce7; color: #166534;{% else %}background: #fee2e2; color: #991b1b;{% endif %}">
+                        Phase 3 Reconciled: {% if work_order.is_inventory_updated %}POSTED{% else %}PENDING{% endif %}
+                    </span>
+                </div>
+                <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                    Lock status verified
+                </div>
+            </div>
+
+            <div style="border-left: 4px solid #f59e0b; padding-left: 12px;">
+                <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b;">Timestamps & Personnel</div>
+                <div style="font-size: 13px; font-weight: 600; color: #1e293b; margin-top: 3px;">
+                    Start: {{ work_order.production_start_date|default:"Not Started" }}
+                </div>
+                <div style="font-size: 12px; color: #64748b; margin-top: 2px;">
+                    End: {{ work_order.production_end_date|date:"Y-m-d H:i"|default:"In Progress" }}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ACTIVE COMPETING RUNS ALERT (CONTESTED STOCK ALLOCATION) -->
+    {% if competing_runs %}
+    <div style="background: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #d97706; border-radius: 8px; padding: 18px 20px; margin-bottom: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.04);">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <span style="font-size: 20px;">&#9888;</span>
+                <div>
+                    <h3 style="margin: 0; font-size: 15px; font-weight: 700; color: #92400e;">
+                        Contested Stock Warning: {{ competing_runs|length }} Active Run(s) Holding Shared Component Allocations
+                    </h3>
+                    <p style="margin: 2px 0 0 0; font-size: 12px; color: #b45309;">
+                        Other In-Progress work orders currently reserve physical raw material stock required by this build recipe.
+                    </p>
+                </div>
+            </div>
+            <span style="background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 9999px; border: 1px solid #fcd34d;">
+                ACTIVE CONCURRENT POOL
+            </span>
+        </div>
+
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+                <thead>
+                    <tr style="background: #fef3c7; color: #78350f; border-bottom: 1px solid #fde68a;">
+                        <th style="padding: 8px 12px; font-weight: 700;">Competing Work Order</th>
+                        <th style="padding: 8px 12px; font-weight: 700;">Target Output Product</th>
+                        <th style="padding: 8px 12px; font-weight: 700;">Batch Size</th>
+                        <th style="padding: 8px 12px; font-weight: 700;">Ingredients Held &amp; Reserved</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for cr in competing_runs %}
+                    <tr style="border-bottom: 1px solid #fef3c7;">
+                        <td style="padding: 8px 12px; font-weight: 700;">
+                            <a href="{% url 'admin:core_workorder_change' cr.work_order.pk %}" style="color: #2563eb; text-decoration: underline;">
+                                {{ cr.order_code }}
+                            </a>
+                        </td>
+                        <td style="padding: 8px 12px; color: #475569;">{{ cr.product_name }}</td>
+                        <td style="padding: 8px 12px; font-weight: 600; color: #1e293b;">{{ cr.target_quantity|floatformat:2 }} units</td>
+                        <td style="padding: 8px 12px;">
+                            {% for c in cr.components %}
+                                <span style="background: #ffffff; color: #b45309; border: 1px solid #fde68a; padding: 2px 6px; border-radius: 4px; margin-right: 4px; display: inline-block; font-size: 11px;">
+                                    <strong>{{ c.allocated_qty|floatformat:2 }} {{ c.unit }}</strong> {{ c.component_name }}
+                                </span>
+                            {% endfor %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- LIFECYCLE MILESTONE STEPPER BAR -->
+    <div style="background: #ffffff; border-radius: 10px; border: 1px solid #e2e8f0; padding: 20px; margin-bottom: 28px; box-shadow: 0 2px 4px rgba(0,0,0,0.03);">
+        <h3 style="margin: 0 0 16px 0; font-size: 14px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.5px;">
+            Execution Pipeline Status
+        </h3>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
+            
+            <!-- Milestone 1: Phase 1 Stock Allocation -->
+            <div style="border-radius: 8px; padding: 14px; {% if milestones.phase1.completed %}background: #f0fdf4; border: 1px solid #bbf7d0;{% else %}background: #f8fafc; border: 1px solid #e2e8f0;{% endif %}">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                    <span style="font-size: 12px; font-weight: 700; {% if milestones.phase1.completed %}color: #166534;{% else %}color: #64748b;{% endif %}">
+                        Phase 1: Allocation
+                    </span>
+                    {% if milestones.phase1.completed %}
+                        <span style="background: #10b981; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">&#10003; VERIFIED</span>
+                    {% else %}
+                        <span style="background: #94a3b8; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">PENDING</span>
+                    {% endif %}
+                </div>
+                <div style="font-size: 13px; font-weight: 600; color: #1e293b;">Component Reservation</div>
+                <div style="font-size: 11px; color: #64748b; margin-top: 4px;">
+                    {% if milestones.phase1.log %}
+                        Logged as {{ milestones.phase1.log.log_code }} on {{ milestones.phase1.log.created_at|date:"M d, H:i" }}
+                    {% else %}
+                        Pending start of production
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- Milestone 2: Phase 2 Incremental Consumption -->
+            <div style="border-radius: 8px; padding: 14px; {% if milestones.phase2.completed %}background: #f0fdf4; border: 1px solid #bbf7d0;{% elif milestones.phase2.in_progress %}background: #eff6ff; border: 1px solid #bfdbfe;{% else %}background: #f8fafc; border: 1px solid #e2e8f0;{% endif %}">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                    <span style="font-size: 12px; font-weight: 700; {% if milestones.phase2.completed %}color: #166534;{% elif milestones.phase2.in_progress %}color: #1d4ed8;{% else %}color: #64748b;{% endif %}">
+                        Phase 2: Actual Usage
+                    </span>
+                    {% if milestones.phase2.completed %}
+                        <span style="background: #10b981; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">&#10003; LOGGED</span>
+                    {% elif milestones.phase2.in_progress %}
+                        <span style="background: #2563eb; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">IN PROGRESS</span>
+                    {% else %}
+                        <span style="background: #94a3b8; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">PENDING</span>
+                    {% endif %}
+                </div>
+                <div style="font-size: 13px; font-weight: 600; color: #1e293b;">Shop Floor Deductions</div>
+                <div style="font-size: 11px; color: #64748b; margin-top: 4px;">
+                    {% if milestones.phase2.logs %}
+                        {{ milestones.phase2.logs|length }} consumption pass(es) executed
+                    {% else %}
+                        Waiting for physical consumption actuals
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- Milestone 3: Phase 3 Stock Reconciliation & Yield -->
+            <div style="border-radius: 8px; padding: 14px; {% if milestones.phase3.completed %}background: #f0fdf4; border: 1px solid #bbf7d0;{% else %}background: #f8fafc; border: 1px solid #e2e8f0;{% endif %}">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                    <span style="font-size: 12px; font-weight: 700; {% if milestones.phase3.completed %}color: #166534;{% else %}color: #64748b;{% endif %}">
+                        Phase 3: Reconciliation
+                    </span>
+                    {% if milestones.phase3.completed %}
+                        <span style="background: #10b981; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">&#10003; RECONCILED</span>
+                    {% else %}
+                        <span style="background: #94a3b8; color: white; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">PENDING</span>
+                    {% endif %}
+                </div>
+                <div style="font-size: 13px; font-weight: 600; color: #1e293b;">Output Yield &amp; AVCO</div>
+                <div style="font-size: 11px; color: #64748b; margin-top: 4px;">
+                    {% if milestones.phase3.log %}
+                        {{ milestones.phase3.log.log_code }} posted output on {{ milestones.phase3.log.created_at|date:"M d, H:i" }}
+                    {% else %}
+                        Runs automatically on COMPLETED
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- CHRONOLOGICAL EXECUTION AUDIT TIMELINE -->
+    <div style="margin-bottom: 32px;">
+        <h3 style="font-size: 16px; font-weight: 800; color: #0f172a; margin: 0 0 16px 0; display: flex; align-items: center; gap: 8px;">
+            <span>Chronological Event History</span>
+            <span style="background: #f1f5f9; color: #475569; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 12px;">
+                {{ logs|length }} Total Records
+            </span>
+        </h3>
+
+        {% if not logs %}
+        <div style="background: #ffffff; border: 2px dashed #cbd5e1; border-radius: 10px; padding: 40px; text-align: center; color: #64748b;">
+            <div style="font-size: 32px; margin-bottom: 8px;">&#128221;</div>
+            <h4 style="margin: 0 0 4px 0; font-size: 15px; font-weight: 700; color: #334155;">No Execution Logs Captured Yet</h4>
+            <p style="margin: 0; font-size: 13px;">
+                Operational logs are automatically recorded when this Work Order is started, consumed, and reconciled.
+            </p>
+        </div>
+        {% else %}
+        <div style="display: flex; flex-direction: column; gap: 18px;">
+            {% for log in logs %}
+            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.03); overflow: hidden; border-left: 6px solid {% if log.level == 'SUCCESS' %}#10b981{% elif log.level == 'WARNING' %}#f59e0b{% elif log.level == 'ERROR' %}#ef4444{% elif log.level == 'DEBUG' %}#64748b{% else %}#0284c7{% endif %};">
+                
+                <!-- Card Header -->
+                <div style="padding: 12px 18px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                        <span style="font-family: monospace; font-weight: 800; font-size: 13px; color: #0f172a; background: #e2e8f0; padding: 2px 8px; border-radius: 4px;">
+                            {{ log.log_code|default:log.log_id }}
+                        </span>
+                        
+                        <!-- Level Badge -->
+                        <span style="font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 4px; {% if log.level == 'SUCCESS' %}background: #10b981; color: white;{% elif log.level == 'WARNING' %}background: #f59e0b; color: white;{% elif log.level == 'ERROR' %}background: #ef4444; color: white;{% elif log.level == 'DEBUG' %}background: #64748b; color: white;{% else %}background: #0284c7; color: white;{% endif %}">
+                            {{ log.get_level_display }}
+                        </span>
+
+                        <!-- Process Type Badge -->
+                        <span style="font-size: 11px; font-weight: 700; background: #ede9fe; color: #6d28d9; padding: 2px 8px; border-radius: 4px;">
+                            {{ log.get_process_type_display }}
+                        </span>
+
+                        {% if log.event_title %}
+                            <span style="font-size: 13px; font-weight: 700; color: #334155;">
+                                {{ log.event_title }}
+                            </span>
+                        {% endif %}
+                    </div>
+
+                    <div style="font-size: 12px; color: #64748b; display: flex; align-items: center; gap: 12px;">
+                        {% if log.logged_by %}
+                            <span>Logged By: <strong style="color: #334155;">{{ log.logged_by.username }}</strong></span>
+                        {% endif %}
+                        <span>{{ log.created_at|date:"Y-m-d H:i:s" }}</span>
+                    </div>
+                </div>
+
+                <!-- Card Body -->
+                <div style="padding: 16px 18px;">
+                    <p style="margin: 0 0 12px 0; font-size: 14px; color: #1e293b; line-height: 1.5;">
+                        {{ log.message }}
+                    </p>
+
+                    <!-- SPECIALIZED VISUALIZATION: PHASE 1 STOCK ALLOCATION -->
+                    {% if log.process_type == 'STOCK_ALLOCATION' and log.details.allocated_components %}
+                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 12px; font-weight: 700; color: #475569; text-transform: uppercase;">
+                            Reserved Raw Material Inventory Shifts &amp; Competing Runs
+                        </h4>
+                        <div style="overflow-x: auto;">
+                            <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+                                <thead>
+                                    <tr style="border-bottom: 2px solid #e2e8f0; color: #64748b; font-size: 11px; text-transform: uppercase;">
+                                        <th style="padding: 6px 10px;">Component Name</th>
+                                        <th style="padding: 6px 10px;">BOM Mult</th>
+                                        <th style="padding: 6px 10px;">Allocated Qty</th>
+                                        <th style="padding: 6px 10px;">Available Shift</th>
+                                        <th style="padding: 6px 10px;">Allocated Shift</th>
+                                        <th style="padding: 6px 10px;">Competing Active Runs</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for ac in log.details.allocated_components %}
+                                    <tr style="border-bottom: 1px solid #f1f5f9;">
+                                        <td style="padding: 6px 10px; font-weight: 700; color: #1e293b;">{{ ac.component_name }}</td>
+                                        <td style="padding: 6px 10px; color: #64748b;">{{ ac.unit_req }}x</td>
+                                        <td style="padding: 6px 10px; font-weight: 700; color: #0284c7;">{{ ac.allocated_qty|floatformat:2 }}</td>
+                                        <td style="padding: 6px 10px; font-family: monospace; color: #475569;">
+                                            {{ ac.inventory_shift.available.before|floatformat:2 }} &rarr; <strong>{{ ac.inventory_shift.available.after|floatformat:2 }}</strong>
+                                        </td>
+                                        <td style="padding: 6px 10px; font-family: monospace; color: #475569;">
+                                            {{ ac.inventory_shift.allocated.before|floatformat:2 }} &rarr; <strong style="color: #059669;">{{ ac.inventory_shift.allocated.after|floatformat:2 }}</strong>
+                                        </td>
+                                        <td style="padding: 6px 10px;">
+                                            {% if ac.competing_allocations %}
+                                                {% for ca in ac.competing_allocations %}
+                                                    <span style="background: #fffbeb; color: #b45309; border: 1px solid #fde68a; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block;">
+                                                        {{ ca.order_code }} ({{ ca.held_qty|floatformat:2 }})
+                                                    </span>
+                                                {% endfor %}
+                                            {% else %}
+                                                <span style="color: #94a3b8; font-style: italic;">None (Exclusive)</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <!-- SPECIALIZED VISUALIZATION: PHASE 2 MATERIAL CONSUMPTION -->
+                    {% if log.details.phase == 'PHASE_2_CONSUMPTION' and log.details.components %}
+                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 12px; font-weight: 700; color: #475569; text-transform: uppercase;">
+                            Actual Material Consumption Run Breakdown
+                        </h4>
+                        <div style="overflow-x: auto;">
+                            <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+                                <thead>
+                                    <tr style="border-bottom: 2px solid #e2e8f0; color: #64748b; font-size: 11px; text-transform: uppercase;">
+                                        <th style="padding: 6px 10px;">Component</th>
+                                        <th style="padding: 6px 10px;">Planned Allocated</th>
+                                        <th style="padding: 6px 10px;">Actual Physical Used</th>
+                                        <th style="padding: 6px 10px;">Net Variance Delta</th>
+                                        <th style="padding: 6px 10px;">Ledger Stock Transaction</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for c in log.details.components %}
+                                    <tr style="border-bottom: 1px solid #f1f5f9;">
+                                        <td style="padding: 6px 10px; font-weight: 700; color: #1e293b;">{{ c.material_name }}</td>
+                                        <td style="padding: 6px 10px; color: #475569;">{{ c.planned_allocated_qty|floatformat:2 }} {{ c.unit }}</td>
+                                        <td style="padding: 6px 10px; font-weight: 700; color: #0284c7;">{{ c.actual_consumed_qty|floatformat:2 }} {{ c.unit }}</td>
+                                        <td style="padding: 6px 10px; font-weight: 700; {% if c.delta_amount > 0 %}color: #d97706;{% else %}color: #10b981;{% endif %}">
+                                            {% if c.delta_amount > 0 %}+{% endif %}{{ c.delta_amount|floatformat:2 }} {{ c.unit }}
+                                        </td>
+                                        <td style="padding: 6px 10px; font-family: monospace; color: #64748b;">
+                                            {% if c.transaction_id %}#{{ c.transaction_id }}{% else %}-{% endif %}
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <!-- SPECIALIZED VISUALIZATION: PHASE 3 RECONCILIATION -->
+                    {% if log.details.phase == 'PHASE_3_RECONCILIATION_COMPLETION' %}
+                    <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 12px; font-weight: 700; color: #166534; text-transform: uppercase;">
+                            Finished Good Output Credit &amp; Moving Average Cost (AVCO) Shift
+                        </h4>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+                            <div style="background: #ffffff; padding: 10px 12px; border-radius: 6px; border: 1px solid #dcfce7;">
+                                <div style="font-size: 11px; color: #64748b; font-weight: 700;">Credited Yield</div>
+                                <div style="font-size: 16px; font-weight: 800; color: #166534; margin-top: 2px;">
+                                    +{{ log.details.output_quantity|floatformat:2 }} units
+                                </div>
+                                <div style="font-size: 11px; color: #94a3b8;">Txn #{{ log.details.transaction_id }}</div>
+                            </div>
+
+                            <div style="background: #ffffff; padding: 10px 12px; border-radius: 6px; border: 1px solid #dcfce7;">
+                                <div style="font-size: 11px; color: #64748b; font-weight: 700;">Inventory Balance Shift</div>
+                                <div style="font-size: 14px; font-weight: 700; color: #1e293b; margin-top: 2px; font-family: monospace;">
+                                    {{ log.details.inventory_shift.initial|floatformat:2 }} &rarr; <strong>{{ log.details.inventory_shift.final|floatformat:2 }}</strong>
+                                </div>
+                                <div style="font-size: 11px; color: #94a3b8;">Physical warehouse availability</div>
+                            </div>
+
+                            <div style="background: #ffffff; padding: 10px 12px; border-radius: 6px; border: 1px solid #dcfce7;">
+                                <div style="font-size: 11px; color: #64748b; font-weight: 700;">AVCO Unit Cost Shift</div>
+                                <div style="font-size: 14px; font-weight: 700; color: #1e293b; margin-top: 2px; font-family: monospace;">
+                                    {{ log.details.avco_shift.old|currency }} &rarr; <strong style="color: #059669;">{{ log.details.avco_shift.new|currency }}</strong>
+                                </div>
+                                <div style="font-size: 11px; color: #94a3b8;">Batch: {{ log.details.avco_shift.batch_unit_cost|currency }}/unit</div>
+                            </div>
+
+                            <div style="background: #ffffff; padding: 10px 12px; border-radius: 6px; border: 1px solid #dcfce7;">
+                                <div style="font-size: 11px; color: #64748b; font-weight: 700;">Released Unused Residuals</div>
+                                <div style="font-size: 15px; font-weight: 800; color: #0284c7; margin-top: 2px;">
+                                    {{ log.details.total_residuals_released|floatformat:2 }} units
+                                </div>
+                                <div style="font-size: 11px; color: #94a3b8;">Restored to available pool</div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    <!-- COLLAPSIBLE RAW JSON DETAILS INSPECTION -->
+                    {% if log.details %}
+                    <details style="margin-top: 8px;">
+                        <summary style="font-size: 11px; font-weight: 700; color: #64748b; cursor: pointer; user-select: none;">
+                            &#9654; View Raw Structured Operational JSON Payload
+                        </summary>
+                        <pre style="background: #0f172a; color: #f8fafc; font-family: Consolas, Monaco, monospace; font-size: 11px; padding: 12px; border-radius: 6px; overflow-x: auto; margin-top: 6px;">{{ log.details|pprint }}</pre>
+                    </details>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+
+</div>
+{% endblock %}

@@ -8,6 +8,7 @@ to the ProcessExecutionLog database ledger.
 
 import sys
 import logging
+import contextvars
 from typing import Optional, Dict, Any, List
 from django.utils import timezone
 
@@ -22,6 +23,28 @@ if not logger.handlers:
 
 MAX_MESSAGE_LENGTH = 1000
 
+# Thread-safe ContextVar to track triggering user across web requests & Celery tasks
+_current_user_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar('current_authenticated_user', default=None)
+
+
+def set_current_authenticated_user(user) -> contextvars.Token:
+    """Sets the current authenticated user for operational audit logging and returns the context token."""
+    return _current_user_var.set(user)
+
+
+def reset_current_authenticated_user(token: contextvars.Token) -> None:
+    """Resets the context variable to its previous state using the token to prevent thread leakage."""
+    if token is not None:
+        try:
+            _current_user_var.reset(token)
+        except Exception as e:
+            logger.debug(f"[LOGGING CONTEXT RESET] Token reset ignored: {e}")
+
+
+def get_current_authenticated_user():
+    """Retrieves the current authenticated user from ContextVar if set."""
+    return _current_user_var.get()
+
 
 def _prepare_log_payload(
     process_type: str,
@@ -30,14 +53,15 @@ def _prepare_log_payload(
     details: Optional[Dict[str, Any]] = None,
     production_order=None,
     work_order=None,
-    logged_by=None
+    logged_by=None,
+    event_title: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Standardizes log payload and enforces string truncation guard.
     Overflow is safely placed into the details JSONField.
     """
     level_normalized = (level or 'INFO').upper().strip()
-    if level_normalized not in ['DEBUG', 'INFO', 'WARNING', 'ERROR']:
+    if level_normalized not in ['DEBUG', 'INFO', 'SUCCESS', 'WARNING', 'ERROR']:
         level_normalized = 'INFO'
 
     details_dict = dict(details) if details else {}
@@ -58,14 +82,29 @@ def _prepare_log_payload(
         if po_candidate:
             production_order = po_candidate
 
+    # Auto-resolve user attribution from thread ContextVar if not explicitly passed
+    resolved_user = logged_by or get_current_authenticated_user()
+
+    # Resolve event_title from argument, details, or standard choice label
+    clean_title = str(event_title or details_dict.get('event_title') or '').strip()
+    if not clean_title:
+        try:
+            from core.models import ProcessExecutionLog
+            clean_title = dict(ProcessExecutionLog.PROCESS_TYPE_CHOICES).get(
+                process_type, process_type.replace('_', ' ').title()
+            )
+        except Exception:
+            clean_title = process_type.replace('_', ' ').title()
+
     return {
         'process_type': process_type,
         'level': level_normalized,
+        'event_title': clean_title,
         'message': truncated_message,
         'details': details_dict,
         'production_order': production_order,
         'work_order': work_order,
-        'logged_by': logged_by,
+        'logged_by': resolved_user,
         'raw_message': raw_message,
     }
 
@@ -77,12 +116,14 @@ def log_execution_event(
     details: Optional[Dict[str, Any]] = None,
     production_order=None,
     work_order=None,
-    logged_by=None
+    logged_by=None,
+    persist_to_db: bool = True,
+    event_title: Optional[str] = None
 ):
     """
     Dual-Channel Execution Logger:
     1. Tier 1: Writes formatted log to Python logger / sys.stdout.
-    2. Tier 2: Persists immutable ProcessExecutionLog audit record to the database.
+    2. Tier 2: Persists immutable ProcessExecutionLog audit record to the database (suppressed if persist_to_db=False or level=='DEBUG').
 
     Fail-safe: Database persistence failure never interrupts the core transaction.
     """
@@ -93,13 +134,15 @@ def log_execution_event(
         details=details,
         production_order=production_order,
         work_order=work_order,
-        logged_by=logged_by
+        logged_by=logged_by,
+        event_title=event_title
     )
 
     # -------------------------------------------------------------------------
     # TIER 1: CONSOLE / STDOUT LOGGING
     # -------------------------------------------------------------------------
-    log_line = f"[{payload['process_type']}] {payload['raw_message']}"
+    title_prefix = f"[{payload['event_title']}] " if payload.get('event_title') else ""
+    log_line = f"[{payload['process_type']}] {title_prefix}{payload['raw_message']}"
     if payload['level'] == 'ERROR':
         logger.error(log_line)
     elif payload['level'] == 'WARNING':
@@ -112,11 +155,16 @@ def log_execution_event(
     # -------------------------------------------------------------------------
     # TIER 2: DATABASE PERSISTENCE (ProcessExecutionLog)
     # -------------------------------------------------------------------------
+    # Demote pure DEBUG developer diagnostic signals from database noise
+    if not persist_to_db or payload['level'] == 'DEBUG':
+        return None
+
     try:
         from core.models import ProcessExecutionLog
         log_entry = ProcessExecutionLog.objects.create(
             process_type=payload['process_type'],
             level=payload['level'],
+            event_title=payload['event_title'],
             message=payload['message'],
             details=payload['details'],
             production_order=payload['production_order'],
@@ -142,7 +190,10 @@ def bulk_log_execution_events(event_list: List[Dict[str, Any]]) -> List[Any]:
     prepared_entries = []
     log_instances = []
 
-    for event in event_list:
+    last_obj = ProcessExecutionLog.objects.order_by('-log_id').values('log_id').first()
+    base_id = (last_obj['log_id'] if last_obj else 0)
+
+    for idx, event in enumerate(event_list, start=1):
         payload = _prepare_log_payload(
             process_type=event.get('process_type', 'RECONCILIATION'),
             message=event.get('message', ''),
@@ -150,12 +201,14 @@ def bulk_log_execution_events(event_list: List[Dict[str, Any]]) -> List[Any]:
             details=event.get('details'),
             production_order=event.get('production_order'),
             work_order=event.get('work_order'),
-            logged_by=event.get('logged_by')
+            logged_by=event.get('logged_by'),
+            event_title=event.get('event_title')
         )
         prepared_entries.append(payload)
 
         # Tier 1: Terminal stdout
-        log_line = f"[{payload['process_type']}] {payload['raw_message']}"
+        title_prefix = f"[{payload['event_title']}] " if payload.get('event_title') else ""
+        log_line = f"[{payload['process_type']}] {title_prefix}{payload['raw_message']}"
         if payload['level'] == 'ERROR':
             logger.error(log_line)
         elif payload['level'] == 'WARNING':
@@ -167,8 +220,10 @@ def bulk_log_execution_events(event_list: List[Dict[str, Any]]) -> List[Any]:
 
         log_instances.append(
             ProcessExecutionLog(
+                log_code=f"PEL-{(base_id + idx):05d}",
                 process_type=payload['process_type'],
                 level=payload['level'],
+                event_title=payload['event_title'],
                 message=payload['message'],
                 details=payload['details'],
                 production_order=payload['production_order'],

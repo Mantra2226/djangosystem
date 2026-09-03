@@ -6,10 +6,16 @@ Guarantees atomic, all-or-nothing stock deduction for all BOM raw materials/pack
 components and finished goods output creation into the StockTransaction ledger.
 """
 
+import logging
 from decimal import Decimal, ROUND_HALF_UP
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+
+from core.services.logging_service import get_current_authenticated_user
+
+logger = logging.getLogger('core.execution')
 
 
 class ProductionReconciliationError(Exception):
@@ -32,11 +38,12 @@ class ProductionReconciliationEngine:
     """
 
     @classmethod
-    def reconcile_work_order_completion(cls, work_order):
+    def reconcile_work_order_completion(cls, work_order, user=None):
         """
         Executes atomic Phase 3 reconciliation on WorkOrder completion.
         Returns a structured dictionary summarizing all ledger mutations.
         """
+        resolved_user = user or getattr(work_order, '_current_user', None) or get_current_authenticated_user()
         if not work_order or not work_order.pk:
             raise ProductionReconciliationError("Invalid WorkOrder: Record must be saved in database before reconciliation.")
 
@@ -115,13 +122,7 @@ class ProductionReconciliationEngine:
                         new_inv = Inventory.objects.select_for_update().get(pk=new_inv.pk)
                         locked_inventories[pid] = new_inv
 
-                log_execution_event(
-                    process_type='RECONCILIATION',
-                    message=f"Acquired exclusive atomic row locks on {len(sorted_product_ids)} inventory rows for Work Order #{locked_wo.pk} ({locked_wo.work_order_code}).",
-                    level='INFO',
-                    details={'locked_product_ids': sorted_product_ids},
-                    work_order=locked_wo
-                )
+                logger.debug(f"[RECONCILIATION] Acquired exclusive atomic row locks on {len(sorted_product_ids)} inventory rows for Work Order #{locked_wo.pk} ({locked_wo.work_order_code}). Product IDs: {sorted_product_ids}")
 
                 # =========================================================================
                 # INVARIANT 3: MULTI-MATERIAL COMPLETENESS VERIFICATION
@@ -205,23 +206,6 @@ class ProductionReconciliationEngine:
                             'transaction_id': st.transaction_id,
                         })
                         summary['stock_transactions'].append(st.transaction_id)
-                        print(f"   [OK] [CONSUMPTION LEDGER] Component '{comp.name}': Consumed={delta} {comp.unit_of_measurement or 'units'} (StockTransaction #{st.transaction_id})", flush=True)
-                        print(f"      Inventory Shift -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
-
-                        log_execution_event(
-                            process_type='RECONCILIATION',
-                            message=f"Deducted {delta} {comp.unit_of_measurement or 'units'} of {comp.name} from inventory (StockTransaction #{st.transaction_id}).",
-                            level='INFO',
-                            details={
-                                'component_id': comp.pk,
-                                'component_name': comp.name,
-                                'consumed_qty': float(delta),
-                                'transaction_id': st.transaction_id,
-                                'quantity_available_after': float(raw_inv.quantity_available),
-                                'quantity_allocated_after': float(raw_inv.quantity_allocated),
-                            },
-                            work_order=locked_wo
-                        )
 
                     # Material cost calculation for AVCO
                     comp_cost = comp.unit_cost if hasattr(comp, 'unit_cost') and comp.unit_cost else (raw_inv.unit_cost or Decimal('0.00'))
@@ -249,19 +233,6 @@ class ProductionReconciliationEngine:
                                 'component_name': comp.name,
                                 'released_qty': released,
                             })
-                            print(f"   [RELEASE RESIDUAL] Component '{comp.name}': Released {released} unused allocated units back to available stock.", flush=True)
-
-                            log_execution_event(
-                                process_type='RECONCILIATION',
-                                message=f"Released {released} unused allocated units of {comp.name} back to available stock for Work Order #{locked_wo.pk}.",
-                                level='INFO',
-                                details={
-                                    'component_id': comp.pk,
-                                    'component_name': comp.name,
-                                    'released_qty': float(released),
-                                },
-                                work_order=locked_wo
-                            )
 
                 # =========================================================================
                 # INVARIANT 6: FINISHED GOODS OUTPUT LEDGER
@@ -305,22 +276,6 @@ class ProductionReconciliationEngine:
                     }
                     summary['stock_transactions'].append(st_output.transaction_id)
                     summary['unit_cost_avco'] = finished_inv.unit_cost
-                    print(f"   [OK] [FINISHED GOODS OUTPUT] Product '{finished_prod.name}': Output={finished_qty} {finished_prod.unit_of_measurement or 'units'} (StockTransaction #{st_output.transaction_id}, AVCO: ${finished_inv.unit_cost:,.2f})", flush=True)
-                    print(f"      Inventory Shift -> Available: {old_qty} => {finished_inv.quantity_available} units", flush=True)
-
-                    log_execution_event(
-                        process_type='RECONCILIATION',
-                        message=f"Credited output of {finished_qty} {finished_prod.unit_of_measurement or 'units'} for {finished_prod.name} (StockTransaction #{st_output.transaction_id}, AVCO: ${finished_inv.unit_cost:,.2f}).",
-                        level='INFO',
-                        details={
-                            'product_id': finished_prod.pk,
-                            'product_name': finished_prod.name,
-                            'output_qty': float(finished_qty),
-                            'transaction_id': st_output.transaction_id,
-                            'unit_cost_avco': float(finished_inv.unit_cost),
-                        },
-                        work_order=locked_wo
-                    )
 
                 # Update WorkOrder completion flags and timestamp
                 locked_wo.is_inventory_updated = True
@@ -339,10 +294,86 @@ class ProductionReconciliationEngine:
                     po.status = 'COMPLETED'
                     po.completed_at = timezone.now()
                     update_fields = ['status', 'completed_at']
-                    if batch_unit_cost is not None:
+                    if 'batch_unit_cost' in locals() and batch_unit_cost is not None:
                         po.unit_cost = batch_unit_cost
                         update_fields.append('unit_cost')
                     po.save(update_fields=update_fields)
+
+                # =========================================================================
+                # PHASE 3: CONSOLIDATED OPERATIONAL AUDIT LOG (SUCCESS)
+                # =========================================================================
+                currency_sym = getattr(settings, 'CURRENCY_SYMBOL', 'KSh')
+                total_residuals_released = sum(
+                    Decimal(str(r['released_qty'])) for r in summary['released_allocations']
+                ) if summary['released_allocations'] else Decimal('0.00')
+
+                if finished_qty > Decimal('0.00') and locked_wo.product:
+                    finished_prod = locked_wo.product
+                    st_output_id = summary['finished_good_output']['transaction_id']
+                    message = (
+                        f"Phase 3 Reconciliation Complete: Produced {finished_qty:,.2f} {finished_prod.unit_of_measurement or 'units'} "
+                        f"of {finished_prod.name} (StockTransaction #{st_output_id}). "
+                        f"Inventory: {old_qty:,.2f} -> {finished_inv.quantity_available:,.2f}. "
+                        f"AVCO: {currency_sym} {current_cost:,.2f} -> {currency_sym} {finished_inv.unit_cost:,.2f}. "
+                        f"Released {total_residuals_released:,.2f} unused allocated unit(s) across {len(summary['released_allocations'])} component(s)."
+                    )
+                    inventory_shift = {
+                        'initial': float(old_qty),
+                        'final': float(finished_inv.quantity_available),
+                        'net_shift': float(finished_qty),
+                    }
+                    avco_shift = {
+                        'old': float(current_cost),
+                        'new': float(finished_inv.unit_cost),
+                        'batch_unit_cost': float(batch_unit_cost),
+                    }
+                    output_prod_info = {
+                        'id': finished_prod.pk,
+                        'name': finished_prod.name,
+                        'sku': finished_prod.sku or '',
+                    }
+                else:
+                    message = (
+                        f"Phase 3 Reconciliation Complete: Processed Work Order #{locked_wo.pk} ({locked_wo.work_order_code}) with 0 finished output. "
+                        f"Released {total_residuals_released:,.2f} unused allocated unit(s) across {len(summary['released_allocations'])} component(s)."
+                    )
+                    inventory_shift = {'initial': 0.0, 'final': 0.0, 'net_shift': 0.0}
+                    avco_shift = {'old': 0.0, 'new': 0.0, 'batch_unit_cost': 0.0}
+                    output_prod_info = None
+                    st_output_id = None
+
+                phase3_details = {
+                    'phase': 'PHASE_3_RECONCILIATION_COMPLETION',
+                    'work_order_id': locked_wo.pk,
+                    'work_order_code': locked_wo.work_order_code,
+                    'output_product': output_prod_info,
+                    'output_quantity': float(finished_qty),
+                    'transaction_id': st_output_id,
+                    'inventory_shift': inventory_shift,
+                    'avco_shift': avco_shift,
+                    'residuals_released': [
+                        {
+                            'component_id': r['component_id'],
+                            'component_name': r['component_name'],
+                            'released_qty': float(r['released_qty']),
+                        }
+                        for r in summary['released_allocations']
+                    ],
+                    'total_residuals_released': float(total_residuals_released),
+                    'consumed_components_count': len(summary['consumed_components']),
+                    'total_material_cost': float(total_material_cost),
+                }
+
+                linked_po = ProductionOrder.objects.filter(work_order=locked_wo).first()
+                log_execution_event(
+                    process_type='RECONCILIATION',
+                    message=message,
+                    level='SUCCESS',
+                    details=phase3_details,
+                    production_order=linked_po,
+                    work_order=locked_wo,
+                    logged_by=resolved_user
+                )
 
             return summary
         except Exception as exc:
@@ -355,7 +386,9 @@ class ProductionReconciliationEngine:
                     'work_order_id': work_order.pk,
                     'work_order_code': getattr(work_order, 'work_order_code', ''),
                     'error': str(exc),
+                    'error_type': exc.__class__.__name__,
                 },
-                work_order=work_order
+                work_order=work_order,
+                logged_by=resolved_user
             )
             raise

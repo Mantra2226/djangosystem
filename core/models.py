@@ -1174,6 +1174,7 @@ class WorkOrder(models.Model):
                         )
 
                     # Step 5: ATOMIC ALLOCATION - All pre-flight checks passed, mutate all rows
+                    allocated_components = []
                     for comp_id in sorted_ids:
                         plan = allocation_plan[comp_id]
                         inv = locked_inventories[comp_id]
@@ -1198,15 +1199,67 @@ class WorkOrder(models.Model):
                             work_order__status='IN_PROGRESS'
                         ).exclude(work_order=self).select_related('work_order')
 
+                        competing_allocations = []
                         if prior_active_lines.exists():
                             print(f"      [ACTIVE WORK ORDERS HOLDING PRIOR ALLOCATIONS ({old_alloc} units)]:", flush=True)
                             for pal in prior_active_lines:
                                 wo = pal.work_order
                                 wo_code = wo.work_order_code or f"WO #{wo.pk}"
-                                wo_alloc = pal.quantity_allocated or pal.quantity_expected
+                                wo_alloc = float(pal.quantity_allocated or pal.quantity_expected or Decimal('0.00'))
                                 wo_target = wo.target_quantity
                                 target_str = f"Target Batch: {wo_target}" if wo_target is not None else "No Target"
                                 print(f"         • {wo_code} (WO #{wo.pk}) -> holding {wo_alloc} units ({target_str})", flush=True)
+                                competing_allocations.append({
+                                    'order_code': wo_code,
+                                    'held_qty': wo_alloc,
+                                })
+
+                        allocated_components.append({
+                            'component_name': plan['component'].name,
+                            'unit_req': float(plan['per_unit_req']),
+                            'allocated_qty': float(alloc_qty),
+                            'inventory_shift': {
+                                'available': {'before': float(old_avail), 'after': float(inv.quantity_available)},
+                                'allocated': {'before': float(old_alloc), 'after': float(inv.quantity_allocated)},
+                            },
+                            'competing_allocations': competing_allocations,
+                        })
+
+                    try:
+                        from core.services.logging_service import log_execution_event
+                        wo_code = self.work_order_code or f"WO #{self.pk}"
+                        unique_competing_orders = {
+                            ca['order_code']
+                            for c in allocated_components
+                            for ca in c['competing_allocations']
+                        }
+                        comp_summary_parts = [
+                            f"{c['allocated_qty']:.2f} {c['component_name']}"
+                            for c in allocated_components
+                        ]
+                        comp_summary_str = ", ".join(comp_summary_parts)
+                        message = (
+                            f"Phase 1 Stock Allocation Complete: Reserved {len(allocated_components)} component(s) "
+                            f"for Work Order #{self.pk} ({wo_code}) target batch {float(target_qty):,.2f} units. "
+                            f"Allocated: {comp_summary_str}. Active competing run(s): {len(unique_competing_orders)}."
+                        )
+                        details = {
+                            'phase': 'PHASE_1_STOCK_ALLOCATION',
+                            'work_order_id': self.pk,
+                            'work_order_code': self.work_order_code,
+                            'target_batch_quantity': float(target_qty),
+                            'allocated_components': allocated_components,
+                        }
+                        log_execution_event(
+                            process_type='STOCK_ALLOCATION',
+                            level='SUCCESS',
+                            event_title='Stock Allocation & Component Reservation',
+                            message=message,
+                            details=details,
+                            work_order=self
+                        )
+                    except Exception as alloc_log_err:
+                        print(f"[LOGGING WARNING] Phase 1 stock allocation log failed: {alloc_log_err}", flush=True)
 
                 self.is_inventory_allocated = True
                 super().save(update_fields=['is_inventory_allocated'])
@@ -1219,15 +1272,28 @@ class WorkOrder(models.Model):
                 print("--------------------------------------------------", flush=True)
                 print("[PHASE 2: INCREMENTAL ACTUAL CONSUMPTION DEDUCTION START]", flush=True)
 
+                phase2_components = []
+                phase2_total_planned = Decimal('0.00')
+                phase2_total_actual = Decimal('0.00')
+                phase2_net_delta = Decimal('0.00')
+                phase2_has_overconsumption = False
+
                 for line in self.material_lines.all():
                     actual_qty = line.quantity_actual or Decimal('0.00')
                     already_deducted = line.deducted_quantity or Decimal('0.00')
-                    allocated_qty = line.quantity_allocated
+                    allocated_qty = line.quantity_allocated or line.quantity_expected or Decimal('0.00')
                     delta = actual_qty - already_deducted
+
+                    phase2_total_planned += allocated_qty
+                    phase2_total_actual += actual_qty
 
                     print(f"   Line '{line.component.name}': Allocated Qty={allocated_qty} | Actual Consumed={actual_qty} | Already Deducted={already_deducted} | Delta={delta}", flush=True)
 
                     if delta != Decimal('0.00'):
+                        phase2_net_delta += delta
+                        if actual_qty > allocated_qty:
+                            phase2_has_overconsumption = True
+
                         raw_inv, _ = Inventory.objects.select_for_update().get_or_create(
                             product=line.component,
                             defaults={'quantity_available': Decimal('0.00'), 'quantity_allocated': Decimal('0.00')}
@@ -1252,7 +1318,7 @@ class WorkOrder(models.Model):
 
                         raw_inv.save(update_fields=['quantity_available', 'quantity_allocated'])
 
-                        StockTransaction.objects.create(
+                        st = StockTransaction.objects.create(
                             product=line.component,
                             quantity=-delta,
                             transaction_type=trans_type,
@@ -1262,8 +1328,50 @@ class WorkOrder(models.Model):
 
                         line.deducted_quantity = actual_qty
                         line.save(update_fields=['deducted_quantity'])
+
+                        phase2_components.append({
+                            'component_id': line.component_id,
+                            'material_name': line.component.name,
+                            'planned_allocated_qty': float(allocated_qty),
+                            'actual_consumed_qty': float(actual_qty),
+                            'delta_amount': float(delta),
+                            'unit': line.component.unit_of_measurement or 'units',
+                            'transaction_id': st.transaction_id,
+                        })
+
                         print(f"      [OK] [DEDUCTED CONSUMPTION DELTA] Delta={delta} for '{line.component.name}'", flush=True)
                         print(f"         Inventory Updated -> Available: {old_avail} => {raw_inv.quantity_available} | Allocated: {old_alloc} => {raw_inv.quantity_allocated}", flush=True)
+
+                if phase2_components:
+                    try:
+                        from core.services.logging_service import log_execution_event
+                        level = 'WARNING' if phase2_has_overconsumption else 'INFO'
+                        wo_code = self.work_order_code or f"WO #{self.pk}"
+                        comp_count = len(phase2_components)
+                        message = (
+                            f"Phase 2 Material Consumption: Processed {comp_count} component(s) for Work Order #{self.pk} ({wo_code}). "
+                            f"Planned: {phase2_total_planned:,.2f}, Actual: {phase2_total_actual:,.2f}, Net Delta: {phase2_net_delta:+,.2f} units."
+                        )
+                        details = {
+                            'phase': 'PHASE_2_CONSUMPTION',
+                            'work_order_id': self.pk,
+                            'work_order_code': self.work_order_code,
+                            'component_count': comp_count,
+                            'total_planned': float(phase2_total_planned),
+                            'total_actual': float(phase2_total_actual),
+                            'net_delta': float(phase2_net_delta),
+                            'has_overconsumption': phase2_has_overconsumption,
+                            'components': phase2_components,
+                        }
+                        log_execution_event(
+                            process_type='RECONCILIATION',
+                            message=message,
+                            level=level,
+                            details=details,
+                            work_order=self
+                        )
+                    except Exception as log_err:
+                        print(f"[LOGGING WARNING] Phase 2 consumption log failed: {log_err}", flush=True)
 
             # =========================================================================
             # PHASE 3: FINAL RECONCILIATION & FINISHED GOODS OUTPUT (Runs on COMPLETED)
@@ -1288,13 +1396,21 @@ class WorkOrder(models.Model):
         """
         bulk_yield = (self.actual_quantity_produced if self.actual_quantity_produced is not None else self.quantity_produced) or Decimal('0.00')
         with transaction.atomic():
-            for child_wo in self.child_packaging_orders.all():
+            child_orders = list(self.child_packaging_orders.all())
+            if not child_orders:
+                return
+
+            synced_count = 0
+            resumed_count = 0
+            for child_wo in child_orders:
                 mat_lines = child_wo.material_lines.filter(component=self.product)
                 for line in mat_lines:
-                    line.quantity_expected = bulk_yield
-                    line.save(update_fields=['quantity_expected'])
-                    # Synchronize corresponding MaterialVarianceRecord if exists
-                    MaterialVarianceRecord.sync_from_material_line(line)
+                    if line.quantity_expected != bulk_yield:
+                        line.quantity_expected = bulk_yield
+                        line.save(update_fields=['quantity_expected'])
+                        # Synchronize corresponding MaterialVarianceRecord if exists
+                        MaterialVarianceRecord.sync_from_material_line(line)
+                        synced_count += 1
 
                 # Auto-resume child packaging work order if it was on hold and now has sufficient stock!
                 if child_wo.status == 'ON_HOLD_SHORTAGE':
@@ -1307,23 +1423,28 @@ class WorkOrder(models.Model):
                         for child_po in ProductionOrder.objects.filter(work_order=child_wo):
                             child_po.status = 'IN_PROGRESS'
                             child_po.save(update_fields=['status'])
+                        resumed_count += 1
                         print(f"[AUTO-RESUME] Child Packaging WorkOrder #{child_wo.pk} auto-resumed to IN_PROGRESS and stock allocated.", flush=True)
 
-            try:
-                from core.services.logging_service import log_execution_event
-                log_execution_event(
-                    process_type='ORDER_SYNC',
-                    message=f"Synced Stage 1 Bulk yield ({bulk_yield} units) to child packaging order(s) for WorkOrder #{self.pk}.",
-                    level='INFO',
-                    details={
-                        'parent_work_order_id': self.pk,
-                        'bulk_yield': float(bulk_yield),
-                        'product_id': self.product_id,
-                    },
-                    work_order=self
-                )
-            except Exception:
-                pass
+            if synced_count > 0 or resumed_count > 0:
+                try:
+                    from core.services.logging_service import log_execution_event
+                    log_execution_event(
+                        process_type='ORDER_SYNC',
+                        message=f"Synced Stage 1 Bulk yield ({bulk_yield} units) to {len(child_orders)} child packaging order(s) (updated {synced_count} line(s), resumed {resumed_count}) for WorkOrder #{self.pk}.",
+                        level='INFO',
+                        details={
+                            'parent_work_order_id': self.pk,
+                            'bulk_yield': float(bulk_yield),
+                            'product_id': self.product_id,
+                            'child_order_count': len(child_orders),
+                            'synced_lines_count': synced_count,
+                            'resumed_orders_count': resumed_count,
+                        },
+                        work_order=self
+                    )
+                except Exception:
+                    pass
 
     def sync_material_lines(self):
         """
@@ -1771,6 +1892,9 @@ class ProductionOrder(models.Model):
     def update_mrp_resolution_state(self):
         """Aggregates child item resolution states to update macro ProductionOrder status."""
         current_status = (self.status or '').upper().strip()
+        old_is_mrp_resolved = self.is_mrp_resolved
+        old_resolution_applied = self.resolution_applied
+
         if current_status in ['IN_PROGRESS', 'COMPLETED']:
             return
 
@@ -1827,33 +1951,39 @@ class ProductionOrder(models.Model):
 
         if self.pk:
             old_st = current_status
+            state_changed = (
+                (old_st != self.status) or
+                (old_is_mrp_resolved != self.is_mrp_resolved) or
+                (old_resolution_applied != self.resolution_applied)
+            )
             ProductionOrder.objects.filter(pk=self.pk).update(
                 status=self.status,
                 is_mrp_resolved=self.is_mrp_resolved,
                 resolution_applied=self.resolution_applied,
                 resolved_at=self.resolved_at
             )
-            try:
-                from core.services.logging_service import log_execution_event
-                log_execution_event(
-                    process_type='ORDER_SYNC',
-                    message=f"Production Order {self.production_order_code or self.pk} state updated: {old_st} -> {self.status} (Resolution: {self.resolution_applied or 'N/A'}).",
-                    level='INFO',
-                    details={
-                        'production_order_id': self.pk,
-                        'production_order_code': self.production_order_code,
-                        'old_status': old_st,
-                        'new_status': self.status,
-                        'is_mrp_resolved': self.is_mrp_resolved,
-                        'resolution_applied': self.resolution_applied,
-                        'unresolved_count': unresolved_count,
-                        'shortage_count': shortage_count,
-                    },
-                    production_order=self,
-                    work_order=self.work_order
-                )
-            except Exception:
-                pass
+            if state_changed:
+                try:
+                    from core.services.logging_service import log_execution_event
+                    log_execution_event(
+                        process_type='ORDER_SYNC',
+                        message=f"Production Order {self.production_order_code or self.pk} state updated: {old_st} -> {self.status} (Resolution: {self.resolution_applied or 'N/A'}).",
+                        level='INFO',
+                        details={
+                            'production_order_id': self.pk,
+                            'production_order_code': self.production_order_code,
+                            'old_status': old_st,
+                            'new_status': self.status,
+                            'is_mrp_resolved': self.is_mrp_resolved,
+                            'resolution_applied': self.resolution_applied,
+                            'unresolved_count': unresolved_count,
+                            'shortage_count': shortage_count,
+                        },
+                        production_order=self,
+                        work_order=self.work_order
+                    )
+                except Exception:
+                    pass
 
     def evaluate_mrp(self):
         """
@@ -3349,6 +3479,7 @@ class FinanceEntry(models.Model):
 
 class ProcessExecutionLog(models.Model):
     PROCESS_TYPE_CHOICES = [
+        ('STOCK_ALLOCATION', 'Stock Allocation & Component Reservation'),
         ('MRP_EVALUATION', 'MRP Shortage Evaluation'),
         ('PO_DRAFT', 'Auto-Draft Purchase Order'),
         ('BATCH_DOWNSCALE', 'Batch Downscale Target'),
@@ -3361,11 +3492,27 @@ class ProcessExecutionLog(models.Model):
     LEVEL_CHOICES = [
         ('DEBUG', 'Debug'),
         ('INFO', 'Information'),
+        ('SUCCESS', 'Success'),
         ('WARNING', 'Warning'),
         ('ERROR', 'Error'),
     ]
 
     log_id = models.AutoField(primary_key=True)
+    log_code = models.CharField(
+        max_length=32,
+        unique=True,
+        editable=False,
+        db_index=True,
+        blank=True,
+        null=True,
+        help_text="Unique business identifier (e.g. PEL-00001)."
+    )
+    event_title = models.CharField(
+        max_length=128,
+        blank=True,
+        default='',
+        help_text="Concise operational title for stepper and timeline display."
+    )
     process_type = models.CharField(max_length=40, choices=PROCESS_TYPE_CHOICES, db_index=True)
     level = models.CharField(max_length=10, choices=LEVEL_CHOICES, default='INFO', db_index=True)
     message = models.TextField(help_text="Human-readable operational execution summary.")
@@ -3401,11 +3548,36 @@ class ProcessExecutionLog(models.Model):
         verbose_name = "Process Execution Log"
         verbose_name_plural = "Process Execution Logs"
 
+    def save(self, *args, **kwargs):
+        if not self.log_code:
+            if self.log_id:
+                self.log_code = f"PEL-{self.log_id:05d}"
+            else:
+                try:
+                    last_obj = ProcessExecutionLog.objects.order_by('-log_id').values('log_id').first()
+                    next_id = (last_obj['log_id'] + 1) if last_obj else 1
+                    self.log_code = f"PEL-{next_id:05d}"
+                except Exception:
+                    pass
+
+        try:
+            super().save(*args, **kwargs)
+        except Exception:
+            # Fallback if next_id collided concurrently: insert with null, then update
+            self.log_code = None
+            super().save(*args, **kwargs)
+
+        if self.log_id and self.log_code != f"PEL-{self.log_id:05d}":
+            self.log_code = f"PEL-{self.log_id:05d}"
+            super().save(update_fields=['log_code'])
+
     def __str__(self):
         code_ref = ""
         if self.production_order:
             code_ref = f" [PO: {self.production_order.production_order_code or self.production_order_id}]"
         elif self.work_order:
             code_ref = f" [WO: {self.work_order.work_order_code or self.work_order_id}]"
-        return f"[{self.level}] {self.get_process_type_display()}{code_ref} - {self.message[:60]}"
+        identifier = self.log_code or f"PEL-#{self.log_id}"
+        return f"{identifier} [{self.level}] {self.get_process_type_display()}{code_ref} - {self.message[:60]}"
+
 

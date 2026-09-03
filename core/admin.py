@@ -2537,7 +2537,7 @@ class WorkOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
         skipped_count = 0
         for wo in queryset:
             try:
-                result = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+                result = ProductionReconciliationEngine.reconcile_work_order_completion(wo, user=request.user)
                 if result.get('skipped'):
                     skipped_count += 1
                 else:
@@ -2625,6 +2625,11 @@ class WorkOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
                 '<int:object_id>/check-stock-resume/',
                 self.admin_site.admin_view(self.check_stock_resume_view),
                 name='workorder-check-stock-resume',
+            ),
+            path(
+                '<int:object_id>/execution-history/',
+                self.admin_site.admin_view(self.execution_history_view),
+                name='core_workorder_execution_history',
             ),
         ]
         return custom_urls + urls
@@ -2790,6 +2795,92 @@ class WorkOrderAdmin(OpenPyXLExportMixin, ModelAdmin):
             return HttpResponseRedirect(referer)
         return redirect(reverse('admin:core_workorder_change', args=[object_id]))
 
+    def execution_history_view(self, request, object_id):
+        work_order = get_object_or_404(
+            WorkOrder.objects.select_related('product', 'bill_of_material', 'parent_work_order').prefetch_related(
+                'employee', 'production_runs', 'material_lines__component'
+            ),
+            pk=object_id
+        )
+
+        # 1. Fetch all related execution logs in chronological order
+        logs_qs = ProcessExecutionLog.objects.filter(
+            models.Q(work_order=work_order) | models.Q(production_order__work_order=work_order)
+        ).select_related('logged_by', 'production_order', 'work_order').order_by('created_at', 'log_id')
+        logs = list(logs_qs)
+
+        # 2. Gather active competing work orders holding allocations for the same ingredients
+        comp_ids = list(work_order.material_lines.values_list('component_id', flat=True))
+        if not comp_ids and work_order.bill_of_material:
+            comp_ids = list(work_order.bill_of_material.items.values_list('component_id', flat=True))
+
+        competing_runs_dict = {}
+        if comp_ids:
+            active_competing_lines = WorkOrderMaterialLine.objects.filter(
+                component_id__in=comp_ids,
+                work_order__status='IN_PROGRESS'
+            ).exclude(work_order=work_order).select_related('work_order', 'component')
+
+            for pal in active_competing_lines:
+                wo = pal.work_order
+                p_code = wo.work_order_code or f"WO #{wo.pk}"
+                alloc_qty = float(pal.quantity_allocated or pal.quantity_expected or Decimal('0.00'))
+                if p_code not in competing_runs_dict:
+                    competing_runs_dict[p_code] = {
+                        'work_order': wo,
+                        'order_code': p_code,
+                        'product_name': wo.product.name if wo.product else 'N/A',
+                        'target_quantity': float(wo.target_quantity or 0.0),
+                        'components': [],
+                    }
+                competing_runs_dict[p_code]['components'].append({
+                    'component_name': pal.component.name,
+                    'allocated_qty': alloc_qty,
+                    'unit': pal.component.unit_of_measurement or 'units',
+                })
+
+        competing_runs = list(competing_runs_dict.values())
+
+        # 3. Categorize logs into milestones
+        phase1_log = next((l for l in reversed(logs) if l.process_type == 'STOCK_ALLOCATION'), None)
+        phase2_logs = [l for l in logs if l.process_type == 'RECONCILIATION' and l.details.get('phase') == 'PHASE_2_CONSUMPTION']
+        phase3_log = next((l for l in reversed(logs) if l.process_type == 'RECONCILIATION' and (l.level == 'SUCCESS' or l.details.get('phase') == 'PHASE_3_RECONCILIATION_COMPLETION')), None)
+        other_logs = [l for l in logs if l != phase1_log and l not in phase2_logs and l != phase3_log]
+
+        milestones = {
+            'phase1': {
+                'title': 'Phase 1: Stock Allocation & Component Reservation',
+                'completed': bool(work_order.is_inventory_allocated or phase1_log),
+                'log': phase1_log,
+            },
+            'phase2': {
+                'title': 'Phase 2: Incremental Consumption & Floor Updates',
+                'completed': bool(phase2_logs or work_order.is_inventory_updated),
+                'in_progress': work_order.status == 'IN_PROGRESS' and not work_order.is_inventory_updated,
+                'logs': phase2_logs,
+            },
+            'phase3': {
+                'title': 'Phase 3: Final Reconciliation & Output Shift',
+                'completed': bool(work_order.is_inventory_updated or phase3_log),
+                'log': phase3_log,
+            },
+        }
+
+        context = {
+            **self.admin_site.each_context(request),
+            'title': f"Execution History & Timeline: {work_order.work_order_code or work_order.pk}",
+            'work_order': work_order,
+            'original': work_order,
+            'logs': logs,
+            'competing_runs': competing_runs,
+            'milestones': milestones,
+            'other_logs': other_logs,
+            'opts': self.model._meta,
+            'has_view_permission': self.has_view_permission(request, work_order),
+            'has_change_permission': self.has_change_permission(request, work_order),
+        }
+        return TemplateResponse(request, 'admin/core/workorder/execution_history.html', context)
+
 
 @admin.register(MaterialVarianceRecord)
 class MaterialVarianceRecordAdmin(OpenPyXLExportMixin, ModelAdmin):
@@ -2839,9 +2930,10 @@ class MaterialVarianceRecordAdmin(OpenPyXLExportMixin, ModelAdmin):
 
 @admin.register(ProcessExecutionLog)
 class ProcessExecutionLogAdmin(ModelAdmin):
-    list_display = ('log_id', 'created_at', 'level_badge', 'process_type_badge', 'message_snippet', 'order_link', 'logged_by')
+    list_display = ('log_code', 'created_at', 'level_badge', 'process_type_badge', 'message_snippet', 'order_link', 'logged_by')
+    list_display_links = ('log_code',)
     list_filter = ['process_type', 'level', ('created_at', RangeDateFilter)]
-    search_fields = ('message', 'production_order__production_order_code', 'work_order__work_order_code')
+    search_fields = ('log_code', 'event_title', 'message', 'production_order__production_order_code', 'work_order__work_order_code')
     readonly_fields = [f.name for f in ProcessExecutionLog._meta.fields]
     actions = [export_as_csv]
 
@@ -2858,7 +2950,8 @@ class ProcessExecutionLogAdmin(ModelAdmin):
     def level_badge(self, obj):
         color_map = {
             'DEBUG': ('#64748b', '#ffffff'),
-            'INFO': ('#10b981', '#ffffff'),
+            'INFO': ('#0284c7', '#ffffff'),
+            'SUCCESS': ('#10b981', '#ffffff'),
             'WARNING': ('#f59e0b', '#ffffff'),
             'ERROR': ('#ef4444', '#ffffff'),
         }
@@ -2868,6 +2961,7 @@ class ProcessExecutionLogAdmin(ModelAdmin):
     @display(description='Process Type')
     def process_type_badge(self, obj):
         type_color_map = {
+            'STOCK_ALLOCATION': '#059669',
             'MRP_EVALUATION': '#0284c7',
             'PO_DRAFT': '#8b5cf6',
             'BATCH_DOWNSCALE': '#d97706',
@@ -2885,11 +2979,21 @@ class ProcessExecutionLogAdmin(ModelAdmin):
 
     @display(description='Linked Order')
     def order_link(self, obj):
+        parts = []
         if obj.production_order:
             url = reverse('admin:core_productionorder_change', args=[obj.production_order.pk])
-            return format_html('<a href="{}" style="color: #2563eb; font-weight: 600;">PO #{}</a>', url, obj.production_order.production_order_code or obj.production_order.pk)
-        elif obj.work_order:
-            url = reverse('admin:core_workorder_change', args=[obj.work_order.pk])
-            return format_html('<a href="{}" style="color: #2563eb; font-weight: 600;">WO #{}</a>', url, obj.work_order.work_order_code or obj.work_order.pk)
-        return "-"
+            parts.append(format_html('<a href="{}" style="color: #2563eb; font-weight: 600;">PO #{}</a>', url, obj.production_order.production_order_code or obj.production_order.pk))
+
+        wo = obj.work_order or (obj.production_order.work_order if obj.production_order else None)
+        if wo:
+            timeline_url = reverse('admin:core_workorder_execution_history', args=[wo.pk])
+            parts.append(format_html(
+                '<a href="{}" style="color: #4f46e5; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;" title="View Execution History & Timeline">'
+                '<span>WO #{}</span> '
+                '<span style="font-size: 10px; background: #e0e7ff; color: #4338ca; padding: 1px 5px; border-radius: 4px; font-weight: 700;">TIMELINE</span>'
+                '</a>',
+                timeline_url,
+                wo.work_order_code or wo.pk
+            ))
+        return format_html(" &middot; ".join(parts)) if parts else "-"
 

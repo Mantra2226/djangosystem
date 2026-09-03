@@ -85,3 +85,24 @@ class ApiExceptionMiddleware:
             }, status=500)
 
         return None
+
+
+class ProcessExecutionUserMiddleware:
+    """
+    Middleware that captures the authenticated user of the active HTTP request
+    into a thread-safe ContextVar, ensuring operational audit logs automatically
+    attribute the triggering user.
+    Uses try...finally to strictly guarantee ContextVar token reset and prevent
+    user state leakage across re-used ASGI/WSGI worker threads.
+    """
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        user = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
+        from core.services.logging_service import set_current_authenticated_user, reset_current_authenticated_user
+        token = set_current_authenticated_user(user)
+        try:
+            return self.get_response(request)
+        finally:
+            reset_current_authenticated_user(token)

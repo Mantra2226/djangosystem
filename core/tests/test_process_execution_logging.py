@@ -19,6 +19,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase, RequestFactory
 from django.contrib.admin.sites import AdminSite
 from django.utils import timezone
+from django.urls import reverse
 
 from core.models import (
     Supplier, Product, BillOfMaterial, BOMItem, Inventory,
@@ -166,7 +167,7 @@ class ProcessExecutionLoggingTests(TestCase):
         self.assertEqual(log.details['shortage_lines_count'], 2)
 
     def test_stock_reconciliation_records_reconciliation_logs(self):
-        """Complete production reconciliation on a Work Order and assert component deductions and output credits are logged."""
+        """Complete production reconciliation on a Work Order and assert consolidated Phase 3 SUCCESS completion log."""
         # Provide full inventory for 100kg test run (needs 80kg CC, 20L Oil)
         self.cc_inv.quantity_available = Decimal('500.00')
         self.cc_inv.save()
@@ -188,21 +189,27 @@ class ProcessExecutionLoggingTests(TestCase):
             status='IN_PROGRESS'
         )
 
-        summary = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+        summary = ProductionReconciliationEngine.reconcile_work_order_completion(wo, user=self.supervisor)
         self.assertFalse(summary.get('skipped', False))
 
         recon_logs = ProcessExecutionLog.objects.filter(
             work_order=wo,
             process_type='RECONCILIATION'
         )
-        self.assertTrue(recon_logs.exists())
-
-        # Check that row locking, deductions, and finished good output were logged
-        messages = [l.message for l in recon_logs]
-        self.assertTrue(any("Acquired exclusive atomic row locks" in m for m in messages))
-        self.assertTrue(any("Deducted" in m and "Calcium Carbonate" in m for m in messages))
-        self.assertTrue(any("Deducted" in m and "Linseed Oil" in m for m in messages))
-        self.assertTrue(any("Credited output" in m and "Standard Glass Putty" in m for m in messages))
+        # Exactly ONE unified Phase 3 completion record must be created
+        self.assertEqual(recon_logs.count(), 1)
+        log = recon_logs.first()
+        self.assertEqual(log.level, 'SUCCESS')
+        self.assertEqual(log.logged_by, self.supervisor)
+        self.assertIn("Phase 3 Reconciliation Complete", log.message)
+        self.assertIn("Produced 100.00 kg", log.message)
+        self.assertIn("Standard Glass Putty 1000kg", log.message)
+        self.assertEqual(log.details['phase'], 'PHASE_3_RECONCILIATION_COMPLETION')
+        self.assertEqual(log.details['output_quantity'], 100.0)
+        self.assertEqual(log.details['inventory_shift']['initial'], 0.0)
+        self.assertEqual(log.details['inventory_shift']['final'], 100.0)
+        self.assertIn('residuals_released', log.details)
+        self.assertIn('avco_shift', log.details)
 
     def test_audit_log_inline_immutability(self):
         """Assert has_add_permission and has_delete_permission are disabled for ProcessExecutionLogInline."""
@@ -329,3 +336,343 @@ class ProcessExecutionLoggingTests(TestCase):
         html_completed = admin.milestone_stepper(po)
         self.assertIn("COMPLETED", html_completed)
         self.assertIn("VERIFIED", html_completed)
+
+    def test_phase2_incremental_consumption_single_aggregated_log(self):
+        """Verify Phase 2 incremental material consumption produces a single aggregated log with full component details."""
+        self.cc_inv.quantity_available = Decimal('500.00')
+        self.cc_inv.save()
+        self.oil_inv.quantity_available = Decimal('200.00')
+        self.oil_inv.save()
+
+        wo = WorkOrder.objects.create(
+            product=self.finished_putty,
+            bill_of_material=self.bom,
+            quantity_produced=Decimal('100.00'),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo,
+            quantity=Decimal('100.00'),
+            status='IN_PROGRESS'
+        )
+
+        # Allocate stock first (Phase 1)
+        wo.process_inventory()
+
+        initial_log_count = ProcessExecutionLog.objects.filter(work_order=wo).count()
+
+        # Update actuals with over-consumption on Calcium Carbonate (85kg vs 80kg planned)
+        lines = list(wo.material_lines.all())
+        for line in lines:
+            if line.component == self.calcium_carbonate:
+                line.quantity_actual = Decimal('85.00')
+            else:
+                line.quantity_actual = Decimal('20.00')
+            line.save(update_fields=['quantity_actual'])
+
+        # Trigger Phase 2 deduction pass
+        wo.process_inventory()
+
+        # Assert exactly ONE consolidated log was created
+        phase2_logs = ProcessExecutionLog.objects.filter(
+            work_order=wo,
+            process_type='RECONCILIATION',
+            message__startswith="Phase 2 Material Consumption"
+        )
+        self.assertEqual(phase2_logs.count(), 1)
+        log = phase2_logs.first()
+        self.assertEqual(log.level, 'WARNING')  # Overconsumption detected (85 > 80)
+        self.assertIn("Processed 2 component(s)", log.message)
+        self.assertIn("Net Delta: +105.00 units", log.message)
+
+        # Assert structured details
+        details = log.details
+        self.assertEqual(details['phase'], 'PHASE_2_CONSUMPTION')
+        self.assertEqual(details['component_count'], 2)
+        self.assertTrue(details['has_overconsumption'])
+        self.assertEqual(len(details['components']), 2)
+
+        # Verify component breakdown
+        comp_names = [c['material_name'] for c in details['components']]
+        self.assertIn("Calcium Carbonate Pure", comp_names)
+        self.assertIn("Raw Linseed Oil Grade A", comp_names)
+
+        # Idempotency check: A second pass with no new deltas must create zero additional logs
+        wo.process_inventory()
+        self.assertEqual(phase2_logs.count(), 1)
+
+    def test_phase3_consolidated_reconciliation_output_shift_and_avco(self):
+        """Verify Phase 3 completion produces a single SUCCESS record with dynamic currency and complete JSON shift metrics."""
+        from django.conf import settings
+        currency_sym = getattr(settings, 'CURRENCY_SYMBOL', 'KSh')
+
+        self.cc_inv.quantity_available = Decimal('1000.00')
+        self.cc_inv.unit_cost = Decimal('2.00')
+        self.cc_inv.save()
+        self.oil_inv.quantity_available = Decimal('500.00')
+        self.oil_inv.unit_cost = Decimal('5.00')
+        self.oil_inv.save()
+
+        wo = WorkOrder.objects.create(
+            product=self.finished_putty,
+            bill_of_material=self.bom,
+            quantity_produced=Decimal('200.00'),
+            actual_quantity_produced=Decimal('200.00'),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo,
+            quantity=Decimal('200.00'),
+            status='IN_PROGRESS'
+        )
+
+        summary = ProductionReconciliationEngine.reconcile_work_order_completion(wo, user=self.supervisor)
+        self.assertFalse(summary.get('skipped', False))
+
+        phase3_logs = ProcessExecutionLog.objects.filter(
+            work_order=wo,
+            process_type='RECONCILIATION',
+            level='SUCCESS'
+        )
+        self.assertEqual(phase3_logs.count(), 1)
+        log = phase3_logs.first()
+        self.assertEqual(log.logged_by, self.supervisor)
+        self.assertIn(currency_sym, log.message)
+        self.assertIn("Phase 3 Reconciliation Complete", log.message)
+        self.assertIn("Produced 200.00 kg", log.message)
+
+        details = log.details
+        self.assertEqual(details['phase'], 'PHASE_3_RECONCILIATION_COMPLETION')
+        self.assertEqual(details['output_product']['name'], self.finished_putty.name)
+        self.assertEqual(details['output_quantity'], 200.0)
+        self.assertEqual(details['inventory_shift']['initial'], 0.0)
+        self.assertEqual(details['inventory_shift']['final'], 200.0)
+        self.assertEqual(details['inventory_shift']['net_shift'], 200.0)
+        self.assertIn('avco_shift', details)
+        self.assertIn('residuals_released', details)
+        self.assertIsNotNone(details['transaction_id'])
+
+    def test_cascade_and_idempotency_deduplication(self):
+        """Verify duplicate ORDER_SYNC events and redundant reconciliation calls are safely suppressed."""
+        # 1. Unchanged MRP resolution state must not log duplicate ORDER_SYNC
+        wo = WorkOrder.objects.create(
+            product=self.finished_putty,
+            bill_of_material=self.bom,
+            quantity_produced=Decimal('100.00'),
+            status='DRAFT'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo,
+            quantity=Decimal('100.00'),
+            status='PENDING'
+        )
+        evaluate_mrp_shortages(po)
+
+        # Baseline count of ORDER_SYNC logs
+        sync_logs_before = ProcessExecutionLog.objects.filter(production_order=po, process_type='ORDER_SYNC').count()
+
+        # Trigger update_mrp_resolution_state() repeatedly with no state change
+        po.update_mrp_resolution_state()
+        po.update_mrp_resolution_state()
+        sync_logs_after = ProcessExecutionLog.objects.filter(production_order=po, process_type='ORDER_SYNC').count()
+        self.assertEqual(sync_logs_before, sync_logs_after)
+
+        # 2. sync_child_packaging_expectations() with 0 child packaging orders must emit 0 ORDER_SYNC logs
+        wo.sync_child_packaging_expectations()
+        child_sync_logs = ProcessExecutionLog.objects.filter(work_order=wo, process_type='ORDER_SYNC')
+        self.assertEqual(child_sync_logs.count(), 0)
+
+        # 3. Repeated reconciliation on completed order must skip and emit 0 logs
+        self.cc_inv.quantity_available = Decimal('500.00')
+        self.cc_inv.save()
+        self.oil_inv.quantity_available = Decimal('200.00')
+        self.oil_inv.save()
+        wo.status = 'IN_PROGRESS'
+        wo.actual_quantity_produced = Decimal('100.00')
+        wo.save()
+
+        res1 = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+        self.assertFalse(res1.get('skipped', False))
+        log_count_completed = ProcessExecutionLog.objects.filter(work_order=wo, level='SUCCESS').count()
+        self.assertEqual(log_count_completed, 1)
+
+        # Second and third calls must skip safely
+        res2 = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+        res3 = ProductionReconciliationEngine.reconcile_work_order_completion(wo)
+        self.assertTrue(res2.get('skipped', False))
+        self.assertTrue(res3.get('skipped', False))
+        self.assertEqual(ProcessExecutionLog.objects.filter(work_order=wo, level='SUCCESS').count(), 1)
+
+    def test_contextvar_user_attribution_and_token_reset(self):
+        """Verify ContextVar user attribution works seamlessly and token reset prevents leakage."""
+        from core.services.logging_service import (
+            set_current_authenticated_user,
+            reset_current_authenticated_user,
+            get_current_authenticated_user
+        )
+
+        # Context starts as None
+        self.assertIsNone(get_current_authenticated_user())
+
+        # Set user in context
+        token = set_current_authenticated_user(self.supervisor)
+        try:
+            self.assertEqual(get_current_authenticated_user(), self.supervisor)
+            # Log event without explicit logged_by parameter
+            log_entry = log_execution_event(
+                process_type='ORDER_SYNC',
+                message="ContextVar attribution test event."
+            )
+            self.assertIsNotNone(log_entry)
+            self.assertEqual(log_entry.logged_by, self.supervisor)
+        finally:
+            reset_current_authenticated_user(token)
+
+        # After reset, context returns to None
+        self.assertIsNone(get_current_authenticated_user())
+
+    def test_deterministic_log_code_generation(self):
+        """Verify log_code is deterministically derived from log_id as PEL-XXXXX with unique constraint."""
+        log1 = log_execution_event(
+            process_type='MRP_EVALUATION',
+            message="Test deterministic log code 1."
+        )
+        log2 = log_execution_event(
+            process_type='ORDER_SYNC',
+            message="Test deterministic log code 2."
+        )
+        self.assertIsNotNone(log1)
+        self.assertIsNotNone(log2)
+
+        expected_code1 = f"PEL-{log1.log_id:05d}"
+        expected_code2 = f"PEL-{log2.log_id:05d}"
+        self.assertEqual(log1.log_code, expected_code1)
+        self.assertEqual(log2.log_code, expected_code2)
+        self.assertIn(expected_code1, str(log1))
+
+        # Test querying by log_code
+        queried_log = ProcessExecutionLog.objects.filter(log_code=expected_code1).first()
+        self.assertEqual(queried_log, log1)
+
+    def test_phase1_stock_allocation_logging_and_competing_runs(self):
+        """Verify Phase 1 stock allocation logs shifts, captures competing runs, and is strictly idempotent."""
+        # Top up stock so both work orders can allocate
+        self.cc_inv.quantity_available = Decimal('1000.00')
+        self.cc_inv.save()
+        self.oil_inv.quantity_available = Decimal('500.00')
+        self.oil_inv.save()
+
+        # 1. Start WorkOrder 1 (holds 80kg CC and 20L Oil)
+        wo1 = WorkOrder.objects.create(
+            product=self.finished_putty,
+            bill_of_material=self.bom,
+            quantity_produced=Decimal('100.00'),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        po1 = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo1,
+            quantity=Decimal('100.00'),
+            status='IN_PROGRESS'
+        )
+        wo1.process_inventory()
+        self.assertTrue(wo1.is_inventory_allocated)
+
+        wo1_alloc_log = ProcessExecutionLog.objects.filter(
+            work_order=wo1,
+            process_type='STOCK_ALLOCATION'
+        ).first()
+        self.assertIsNotNone(wo1_alloc_log)
+        self.assertEqual(wo1_alloc_log.level, 'SUCCESS')
+        self.assertEqual(wo1_alloc_log.event_title, 'Stock Allocation & Component Reservation')
+        self.assertEqual(wo1_alloc_log.details['phase'], 'PHASE_1_STOCK_ALLOCATION')
+        self.assertEqual(wo1_alloc_log.details['target_batch_quantity'], 100.0)
+
+        # 2. Start WorkOrder 2 (target 50 units -> needs 40kg CC and 10L Oil)
+        wo2 = WorkOrder.objects.create(
+            product=self.finished_putty,
+            bill_of_material=self.bom,
+            quantity_produced=Decimal('50.00'),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        po2 = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo2,
+            quantity=Decimal('50.00'),
+            status='IN_PROGRESS'
+        )
+        wo2.process_inventory()
+        self.assertTrue(wo2.is_inventory_allocated)
+
+        wo2_alloc_logs = ProcessExecutionLog.objects.filter(
+            work_order=wo2,
+            process_type='STOCK_ALLOCATION'
+        )
+        self.assertEqual(wo2_alloc_logs.count(), 1)
+        wo2_log = wo2_alloc_logs.first()
+        self.assertEqual(wo2_log.level, 'SUCCESS')
+        self.assertIn("Active competing run(s): 1", wo2_log.message)
+
+        # Inspect details payload structure
+        details = wo2_log.details
+        self.assertEqual(details['phase'], 'PHASE_1_STOCK_ALLOCATION')
+        self.assertEqual(details['target_batch_quantity'], 50.0)
+        self.assertEqual(len(details['allocated_components']), 2)
+
+        cc_entry = next(c for c in details['allocated_components'] if c['component_name'] == "Calcium Carbonate Pure")
+        self.assertEqual(cc_entry['unit_req'], 0.8)
+        self.assertEqual(cc_entry['allocated_qty'], 40.0)
+        self.assertEqual(len(cc_entry['competing_allocations']), 1)
+        self.assertEqual(cc_entry['competing_allocations'][0]['order_code'], wo1.work_order_code)
+        self.assertEqual(cc_entry['competing_allocations'][0]['held_qty'], 80.0)
+
+        # 3. Idempotent Transition Guard: Subsequent saves must not duplicate STOCK_ALLOCATION log
+        wo2.process_inventory()
+        wo2.save()
+        self.assertEqual(wo2_alloc_logs.count(), 1)
+
+    def test_work_order_execution_history_view(self):
+        """Verify the dedicated execution history admin route renders HTTP 200 with timeline context."""
+        self.cc_inv.quantity_available = Decimal('500.00')
+        self.cc_inv.save()
+        self.oil_inv.quantity_available = Decimal('200.00')
+        self.oil_inv.save()
+
+        wo = WorkOrder.objects.create(
+            product=self.finished_putty,
+            bill_of_material=self.bom,
+            quantity_produced=Decimal('100.00'),
+            production_start_date=timezone.now().date(),
+            status='IN_PROGRESS'
+        )
+        po = ProductionOrder.objects.create(
+            product=self.finished_putty,
+            work_order=wo,
+            quantity=Decimal('100.00'),
+            status='IN_PROGRESS'
+        )
+        wo.process_inventory()
+
+        self.client.force_login(self.supervisor)
+        url = reverse('admin:core_workorder_execution_history', args=[wo.pk])
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('work_order', response.context)
+        self.assertIn('logs', response.context)
+        self.assertIn('milestones', response.context)
+        self.assertIn('competing_runs', response.context)
+
+        content = response.content.decode('utf-8')
+        self.assertIn(wo.work_order_code, content)
+        self.assertIn("Execution Pipeline Status", content)
+        self.assertIn("Phase 1: Allocation", content)
+        self.assertIn("Phase 1 Stock Allocation Complete", content)
+
