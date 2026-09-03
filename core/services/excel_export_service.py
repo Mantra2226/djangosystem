@@ -35,7 +35,10 @@ ALIGN_LEFT = Alignment(horizontal='left', vertical='center')
 ALIGN_RIGHT = Alignment(horizontal='right', vertical='center')
 ALIGN_CENTER = Alignment(horizontal='center', vertical='center')
 
-NUMBER_FORMAT_CURRENCY = '$#,##0.00'
+from django.conf import settings
+
+CURRENCY_SYMBOL = getattr(settings, 'CURRENCY_SYMBOL', 'KSh')
+NUMBER_FORMAT_CURRENCY = f'"{CURRENCY_SYMBOL} " #,##0.00;[Red]-"{CURRENCY_SYMBOL} " #,##0.00;"{CURRENCY_SYMBOL} " 0.00'
 NUMBER_FORMAT_DECIMAL = '#,##0.00'
 NUMBER_FORMAT_INTEGER = '#,##0'
 NUMBER_FORMAT_DATE = 'yyyy-mm-dd'
@@ -93,7 +96,7 @@ def format_cell_value(cell, value, format_type):
 
     if fmt == 'currency':
         try:
-            val = float(value) if isinstance(value, (Decimal, int, float)) else float(str(value).replace('$', '').replace(',', ''))
+            val = float(value) if isinstance(value, (Decimal, int, float)) else float(str(value).replace('$', '').replace(CURRENCY_SYMBOL, '').replace(',', '').strip())
             cell.value = val
         except (ValueError, TypeError):
             cell.value = str(value)

@@ -33,9 +33,33 @@ from .models import (
     BillOfMaterial, BOMItem, SalesInvoicePayments, PurchasePayment, WorkOrderMaterialLine,
     DocumentSequence, SalesInvoiceLine, CreditNote, CreditNoteLine, ProcessExecutionLog
 )
+from django.conf import settings
 from .forms import WorkOrderForm
 from .utils.pdf_generator import generate_invoice_pdf, generate_credit_note_pdf, generate_finance_entry_pdf
 from .admin_mixins import OpenPyXLExportMixin
+
+
+def format_admin_currency(amount, show_plus=False):
+    """
+    Standardized admin currency formatter referencing settings.CURRENCY_SYMBOL.
+    Formats positive values as: 'KSh 1,250.00'
+    Formats negative values as: '-KSh 137.55'
+    Formats zero/none values as: 'KSh 0.00'
+    """
+    symbol = getattr(settings, 'CURRENCY_SYMBOL', 'KSh')
+    if amount is None:
+        return f"{symbol} 0.00"
+    try:
+        val = Decimal(str(amount))
+    except Exception:
+        return f"{symbol} 0.00"
+
+    if val < 0:
+        return f"-{symbol} {abs(val):,.2f}"
+    elif val > 0 and show_plus:
+        return f"+{symbol} {val:,.2f}"
+    else:
+        return f"{symbol} {val:,.2f}"
 
 
 def export_as_csv(modeladmin, request, queryset):
@@ -147,14 +171,14 @@ class SalesOrderItemInline(TabularInline):
     @display(description='Catalog Unit Price')
     def get_unit_price(self, obj):
         if obj.unit_price is not None:
-            return f"${obj.unit_price:,.2f}"
-        return "$0.00"
+            return format_admin_currency(obj.unit_price)
+        return format_admin_currency(0)
 
     @display(description='Line Total')
     def get_total_price(self, obj):
         if obj.total_price:
-            return f"${obj.total_price:,.2f}"
-        return "$0.00"
+            return format_admin_currency(obj.total_price)
+        return format_admin_currency(0)
 
     def has_add_permission(self, request, obj=None):
         if obj and obj.status != 'draft' and not request.user.is_superuser:
@@ -235,8 +259,8 @@ class PurchaseOrderItemInline(TabularInline):
     @display(description='Total Cost')
     def get_total(self, obj):
         if obj.pk:
-            return f"${obj.total_price:.2f}"
-        return "$0.00"
+            return format_admin_currency(obj.total_price)
+        return format_admin_currency(0)
 
 
 # =============================================================================
@@ -299,7 +323,7 @@ class ProductAdmin(ModelAdmin):
     @display(description='Selling Price')
     def get_selling_price(self, obj):
         if obj.selling_price is not None:
-            return f"${obj.selling_price:,.2f}"
+            return format_admin_currency(obj.selling_price)
         return "-"
 
 
@@ -430,11 +454,11 @@ class InventoryAdmin(OpenPyXLExportMixin, ModelAdmin):
 
     @display(description='Avg Unit Cost')
     def get_unit_cost(self, obj):
-        return f"${obj.unit_cost:,.2f}"
+        return format_admin_currency(obj.unit_cost)
 
     @display(description='Total Valuation')
     def get_total_valuation(self, obj):
-        return f"${obj.total_valuation:,.2f}"
+        return format_admin_currency(obj.total_valuation)
 
 
 @admin.register(StockTransaction)
@@ -966,9 +990,8 @@ class ProductionOrderAdmin(ModelAdmin):
         return obj.quantity or "0.00"
 
     @display(description='Batch Unit Cost')
-    @display(description='Batch Unit Cost')
     def get_unit_cost(self, obj):
-        return f"${obj.unit_cost:,.2f}"
+        return format_admin_currency(obj.unit_cost)
 
     @display(description='Manufacturing Lifecycle Milestone Stepper')
     def milestone_stepper(self, obj):
@@ -1406,11 +1429,11 @@ class OpenSalesInvoiceInline(TabularInline):
 
     @display(description='Total Paid')
     def get_total_paid(self, obj):
-        return f"${obj.total_paid:,.2f}"
+        return format_admin_currency(obj.total_paid)
 
     @display(description='Outstanding Balance')
     def get_remaining_balance(self, obj):
-        return f"${obj.remaining_balance:,.2f}"
+        return format_admin_currency(obj.remaining_balance)
 
     @display(description='Status')
     def status_badge(self, obj):
@@ -1446,18 +1469,18 @@ class CustomerAdmin(ModelAdmin):
         open_invoices = obj.sales_invoices.filter(status__in=['POSTED', 'PARTIALLY_PAID'])
         total_debt = sum(inv.remaining_balance for inv in open_invoices)
         if total_debt > 0:
-            formatted_debt = f"${total_debt:,.2f}"
+            formatted_debt = format_admin_currency(total_debt)
             return format_html("<span style='color: #dc2626; font-weight: bold;'>{}</span>", formatted_debt)
-        return "$0.00"
+        return format_admin_currency(0)
 
     @display(description='Available Credit')
     def get_available_credit(self, obj):
         open_cns = obj.credit_notes.filter(status='POSTED')
         total_credit = sum(cn.remaining_credit for cn in open_cns)
         if total_credit > 0:
-            formatted_credit = f"${total_credit:,.2f}"
+            formatted_credit = format_admin_currency(total_credit)
             return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted_credit)
-        return "$0.00"
+        return format_admin_currency(0)
 
     @display(description='Open Invoices')
     def get_open_invoices_count(self, obj):
@@ -1482,7 +1505,7 @@ class CustomerAdmin(ModelAdmin):
                     <div>
                         <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.5px;">Outstanding Debt Pool</div>
                         <div style="font-size: 24px; font-weight: 800; color: {'#dc2626' if total_debt > 0 else '#16a34a'}; margin-top: 2px;">
-                            ${total_debt:,.2f}
+                            {format_admin_currency(total_debt)}
                         </div>
                         <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
                             <strong>{count}</strong> open invoice(s) awaiting settlement
@@ -1491,7 +1514,7 @@ class CustomerAdmin(ModelAdmin):
                     <div style="border-left: 1px solid #e2e8f0; padding-left: 32px;">
                         <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; color: #64748b; letter-spacing: 0.5px;">Available Credit Notes Pool</div>
                         <div style="font-size: 24px; font-weight: 800; color: {'#16a34a' if total_credit > 0 else '#64748b'}; margin-top: 2px;">
-                            ${total_credit:,.2f}
+                            {format_admin_currency(total_credit)}
                         </div>
                         <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
                             <strong>{open_cns.count()}</strong> active credit note(s)
@@ -1602,7 +1625,7 @@ class CustomerAdmin(ModelAdmin):
             credit_info = f" and automatically applied {len(applied)} open Credit Note(s)" if applied else ""
             self.message_user(
                 request,
-                f"Successfully linked Invoice '{invoice.invoice_number}' (Balance: ${invoice.remaining_balance:,.2f}) to {customer.customer_name}{reassigned_info}{credit_info}.",
+                f"Successfully linked Invoice '{invoice.invoice_number}' (Balance: {format_admin_currency(invoice.remaining_balance)}) to {customer.customer_name}{reassigned_info}{credit_info}.",
                 level=messages.SUCCESS
             )
             return redirect(reverse('admin:core_customer_change', args=[object_id]))
@@ -1672,9 +1695,9 @@ class CustomerAdmin(ModelAdmin):
                     )
                     count_settled = len(result.get('allocations', []))
                     unallocated = result.get('unallocated_amount', Decimal('0.00'))
-                    msg = f"Successfully executed bulk deposit of ${amount:,.2f} across {count_settled} invoice(s) for {customer.customer_name}."
+                    msg = f"Successfully executed bulk deposit of {format_admin_currency(amount)} across {count_settled} invoice(s) for {customer.customer_name}."
                     if unallocated > Decimal('0.00'):
-                        msg += f" Surplus credit balance: ${unallocated:,.2f}."
+                        msg += f" Surplus credit balance: {format_admin_currency(unallocated)}."
                     self.message_user(request, msg, level=messages.SUCCESS)
                     return redirect(reverse('admin:core_customer_change', args=[customer.pk]))
                 except Exception as e:
@@ -1752,9 +1775,9 @@ class SalesOrderAdmin(ModelAdmin):
             <tr style="border-bottom: 1px solid #e2e8f0;">
                 <td style="padding: 10px 12px; font-family: monospace; font-weight: 600;"><a href="{url}" style="color: #2563eb; text-decoration: underline;">{inv.invoice_number}</a></td>
                 <td style="padding: 10px 12px; color: #475569;">{inv.invoice_date}</td>
-                <td style="padding: 10px 12px; text-align: right; font-weight: 600;">${inv.total_amount:,.2f}</td>
-                <td style="padding: 10px 12px; text-align: right; color: #16a34a;">${inv.total_paid:,.2f}</td>
-                <td style="padding: 10px 12px; text-align: right; font-weight: 700; color: {'#dc2626' if inv.remaining_balance > 0 else '#16a34a'};">${inv.remaining_balance:,.2f}</td>
+                <td style="padding: 10px 12px; text-align: right; font-weight: 600;">{format_admin_currency(inv.total_amount)}</td>
+                <td style="padding: 10px 12px; text-align: right; color: #16a34a;">{format_admin_currency(inv.total_paid)}</td>
+                <td style="padding: 10px 12px; text-align: right; font-weight: 700; color: {'#dc2626' if inv.remaining_balance > 0 else '#16a34a'};">{format_admin_currency(inv.remaining_balance)}</td>
                 <td style="padding: 10px 12px; text-align: center;">
                     <span style="background: {status_color}15; color: {status_color}; border: 1px solid {status_color}40; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; text-transform: uppercase;">
                         {inv.get_status_display()}
@@ -1846,7 +1869,7 @@ class SalesOrderAdmin(ModelAdmin):
     @display(description='Order Total')
     def get_order_total(self, obj):
         total = sum(item.total_price for item in obj.items.all())
-        return f"${total:,.2f}"
+        return format_admin_currency(total)
 
     def get_urls(self):
         urls = super().get_urls()
@@ -1943,14 +1966,11 @@ class SalesInvoiceAdmin(OpenPyXLExportMixin, ModelAdmin):
 
     @display(description='Total Paid')
     def get_total_paid(self, obj):
-        return f"${obj.total_paid:,.2f}"
+        return format_admin_currency(obj.total_paid)
 
     @display(description='Remaining Balance')
     def get_remaining_balance(self, obj):
-        bal = obj.remaining_balance
-        if bal > 0:
-            return f"${bal:,.2f}"
-        return "$0.00"
+        return format_admin_currency(obj.remaining_balance)
 
     @action(description="Download Commercial Invoice PDF", url_path="download-pdf")
     def action_download_pdf(self, request, object_id):
@@ -1986,15 +2006,15 @@ class CreditNoteAdmin(ModelAdmin):
     @display(description='Applied Credit')
     def get_applied_amount(self, obj):
         applied = obj.applied_amount or Decimal('0.00')
-        return f"${applied:,.2f}"
+        return format_admin_currency(applied)
 
     @display(description='Remaining Credit')
     def get_remaining_credit(self, obj):
         rem = obj.remaining_credit
         if rem > 0:
-            formatted = f"${rem:,.2f}"
+            formatted = format_admin_currency(rem)
             return format_html("<span style='color: #16a34a; font-weight: bold;'>{}</span>", formatted)
-        return "$0.00"
+        return format_admin_currency(0)
 
     @display(description='Status')
     def status_badge(self, obj):
@@ -2804,11 +2824,7 @@ class MaterialVarianceRecordAdmin(OpenPyXLExportMixin, ModelAdmin):
     @display(description='Financial Impact')
     def get_financial_impact(self, obj):
         cost = obj.financial_impact or Decimal('0.00')
-        if cost > 0:
-            return f"+${cost:,.2f}"
-        elif cost < 0:
-            return f"-${abs(cost):,.2f}"
-        return "$0.00"
+        return format_admin_currency(cost, show_plus=True)
 
     @display(description='Classification')
     def classification_badge(self, obj):

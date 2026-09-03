@@ -28,6 +28,7 @@ from core.models import (
     SalesOrder, SalesOrderItem, Customer, DispatchRecord,
     PurchaseOrder, PurchaseOrderItem, FinanceEntry
 )
+from core.services.excel_export_service import NUMBER_FORMAT_CURRENCY
 from core.admin import (
     InventoryAdmin, StockTransactionAdmin, WorkOrderAdmin,
     MaterialVarianceRecordAdmin, PurchaseOrderAdmin, SalesInvoiceAdmin,
@@ -239,7 +240,7 @@ class ExcelExportEngineTestCase(TestCase):
 
         # Check format on data row (row 2)
         subtotal_cell = ws.cell(row=2, column=subtotal_col)
-        self.assertEqual(subtotal_cell.number_format, '$#,##0.00')
+        self.assertEqual(subtotal_cell.number_format, NUMBER_FORMAT_CURRENCY)
         self.assertEqual(float(subtotal_cell.value), 500.00)
 
         date_cell = ws.cell(row=2, column=date_col)
@@ -293,7 +294,7 @@ class ExcelExportEngineTestCase(TestCase):
         ws_disp = wb['COGS Dispatches']
         cogs_col = None
         for col_idx in range(1, ws_disp.max_column + 1):
-            if ws_disp.cell(row=1, column=col_idx).value == 'COGS Line Valuation':
+            if ws_disp.cell(row=1, column=col_idx).value in ('COGS Line Valuation (KSh)', 'COGS Line Valuation'):
                 cogs_col = col_idx
                 break
 
@@ -353,7 +354,7 @@ class ExcelExportEngineTestCase(TestCase):
         # Verify P&L Summary sheet has line items and formatting metadata
         pnl_sheet = data['sheets'][0]
         self.assertGreater(pnl_sheet['row_count'], 0)
-        self.assertEqual(pnl_sheet['headers'], ['Financial Statement Line', 'Amount / Value', 'Classification / Notes'])
+        self.assertEqual(pnl_sheet['headers'], ['Financial Statement Line', 'Amount (KSh)', 'Classification / Notes'])
         self.assertEqual(pnl_sheet['formats'], ['text', 'currency', 'text'])
 
     def test_shopfloor_export_preview_json(self):

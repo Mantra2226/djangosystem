@@ -452,7 +452,7 @@ def export_financial_analytics_excel(request):
     ]
     sheet1 = {
         'title': 'P&L Summary',
-        'headers': ['Financial Statement Line', 'Amount / Value', 'Classification / Notes'],
+        'headers': ['Financial Statement Line', 'Amount (KSh)', 'Classification / Notes'],
         'formats': ['text', 'currency', 'text'],
         'rows': sheet1_rows
     }
@@ -484,7 +484,7 @@ def export_financial_analytics_excel(request):
         ])
     sheet2 = {
         'title': 'Sales Invoices',
-        'headers': ['Invoice #', 'Customer', 'Sales Order', 'Status', 'Invoice Date', 'Due Date', 'Subtotal', 'Tax Amount', 'Total Amount', 'Total Paid', 'Remaining Balance'],
+        'headers': ['Invoice #', 'Customer', 'Sales Order', 'Status', 'Invoice Date', 'Due Date', 'Subtotal (KSh)', 'Tax (KSh)', 'Total (KSh)', 'Total Paid (KSh)', 'Remaining Balance (KSh)'],
         'formats': ['text', 'text', 'text', 'text', 'date', 'date', 'currency', 'currency', 'currency', 'currency', 'currency'],
         'rows': sheet2_rows
     }
@@ -522,7 +522,7 @@ def export_financial_analytics_excel(request):
         ])
     sheet3 = {
         'title': 'COGS Dispatches',
-        'headers': ['Dispatch Code', 'Customer', 'Sales Order', 'Product', 'SKU', 'Quantity Dispatched', 'Unit Cost', 'COGS Line Valuation', 'Dispatch Date', 'Delivery Date'],
+        'headers': ['Dispatch Code', 'Customer', 'Sales Order', 'Product', 'SKU', 'Quantity Dispatched', 'Unit Cost (KSh)', 'COGS Line Valuation (KSh)', 'Dispatch Date', 'Delivery Date'],
         'formats': ['text', 'text', 'text', 'text', 'text', 'decimal', 'currency', 'currency', 'date', 'date'],
         'rows': sheet3_rows
     }
@@ -632,7 +632,7 @@ def export_shopfloor_analytics_excel(request):
         ])
     sheet2 = {
         'title': 'Material Variances',
-        'headers': ['Variance Code', 'Work Order #', 'Component', 'SKU', 'Expected Qty', 'Actual Qty', 'Variance Qty', 'Unit Cost', 'Financial Impact', 'Classification', 'Efficiency Rate %', 'Recorded Timestamp'],
+        'headers': ['Variance Code', 'Work Order #', 'Component', 'SKU', 'Expected Qty', 'Actual Qty', 'Variance Qty', 'Unit Cost (KSh)', 'Variance Cost (KSh)', 'Classification', 'Efficiency Rate %', 'Recorded Timestamp'],
         'formats': ['text', 'text', 'text', 'text', 'decimal', 'decimal', 'decimal', 'currency', 'currency', 'text', 'decimal', 'datetime'],
         'rows': sheet2_rows
     }
@@ -666,7 +666,7 @@ def export_shopfloor_analytics_excel(request):
         ])
     sheet3 = {
         'title': 'Low-Stock Alerts',
-        'headers': ['Product Name', 'SKU', 'Category', 'Available Stock', 'Allocated Stock', 'Reorder Threshold', 'Stock Deficit', 'Unit Cost', 'Total Valuation', 'Location', 'Supplier'],
+        'headers': ['Product Name', 'SKU', 'Category', 'Available Stock', 'Allocated Stock', 'Reorder Threshold', 'Stock Deficit', 'Unit Cost (KSh)', 'Total Valuation (KSh)', 'Location', 'Supplier'],
         'formats': ['text', 'text', 'text', 'decimal', 'decimal', 'decimal', 'decimal', 'currency', 'currency', 'text', 'text'],
         'rows': sheet3_rows
     }

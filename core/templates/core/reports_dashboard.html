@@ -1,3 +1,4 @@
+{% load currency_filters %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -631,7 +632,7 @@
            title="View Sales Invoices & Revenue Ledger">
             <div class="kpi-card green">
                 <div class="kpi-label">Total Revenue</div>
-                <div class="kpi-value">${{ pnl.total_revenue|floatformat:2 }}</div>
+                <div class="kpi-value">{{ pnl.total_revenue|currency }}</div>
                 <div class="kpi-subtext">Sales Invoices & Revenue Ledger <span class="kpi-arrow">→</span></div>
             </div>
         </a>
@@ -641,7 +642,7 @@
            title="View Sales Invoices & Margin Analysis">
             <div class="kpi-card green">
                 <div class="kpi-label">Gross Profit</div>
-                <div class="kpi-value">${{ pnl.gross_profit|floatformat:2 }}</div>
+                <div class="kpi-value">{{ pnl.gross_profit|currency }}</div>
                 <div class="kpi-subtext">Margin Rate: <strong>{{ pnl.gross_margin_pct }}%</strong> <span class="kpi-arrow">→</span></div>
             </div>
         </a>
@@ -651,7 +652,7 @@
            title="View Cost of Goods Sold (Dispatches)">
             <div class="kpi-card red">
                 <div class="kpi-label">COGS</div>
-                <div class="kpi-value">${{ pnl.cogs|floatformat:2 }}</div>
+                <div class="kpi-value">{{ pnl.cogs|currency }}</div>
                 <div class="kpi-subtext">Cost of Goods Sold (Dispatches) <span class="kpi-arrow">→</span></div>
             </div>
         </a>
@@ -661,7 +662,7 @@
            title="View Completed Work Orders (COGM)">
             <div class="kpi-card purple">
                 <div class="kpi-label">Total COGM</div>
-                <div class="kpi-value">${{ cogm.total_cogm|floatformat:2 }}</div>
+                <div class="kpi-value">{{ cogm.total_cogm|currency }}</div>
                 <div class="kpi-subtext">Completed Builds: {{ cogm.completed_orders_count }} <span class="kpi-arrow">→</span></div>
             </div>
         </a>
@@ -707,23 +708,23 @@
             </div>
             <div class="metric-row">
                 <span>Sales Invoice Revenue</span>
-                <span>${{ pnl.sales_revenue|floatformat:2 }}</span>
+                <span>{{ pnl.sales_revenue|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>Cost of Goods Sold (COGS)</span>
-                <span style="color: var(--accent-red);">-${{ pnl.cogs|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ pnl.cogs|currency:"neg" }}</span>
             </div>
             <div class="metric-row total">
                 <span>Gross Profit</span>
-                <span>${{ pnl.gross_profit|floatformat:2 }}</span>
+                <span>{{ pnl.gross_profit|currency }}</span>
             </div>
             <div class="metric-row" style="margin-top: 8px;">
                 <span>Operating Expenses (Ledger)</span>
-                <span style="color: var(--accent-red);">-${{ pnl.operating_expenses|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ pnl.operating_expenses|currency:"neg" }}</span>
             </div>
             <div class="metric-row total" style="color: var(--brand-blue);">
                 <span>Net Operating Income</span>
-                <span>${{ pnl.net_income|floatformat:2 }}</span>
+                <span>{{ pnl.net_income|currency }}</span>
             </div>
         </div>
 
@@ -735,23 +736,23 @@
             </div>
             <div class="metric-row">
                 <span>Direct Raw Materials Consumed</span>
-                <span>${{ cogm.raw_material_cost|floatformat:2 }}</span>
+                <span>{{ cogm.raw_material_cost|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>Unfavourable Scrap &amp; Waste Variance</span>
-                <span style="color: var(--accent-red);">+${{ cogm.unfavourable_scrap|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">+{{ cogm.unfavourable_scrap|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>Favourable Material Savings</span>
-                <span style="color: var(--accent-green);">-${{ cogm.favourable_savings|floatformat:2 }}</span>
+                <span style="color: var(--accent-green);">{{ cogm.favourable_savings|currency:"neg" }}</span>
             </div>
             <div class="metric-row">
-                <span>Direct Labor Cost ({{ cogm.total_labor_hours }} Hours @ $25/hr)</span>
-                <span>${{ cogm.labor_cost|floatformat:2 }}</span>
+                <span>Direct Labor Cost ({{ cogm.total_labor_hours }} Hours @ KSh 25/hr)</span>
+                <span>{{ cogm.labor_cost|currency }}</span>
             </div>
             <div class="metric-row total">
                 <span>Total Manufactured Output Cost (COGM)</span>
-                <span>${{ cogm.total_cogm|floatformat:2 }}</span>
+                <span>{{ cogm.total_cogm|currency }}</span>
             </div>
         </div>
     </div>
@@ -815,7 +816,7 @@
             </div>
             <div class="metric-row">
                 <span>Total Warehouse Valuation</span>
-                <span><strong>${{ inventory_otif.total_valuation|floatformat:2 }}</strong></span>
+                <span><strong>{{ inventory_otif.total_valuation|currency }}</strong></span>
             </div>
             <div class="metric-row" style="margin-bottom: 12px;">
                 <span>Total Inventory Items Tracked</span>
@@ -860,23 +861,23 @@
             </div>
             <div class="metric-row">
                 <span>Current (0-30 Days)</span>
-                <span>${{ ar_aging.current_30|floatformat:2 }}</span>
+                <span>{{ ar_aging.current_30|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>31-60 Days Overdue</span>
-                <span style="color: var(--accent-amber);">${{ ar_aging.days_31_60|floatformat:2 }}</span>
+                <span style="color: var(--accent-amber);">{{ ar_aging.days_31_60|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>61-90 Days Overdue</span>
-                <span style="color: var(--accent-red);">${{ ar_aging.days_61_90|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ ar_aging.days_61_90|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>90+ Days Critical</span>
-                <span style="color: var(--accent-red); font-weight: 700;">${{ ar_aging.days_90_plus|floatformat:2 }}</span>
+                <span style="color: var(--accent-red); font-weight: 700;">{{ ar_aging.days_90_plus|currency }}</span>
             </div>
             <div class="metric-row total">
                 <span>Total Outstanding Receivables</span>
-                <span>${{ ar_aging.total_ar|floatformat:2 }}</span>
+                <span>{{ ar_aging.total_ar|currency }}</span>
             </div>
         </div>
 
@@ -888,23 +889,23 @@
             </div>
             <div class="metric-row">
                 <span>Current (0-30 Days)</span>
-                <span>${{ ap_aging.current_30|floatformat:2 }}</span>
+                <span>{{ ap_aging.current_30|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>31-60 Days Owed</span>
-                <span style="color: var(--accent-amber);">${{ ap_aging.days_31_60|floatformat:2 }}</span>
+                <span style="color: var(--accent-amber);">{{ ap_aging.days_31_60|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>61-90 Days Owed</span>
-                <span style="color: var(--accent-red);">${{ ap_aging.days_61_90|floatformat:2 }}</span>
+                <span style="color: var(--accent-red);">{{ ap_aging.days_61_90|currency }}</span>
             </div>
             <div class="metric-row">
                 <span>90+ Days Overdue</span>
-                <span style="color: var(--accent-red); font-weight: 700;">${{ ap_aging.days_90_plus|floatformat:2 }}</span>
+                <span style="color: var(--accent-red); font-weight: 700;">{{ ap_aging.days_90_plus|currency }}</span>
             </div>
             <div class="metric-row total">
                 <span>Total Outstanding Payables</span>
-                <span>${{ ap_aging.total_ap|floatformat:2 }}</span>
+                <span>{{ ap_aging.total_ap|currency }}</span>
             </div>
         </div>
     </div>
@@ -1103,7 +1104,10 @@
             if (fmt === 'currency') {
                 const num = parseFloat(val);
                 if (!isNaN(num)) {
-                    return '$' + num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    if (num < 0) {
+                        return '-KSh ' + Math.abs(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    }
+                    return 'KSh ' + num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                 }
             } else if (fmt === 'decimal' || fmt === 'quantity' || fmt === 'float') {
                 const num = parseFloat(val);
